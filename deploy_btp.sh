@@ -7,7 +7,7 @@ APP_NAME="itil4-evalapp"
 usage() {
   cat <<'EOF'
 Usage:
-  ./deploy_btp.sh [--api <cf-api-endpoint>] [--org <org>] [--space <space>] [--domain <default-domain>] [--sso]
+  ./deploy_btp.sh [--api <cf-api-endpoint>] [--org <org>] [--space <space>] [--domain <default-domain>] [--env-file <file>] [--sso]
 
 Example:
   ./deploy_btp.sh \
@@ -22,7 +22,8 @@ Notes:
   - It auto-detects API/org/space from `cf target` when omitted.
   - It auto-detects a shared external domain from `cf domains` when omitted.
   - If your landscape requires SSO, add --sso to force interactive SSO login.
-  - HANA env vars must be exported before running:
+  - HANA vars can be exported or loaded from --env-file/.deploy.env/.env.
+  - Required HANA vars:
     HANA_HOST, HANA_PORT, HANA_USER, HANA_PASSWORD, HANA_SCHEMA,
     HANA_ENCRYPT, HANA_SSL_VALIDATE_CERTIFICATE
 EOF
@@ -33,6 +34,7 @@ CF_ORG=""
 CF_SPACE=""
 DEFAULT_DOMAIN=""
 USE_SSO="false"
+ENV_FILE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -46,6 +48,8 @@ while [[ $# -gt 0 ]]; do
       DEFAULT_DOMAIN="${2:-}"; shift 2 ;;
     --sso)
       USE_SSO="true"; shift ;;
+    --env-file)
+      ENV_FILE="${2:-}"; shift 2 ;;
     -h|--help)
       usage; exit 0 ;;
     *)
@@ -66,6 +70,21 @@ if [[ ! -f "$APP_DIR/manifest.yml" ]]; then
 fi
 
 cd "$APP_DIR"
+
+if [[ -n "$ENV_FILE" ]]; then
+  if [[ ! -f "$ENV_FILE" ]]; then
+    echo "Env file not found: $ENV_FILE" >&2
+    exit 1
+  fi
+  # shellcheck disable=SC1090
+  set -a; source "$ENV_FILE"; set +a
+elif [[ -f "$APP_DIR/.deploy.env" ]]; then
+  # shellcheck disable=SC1091
+  set -a; source "$APP_DIR/.deploy.env"; set +a
+elif [[ -f "$APP_DIR/.env" ]]; then
+  # shellcheck disable=SC1091
+  set -a; source "$APP_DIR/.env"; set +a
+fi
 
 # Try to infer missing context from current CF target
 TARGET_OUT="$(cf target 2>/dev/null || true)"
@@ -131,20 +150,16 @@ fi
 echo "==> Targeting org/space: $CF_ORG / $CF_SPACE"
 cf target -o "$CF_ORG" -s "$CF_SPACE"
 
-echo "==> Deploying app with fixed route domain: $DEFAULT_DOMAIN"
-cf push --var "default_domain=$DEFAULT_DOMAIN"
-
-echo "==> Setting HANA environment variables on app: $APP_NAME"
-cf set-env "$APP_NAME" HANA_HOST "$HANA_HOST"
-cf set-env "$APP_NAME" HANA_PORT "$HANA_PORT"
-cf set-env "$APP_NAME" HANA_USER "$HANA_USER"
-cf set-env "$APP_NAME" HANA_PASSWORD "$HANA_PASSWORD"
-cf set-env "$APP_NAME" HANA_SCHEMA "$HANA_SCHEMA"
-cf set-env "$APP_NAME" HANA_ENCRYPT "$HANA_ENCRYPT"
-cf set-env "$APP_NAME" HANA_SSL_VALIDATE_CERTIFICATE "$HANA_SSL_VALIDATE_CERTIFICATE"
-
-echo "==> Restarting app to apply HANA env vars"
-cf restage "$APP_NAME"
+echo "==> Deploying app with fixed route + HANA vars"
+cf push \
+  --var "default_domain=$DEFAULT_DOMAIN" \
+  --var "hana_host=$HANA_HOST" \
+  --var "hana_port=$HANA_PORT" \
+  --var "hana_user=$HANA_USER" \
+  --var "hana_password=$HANA_PASSWORD" \
+  --var "hana_schema=$HANA_SCHEMA" \
+  --var "hana_encrypt=$HANA_ENCRYPT" \
+  --var "hana_ssl_validate_certificate=$HANA_SSL_VALIDATE_CERTIFICATE"
 
 echo "==> Deployment complete. App details:"
 cf app "$APP_NAME"

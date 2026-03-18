@@ -8,3 +8,11 @@ applications:
     path: .
     routes:
       - route: itil4-evalapp.((default_domain))
+    env:
+      HANA_HOST: ((hana_host))
+      HANA_PORT: ((hana_port))
+      HANA_USER: ((hana_user))
+      HANA_PASSWORD: ((hana_password))
+      HANA_SCHEMA: ((hana_schema))
+      HANA_ENCRYPT: ((hana_encrypt))
+      HANA_SSL_VALIDATE_CERTIFICATE: ((hana_ssl_validate_certificate))
