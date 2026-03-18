@@ -1,0 +1,4 @@
+# SAP BTP CF static hosting (staticfile_buildpack)
+root: .
+directory: false
+gzip: true

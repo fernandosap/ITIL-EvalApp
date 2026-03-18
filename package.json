@@ -1,0 +1,17 @@
+{
+  "name": "itil-evalapp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "ITIL exam app with Node middleware and SAP HANA persistence",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": "20.x"
+  },
+  "dependencies": {
+    "@sap/hana-client": "^2.25.27",
+    "express": "^4.21.2"
+  }
+}
