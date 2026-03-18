@@ -69,6 +69,22 @@ function parseJsonOrNull(s) {
   }
 }
 
+function appLog(level, event, meta = {}) {
+  const payload = {
+    ts: new Date().toISOString(),
+    level,
+    event,
+    ...meta
+  };
+  console.log(JSON.stringify(payload));
+}
+
+function toCsvCell(v) {
+  if (v === null || v === undefined) return '';
+  const s = String(v);
+  return `"${s.replace(/"/g, '""')}"`;
+}
+
 async function withDb(fn) {
   const conn = dbConnect();
   try {
@@ -90,6 +106,7 @@ app.get('/api/health', async (_req, res) => {
     });
     res.json({ ok: true, db: 'connected', schema: HANA_SCHEMA });
   } catch (err) {
+    appLog('error', 'health_failed', { message: err.message });
     res.status(500).json({ ok: false, message: err.message });
   }
 });
@@ -142,6 +159,7 @@ app.get('/api/bootstrap', async (_req, res) => {
 
     res.json(payload);
   } catch (err) {
+    appLog('error', 'bootstrap_failed', { message: err.message });
     res.status(500).json({ error: 'bootstrap_failed', message: err.message });
   }
 });
@@ -185,6 +203,7 @@ app.put('/api/codebook', async (req, res) => {
     });
     res.json({ ok: true });
   } catch (err) {
+    appLog('error', 'codebook_save_failed', { message: err.message });
     res.status(500).json({ error: 'codebook_save_failed', message: err.message });
   }
 });
@@ -219,6 +238,7 @@ app.put('/api/session/:code', async (req, res) => {
     });
     res.json({ ok: true });
   } catch (err) {
+    appLog('error', 'session_save_failed', { code, message: err.message });
     res.status(500).json({ error: 'session_save_failed', message: err.message });
   }
 });
@@ -230,8 +250,10 @@ app.delete('/api/session/:code', async (req, res) => {
     await withDb(async (conn) => {
       await execQuery(conn, 'DELETE FROM EXAM_SESSIONS WHERE ACCESS_CODE = ?', [code]);
     });
+    appLog('info', 'session_deleted', { code });
     res.json({ ok: true });
   } catch (err) {
+    appLog('error', 'session_delete_failed', { code, message: err.message });
     res.status(500).json({ error: 'session_delete_failed', message: err.message });
   }
 });
@@ -289,8 +311,16 @@ app.put('/api/result/:code', async (req, res) => {
         JSON.stringify(result)
       ]);
     });
+    appLog('info', 'result_saved', {
+      code,
+      score: result.score ?? 0,
+      pass: Boolean(result.pass),
+      incidentCount: result.incidentCount ?? 0,
+      autoSubmit: Boolean(result.autoSubmit)
+    });
     res.json({ ok: true });
   } catch (err) {
+    appLog('error', 'result_save_failed', { code, message: err.message });
     res.status(500).json({ error: 'result_save_failed', message: err.message });
   }
 });
@@ -302,8 +332,10 @@ app.delete('/api/result/:code', async (req, res) => {
     await withDb(async (conn) => {
       await execQuery(conn, 'DELETE FROM EXAM_RESULTS WHERE ACCESS_CODE = ?', [code]);
     });
+    appLog('info', 'result_deleted', { code });
     res.json({ ok: true });
   } catch (err) {
+    appLog('error', 'result_delete_failed', { code, message: err.message });
     res.status(500).json({ error: 'result_delete_failed', message: err.message });
   }
 });
@@ -321,7 +353,57 @@ app.get('/api/admin/codes', async (_req, res) => {
     });
     res.json({ rows });
   } catch (err) {
+    appLog('error', 'admin_codes_failed', { message: err.message });
     res.status(500).json({ error: 'admin_codes_failed', message: err.message });
+  }
+});
+
+app.get('/api/admin/export.csv', async (_req, res) => {
+  try {
+    const rows = await withDb(async (conn) => {
+      return execQuery(
+        conn,
+        `SELECT
+           c.ACCESS_CODE,
+           c.LABEL,
+           c.STATUS,
+           r.SCORE,
+           r.PCT,
+           r.PASS,
+           r.TAB_SWITCHES,
+           r.INCIDENT_COUNT,
+           r.SUBMITTED_AT
+         FROM ACCESS_CODES c
+         LEFT JOIN EXAM_RESULTS r ON r.ACCESS_CODE = c.ACCESS_CODE
+         ORDER BY c.ACCESS_CODE ASC`
+      );
+    });
+
+    const lines = [
+      'Code,Label,Status,Score,Pct,Result,TabSwitches,Incidents,SubmittedAt'
+    ];
+    for (const r of rows) {
+      const resultLabel = r.PASS === null || r.PASS === undefined ? '' : (r.PASS ? 'PASS' : 'FAIL');
+      lines.push([
+        toCsvCell(r.ACCESS_CODE),
+        toCsvCell(r.LABEL || ''),
+        toCsvCell(r.STATUS || ''),
+        toCsvCell(r.SCORE ?? ''),
+        toCsvCell(r.PCT === null || r.PCT === undefined ? '' : `${r.PCT}%`),
+        toCsvCell(resultLabel),
+        toCsvCell(r.TAB_SWITCHES ?? ''),
+        toCsvCell(r.INCIDENT_COUNT ?? ''),
+        toCsvCell(r.SUBMITTED_AT ? new Date(r.SUBMITTED_AT).toISOString() : '')
+      ].join(','));
+    }
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="ITIL4_Exam_Results.csv"');
+    appLog('info', 'admin_export_csv', { rows: rows.length });
+    res.send(lines.join('\n'));
+  } catch (err) {
+    appLog('error', 'admin_export_csv_failed', { message: err.message });
+    res.status(500).json({ error: 'admin_export_csv_failed', message: err.message });
   }
 });
 
@@ -336,7 +418,7 @@ app.get('*', (req, res, next) => {
 });
 
 app.use((err, _req, res, _next) => {
-  console.error(err);
+  appLog('error', 'server_error', { message: err.message });
   res.status(500).json({ error: 'server_error', message: err.message });
 });
 

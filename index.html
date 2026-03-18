@@ -23,6 +23,11 @@ body{font-family:'Segoe UI',Arial,sans-serif;background:#0a3030 url('data:image/
   background:rgba(255,255,255,.12);padding:5px 14px;border-radius:6px;min-width:96px;text-align:center}
 .timer.warning{background:#e67e22}
 .timer.danger{background:#c0392b;animation:pulse 1s infinite}
+.save-pill{font-size:11px;font-weight:700;letter-spacing:.3px;padding:4px 9px;border-radius:999px;
+  border:1px solid rgba(255,255,255,.35);background:rgba(255,255,255,.14);color:#ecf2ff;min-width:110px;text-align:center}
+.save-pill.saving{background:#2E75B6;color:#fff}
+.save-pill.retry{background:#e67e22;color:#fff}
+.save-pill.error{background:#c0392b;color:#fff}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.7}}
 
 /* Cards */
@@ -408,9 +413,90 @@ function isValidFormat(code) {
   return /^[A-Z2-9]{6}$/.test(code) && !/(0|O|1|I|L)/.test(code);
 }
 const DB = { codebook: {}, sessions: {}, results: {} };
-async function apiJson(url, opts) {
-  const r = await fetch(url, opts);
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+const API_TIMEOUT_MS = 8000;
+const API_BASE_RETRY_MS = 400;
+let _pendingSaves = 0;
+const SAVE_UI = { cls: '', text: 'Synced' };
+
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+function setSavePill(cls, text) {
+  SAVE_UI.cls = cls || '';
+  SAVE_UI.text = text || 'Synced';
+  const el = $('save-pill');
+  if (!el) return;
+  el.className = `save-pill ${SAVE_UI.cls}`.trim();
+  el.textContent = SAVE_UI.text;
+}
+
+function markSaveStart() {
+  _pendingSaves++;
+  setSavePill('saving', 'Saving...');
+}
+
+function markRetry(attempt) {
+  setSavePill('retry', `Retrying (${attempt})...`);
+}
+
+function markSaveDone(ok) {
+  _pendingSaves = Math.max(0, _pendingSaves - 1);
+  if (_pendingSaves > 0) return;
+  if (ok) setSavePill('', 'Saved');
+  else setSavePill('error', 'Sync issue');
+}
+
+function errorMessage(err, fallback) {
+  if (!err) return fallback;
+  if (err.name === 'AbortError') return 'Request timed out';
+  if (err.message) return err.message;
+  return fallback;
+}
+
+async function apiFetch(url, opts = {}, cfg = {}) {
+  const method = String((opts.method || 'GET')).toUpperCase();
+  const retries = Number.isInteger(cfg.retries) ? cfg.retries : (method === 'GET' ? 1 : 2);
+  const timeoutMs = cfg.timeoutMs || API_TIMEOUT_MS;
+  const isSave = !!cfg.isSave;
+
+  if (isSave) markSaveStart();
+  let lastErr = null;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const resp = await fetch(url, { ...opts, signal: controller.signal });
+      clearTimeout(timer);
+      if (!resp.ok) {
+        const e = new Error(`HTTP ${resp.status}`);
+        e.status = resp.status;
+        throw e;
+      }
+      if (isSave) markSaveDone(true);
+      return resp;
+    } catch (err) {
+      clearTimeout(timer);
+      lastErr = err;
+      const status = err && err.status ? err.status : 0;
+      const retryable = err.name === 'AbortError' || status === 0 || status === 429 || status >= 500;
+      if (attempt < retries && retryable) {
+        if (isSave) markRetry(attempt + 1);
+        await sleep(API_BASE_RETRY_MS * Math.pow(2, attempt));
+        continue;
+      }
+      if (isSave) markSaveDone(false);
+      throw new Error(errorMessage(err, 'API request failed'));
+    }
+  }
+
+  if (isSave) markSaveDone(false);
+  throw new Error(errorMessage(lastErr, 'API request failed'));
+}
+
+async function apiJson(url, opts = {}, cfg = {}) {
+  const r = await apiFetch(url, opts, cfg);
+  const ct = (r.headers.get('content-type') || '').toLowerCase();
+  if (!ct.includes('application/json')) return null;
   return r.json();
 }
 async function bootstrapStorage() {
@@ -434,7 +520,7 @@ function codebookSet(cb) {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ codebook: DB.codebook })
-  }).catch(()=>{});
+  }, { isSave: true }).catch(()=>{});
 }
 function sessionGet(code) { return DB.sessions[code] || null; }
 function sessionSet(code, data) {
@@ -443,11 +529,11 @@ function sessionSet(code, data) {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ session: data })
-  }).catch(()=>{});
+  }, { isSave: true }).catch(()=>{});
 }
 function sessionDelete(code) {
   delete DB.sessions[code];
-  apiJson(`/api/session/${encodeURIComponent(code)}`, { method: 'DELETE' }).catch(()=>{});
+  apiJson(`/api/session/${encodeURIComponent(code)}`, { method: 'DELETE' }, { isSave: true }).catch(()=>{});
 }
 function resultGet(code) { return DB.results[code] || null; }
 function resultSet(code, data) {
@@ -456,11 +542,11 @@ function resultSet(code, data) {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ result: data })
-  }).catch(()=>{});
+  }, { isSave: true }).catch(()=>{});
 }
 function resultDelete(code) {
   delete DB.results[code];
-  apiJson(`/api/result/${encodeURIComponent(code)}`, { method: 'DELETE' }).catch(()=>{});
+  apiJson(`/api/result/${encodeURIComponent(code)}`, { method: 'DELETE' }, { isSave: true }).catch(()=>{});
 }
 
 // ── STATE ─────────────────────────────────────────────────────────────────────
@@ -474,6 +560,7 @@ const S = {
   webcamStream: null, screenStream: null,
   webcamOk: false, screenOk: false,
   pendingResume: null,
+  securityBound: false,
   submitted: false,
 };
 
@@ -835,7 +922,10 @@ function renderQ() {
         <span class="header-title">SAP Academy for Cloud Delivery · ITIL Exam</span>
         <span class="header-code">CODE: ${S.code}</span>
       </div>
-      <div id="timer" class="timer">--:--</div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <div id="save-pill" class="save-pill">Saved</div>
+        <div id="timer" class="timer">--:--</div>
+      </div>
     </div>
     <div style="background:white;padding:8px 20px;border-bottom:1px solid #e0e6f0">
       <div style="display:flex;justify-content:space-between;font-size:12px;color:#777;margin-bottom:5px">
@@ -883,6 +973,7 @@ function renderQ() {
 
   const ec = $('exam-cam');
   if (ec && S.webcamStream && proctorEnabled()) ec.srcObject = S.webcamStream;
+  setSavePill(SAVE_UI.cls, SAVE_UI.text);
   updateTimer();
   saveSession();
 }
@@ -937,9 +1028,11 @@ function updateTimer() {
 // ── SECURITY & PROCTORING ─────────────────────────────────────────────────────
 let _blurTime = null;
 function setupSecurity() {
+  if (S.securityBound) return;
   document.addEventListener('visibilitychange', onVisChange);
   window.addEventListener('blur', onBlur);
   window.addEventListener('focus', onFocus);
+  S.securityBound = true;
 }
 function onBlur() {
   if(S.screen!=='exam'||S.submitted) return;
@@ -1040,6 +1133,7 @@ async function submitExam(auto=false) {
   document.removeEventListener('visibilitychange',onVisChange);
   window.removeEventListener('blur',onBlur);
   window.removeEventListener('focus',onFocus);
+  S.securityBound = false;
   if(S.webcamStream) S.webcamStream.getTracks().forEach(t=>t.stop());
   if(S.screenStream) S.screenStream.getTracks().forEach(t=>t.stop());
 
@@ -1300,18 +1394,32 @@ function showIncidents(code) {
   modal('⚠️',`Incidents — ${code}`,txt,[{label:'Close',cls:'btn-primary'}]);
 }
 
-function dlCSV() {
-  if(!window._adminCsv) return;
-  const b=new Blob([window._adminCsv],{type:'text/csv'});
-  const u=URL.createObjectURL(b);
-  const a=document.createElement('a');
-  a.href=u; a.download='ITIL4_Exam_Results.csv'; a.click();
-  URL.revokeObjectURL(u);
+async function dlCSV() {
+  try {
+    const r = await apiFetch('/api/admin/export.csv', {}, { timeoutMs: 12000, retries: 1 });
+    const txt = await r.text();
+    const b = new Blob([txt], { type: 'text/csv' });
+    const u = URL.createObjectURL(b);
+    const a = document.createElement('a');
+    a.href = u; a.download = 'ITIL4_Exam_Results.csv'; a.click();
+    URL.revokeObjectURL(u);
+  } catch (e) {
+    if (!window._adminCsv) {
+      modal('❌', 'Export Failed', 'Could not export CSV from server. Please try again.', [{label:'OK', cls:'btn-primary'}]);
+      return;
+    }
+    const b = new Blob([window._adminCsv], { type: 'text/csv' });
+    const u = URL.createObjectURL(b);
+    const a = document.createElement('a');
+    a.href = u; a.download = 'ITIL4_Exam_Results.csv'; a.click();
+    URL.revokeObjectURL(u);
+  }
 }
 
 // ── INIT ──────────────────────────────────────────────────────────────────────
 async function initApp() {
   await bootstrapStorage();
+  setSavePill('', 'Synced');
   ensureCodebook();
   new URLSearchParams(window.location.search).get('admin')==='1'
     ? showAdminLogin()
