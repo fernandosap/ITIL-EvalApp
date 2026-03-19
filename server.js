@@ -17,6 +17,9 @@ const HANA_SCHEMA = process.env.HANA_SCHEMA || 'ITIL_EXAM';
 const HANA_ENCRYPT = String(process.env.HANA_ENCRYPT || 'true').toLowerCase() === 'true';
 const HANA_SSL_VALIDATE_CERTIFICATE =
   String(process.env.HANA_SSL_VALIDATE_CERTIFICATE || 'false').toLowerCase() === 'true';
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514';
+const ANTHROPIC_VERSION = process.env.ANTHROPIC_VERSION || '2023-06-01';
 
 const HAS_DB_CONFIG = Boolean(HANA_HOST && HANA_USER && HANA_PASSWORD && HANA_SCHEMA);
 
@@ -85,6 +88,15 @@ function toCsvCell(v) {
   return `"${s.replace(/"/g, '""')}"`;
 }
 
+function parseAnthropicText(content) {
+  if (!Array.isArray(content)) return '';
+  return content
+    .filter((c) => c && c.type === 'text' && typeof c.text === 'string')
+    .map((c) => c.text)
+    .join('\n')
+    .trim();
+}
+
 let _hasNotesColumn = null;
 async function hasNotesColumn(conn) {
   if (_hasNotesColumn !== null) return _hasNotesColumn;
@@ -111,6 +123,70 @@ async function withDb(fn) {
     await closeConn(conn);
   }
 }
+
+app.post('/api/proctor/check', async (req, res) => {
+  const imageB64 = req.body && typeof req.body.imageB64 === 'string' ? req.body.imageB64 : '';
+  if (!imageB64) return res.status(400).json({ error: 'missing_image' });
+
+  if (!ANTHROPIC_API_KEY) {
+    return res.json({ enabled: false, flag: false, reason: null });
+  }
+
+  try {
+    const prompt =
+      'Exam proctor AI. Respond ONLY with JSON, no other text: {"flag":false,"reason":null} or {"flag":true,"reason":"brief reason"}. ' +
+      'Flag ONLY if: no face visible, second person visible, phone/notes visible, candidate clearly looking away for extended period. ' +
+      'Do NOT flag for minor head movements, blinking, or adjusting posture.';
+
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': ANTHROPIC_VERSION
+      },
+      body: JSON.stringify({
+        model: ANTHROPIC_MODEL,
+        max_tokens: 100,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: imageB64 } },
+              { type: 'text', text: prompt }
+            ]
+          }
+        ]
+      }),
+      signal: AbortSignal.timeout(12000)
+    });
+
+    if (!response.ok) {
+      const detail = await response.text();
+      appLog('warn', 'proctor_provider_non_ok', { status: response.status, detail: detail.slice(0, 300) });
+      return res.status(502).json({ error: 'provider_non_ok' });
+    }
+
+    const data = await response.json();
+    const text = parseAnthropicText(data.content);
+    let parsed = { flag: false, reason: null };
+    try {
+      parsed = JSON.parse(text);
+    } catch (_e) {
+      appLog('warn', 'proctor_provider_parse_failed', { text: text.slice(0, 300) });
+      return res.status(502).json({ error: 'provider_parse_failed' });
+    }
+
+    return res.json({
+      enabled: true,
+      flag: Boolean(parsed && parsed.flag),
+      reason: parsed && parsed.reason ? String(parsed.reason) : null
+    });
+  } catch (err) {
+    appLog('error', 'proctor_check_failed', { message: err.message });
+    return res.status(500).json({ error: 'proctor_check_failed' });
+  }
+});
 
 app.get('/api/health', async (_req, res) => {
   if (!HAS_DB_CONFIG) {

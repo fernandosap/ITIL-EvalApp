@@ -26,6 +26,8 @@ Notes:
   - Required HANA vars:
     HANA_HOST, HANA_PORT, HANA_USER, HANA_PASSWORD, HANA_SCHEMA,
     HANA_ENCRYPT, HANA_SSL_VALIDATE_CERTIFICATE
+  - Optional Anthropic vars for AI proctoring:
+    ANTHROPIC_API_KEY, ANTHROPIC_MODEL, ANTHROPIC_VERSION
 EOF
 }
 
@@ -160,6 +162,21 @@ cf push \
   --var "hana_schema=$HANA_SCHEMA" \
   --var "hana_encrypt=$HANA_ENCRYPT" \
   --var "hana_ssl_validate_certificate=$HANA_SSL_VALIDATE_CERTIFICATE"
+
+if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+  echo "==> Configuring Anthropic env vars for server-side proctoring"
+  cf set-env "$APP_NAME" ANTHROPIC_API_KEY "$ANTHROPIC_API_KEY"
+  if [[ -n "${ANTHROPIC_MODEL:-}" ]]; then
+    cf set-env "$APP_NAME" ANTHROPIC_MODEL "$ANTHROPIC_MODEL"
+  fi
+  if [[ -n "${ANTHROPIC_VERSION:-}" ]]; then
+    cf set-env "$APP_NAME" ANTHROPIC_VERSION "$ANTHROPIC_VERSION"
+  fi
+  echo "==> Restaging app to apply Anthropic env vars"
+  cf restage "$APP_NAME"
+else
+  echo "==> ANTHROPIC_API_KEY not set; AI proctoring endpoint will stay disabled"
+fi
 
 echo "==> Deployment complete. App details:"
 cf app "$APP_NAME"

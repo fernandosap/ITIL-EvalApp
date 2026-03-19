@@ -46,11 +46,21 @@ export HANA_ENCRYPT=true
 export HANA_SSL_VALIDATE_CERTIFICATE=false
 ```
 
+Optional (server-side AI proctoring via Anthropic):
+
+```bash
+export ANTHROPIC_API_KEY=<your-key>
+export ANTHROPIC_MODEL=claude-sonnet-4-20250514
+export ANTHROPIC_VERSION=2023-06-01
+```
+
 4. Deploy:
 
 ```bash
 ./deploy_btp.sh --domain <your-default-domain>
 ```
+
+If `ANTHROPIC_API_KEY` is present, the script sets Anthropic env vars on the app and restages automatically.
 
 5. Get route:
 

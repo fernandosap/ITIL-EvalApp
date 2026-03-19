@@ -1084,25 +1084,18 @@ async function proctor() {
     c.width=Math.min(v.videoWidth,320); c.height=Math.min(v.videoHeight,240);
     c.getContext('2d').drawImage(v,0,0,c.width,c.height);
     const b64=c.toDataURL('image/jpeg',0.65).split(',')[1];
-    const resp=await fetch('https://api.anthropic.com/v1/messages',{
+    const resp=await apiFetch('/api/proctor/check',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({
-        model:'claude-sonnet-4-20250514', max_tokens:100,
-        messages:[{role:'user',content:[
-          {type:'image',source:{type:'base64',media_type:'image/jpeg',data:b64}},
-          {type:'text',text:'Exam proctor AI. Respond ONLY with JSON, no other text: {"flag":false,"reason":null} or {"flag":true,"reason":"brief reason"}. Flag ONLY if: no face visible, second person visible, phone/notes visible, candidate clearly looking away for extended period. Do NOT flag for minor head movements, blinking, or adjusting posture.'}
-        ]}]
-      })
-    });
+      body:JSON.stringify({imageB64:b64})
+    },{timeoutMs:15000,retries:0});
     if(!resp.ok) return;
     const d=await resp.json();
-    const txt=(d.content||[]).filter(c=>c.type==='text').map(c=>c.text).join('');
-    const res=JSON.parse(txt.trim());
-    if(res.flag){
-      log('ai_flag', res.reason||'AI proctoring flag');
+    if(d.enabled===false) return;
+    if(d.flag){
+      log('ai_flag', d.reason||'AI proctoring flag');
       modal('🚨','Proctoring Alert',
-        `An automated proctoring check has flagged the following concern:\n\n"${res.reason||'Suspicious behaviour detected'}"\n\nThis event has been logged against your access code and will be reviewed by your proctor.\n\nPlease ensure only you are visible on camera and no unauthorised materials are present.`,
+        `An automated proctoring check has flagged the following concern:\n\n"${d.reason||'Suspicious behaviour detected'}"\n\nThis event has been logged against your access code and will be reviewed by your proctor.\n\nPlease ensure only you are visible on camera and no unauthorised materials are present.`,
         [{label:'I understand', cls:'btn-danger'}]);
     }
   }catch(e){}
