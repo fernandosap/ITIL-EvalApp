@@ -85,6 +85,23 @@ function toCsvCell(v) {
   return `"${s.replace(/"/g, '""')}"`;
 }
 
+let _hasNotesColumn = null;
+async function hasNotesColumn(conn) {
+  if (_hasNotesColumn !== null) return _hasNotesColumn;
+  const rows = await execQuery(
+    conn,
+    `SELECT COUNT(*) AS CNT
+       FROM SYS.TABLE_COLUMNS
+      WHERE SCHEMA_NAME = ?
+        AND TABLE_NAME = 'ACCESS_CODES'
+        AND COLUMN_NAME = 'NOTES'`,
+    [String(HANA_SCHEMA || '').toUpperCase()]
+  );
+  const cnt = rows && rows[0] ? Number(rows[0].CNT || 0) : 0;
+  _hasNotesColumn = cnt > 0;
+  return _hasNotesColumn;
+}
+
 async function withDb(fn) {
   const conn = dbConnect();
   try {
@@ -114,9 +131,10 @@ app.get('/api/health', async (_req, res) => {
 app.get('/api/bootstrap', async (_req, res) => {
   try {
     const payload = await withDb(async (conn) => {
+      const hasNotes = await hasNotesColumn(conn);
       const codeRows = await execQuery(
         conn,
-        `SELECT ACCESS_CODE, LABEL, STATUS, CREATED_AT, SCORE, PCT, PASS
+        `SELECT ACCESS_CODE, LABEL, ${hasNotes ? 'NOTES,' : ''} STATUS, CREATED_AT, SCORE, PCT, PASS
          FROM ACCESS_CODES`
       );
       const sessionRows = await execQuery(
@@ -134,6 +152,7 @@ app.get('/api/bootstrap', async (_req, res) => {
       for (const r of codeRows) {
         codebook[r.ACCESS_CODE] = {
           label: r.LABEL || null,
+          notes: hasNotes ? (r.NOTES || '') : '',
           status: r.STATUS || 'unused',
           createdAt: r.CREATED_AT ? new Date(r.CREATED_AT).toISOString() : null,
           score: r.SCORE === null ? undefined : r.SCORE,
@@ -173,32 +192,46 @@ app.put('/api/codebook', async (req, res) => {
 
   try {
     await withDb(async (conn) => {
-      const sql = `
-        MERGE INTO ACCESS_CODES T
-        USING (SELECT ? AS ACCESS_CODE, ? AS LABEL, ? AS STATUS, ? AS SCORE, ? AS PCT, ? AS PASS FROM DUMMY) S
-        ON (T.ACCESS_CODE = S.ACCESS_CODE)
-        WHEN MATCHED THEN UPDATE SET
-          T.LABEL = S.LABEL,
-          T.STATUS = S.STATUS,
-          T.SCORE = S.SCORE,
-          T.PCT = S.PCT,
-          T.PASS = S.PASS,
-          T.UPDATED_AT = CURRENT_UTCTIMESTAMP
-        WHEN NOT MATCHED THEN INSERT
-          (ACCESS_CODE, LABEL, STATUS, SCORE, PCT, PASS, CREATED_AT, UPDATED_AT)
-          VALUES (S.ACCESS_CODE, S.LABEL, S.STATUS, S.SCORE, S.PCT, S.PASS, CURRENT_UTCTIMESTAMP, CURRENT_UTCTIMESTAMP)
-      `;
+      const hasNotes = await hasNotesColumn(conn);
+      const sql = hasNotes
+        ? `
+          MERGE INTO ACCESS_CODES T
+          USING (SELECT ? AS ACCESS_CODE, ? AS LABEL, ? AS NOTES, ? AS STATUS, ? AS SCORE, ? AS PCT, ? AS PASS FROM DUMMY) S
+          ON (T.ACCESS_CODE = S.ACCESS_CODE)
+          WHEN MATCHED THEN UPDATE SET
+            T.LABEL = S.LABEL,
+            T.NOTES = S.NOTES,
+            T.STATUS = S.STATUS,
+            T.SCORE = S.SCORE,
+            T.PCT = S.PCT,
+            T.PASS = S.PASS,
+            T.UPDATED_AT = CURRENT_UTCTIMESTAMP
+          WHEN NOT MATCHED THEN INSERT
+            (ACCESS_CODE, LABEL, NOTES, STATUS, SCORE, PCT, PASS, CREATED_AT, UPDATED_AT)
+            VALUES (S.ACCESS_CODE, S.LABEL, S.NOTES, S.STATUS, S.SCORE, S.PCT, S.PASS, CURRENT_UTCTIMESTAMP, CURRENT_UTCTIMESTAMP)
+        `
+        : `
+          MERGE INTO ACCESS_CODES T
+          USING (SELECT ? AS ACCESS_CODE, ? AS LABEL, ? AS STATUS, ? AS SCORE, ? AS PCT, ? AS PASS FROM DUMMY) S
+          ON (T.ACCESS_CODE = S.ACCESS_CODE)
+          WHEN MATCHED THEN UPDATE SET
+            T.LABEL = S.LABEL,
+            T.STATUS = S.STATUS,
+            T.SCORE = S.SCORE,
+            T.PCT = S.PCT,
+            T.PASS = S.PASS,
+            T.UPDATED_AT = CURRENT_UTCTIMESTAMP
+          WHEN NOT MATCHED THEN INSERT
+            (ACCESS_CODE, LABEL, STATUS, SCORE, PCT, PASS, CREATED_AT, UPDATED_AT)
+            VALUES (S.ACCESS_CODE, S.LABEL, S.STATUS, S.SCORE, S.PCT, S.PASS, CURRENT_UTCTIMESTAMP, CURRENT_UTCTIMESTAMP)
+        `;
 
       for (const [code, v] of Object.entries(codebook)) {
         const row = v || {};
-        await execQuery(conn, sql, [
-          code,
-          row.label || null,
-          row.status || 'unused',
-          row.score ?? null,
-          row.pct ?? null,
-          row.pass ?? null
-        ]);
+        const params = hasNotes
+          ? [code, row.label || null, row.notes || '', row.status || 'unused', row.score ?? null, row.pct ?? null, row.pass ?? null]
+          : [code, row.label || null, row.status || 'unused', row.score ?? null, row.pct ?? null, row.pass ?? null];
+        await execQuery(conn, sql, params);
       }
     });
     res.json({ ok: true });
@@ -361,11 +394,13 @@ app.get('/api/admin/codes', async (_req, res) => {
 app.get('/api/admin/export.csv', async (_req, res) => {
   try {
     const rows = await withDb(async (conn) => {
+      const hasNotes = await hasNotesColumn(conn);
       return execQuery(
         conn,
         `SELECT
            c.ACCESS_CODE,
            c.LABEL,
+           ${hasNotes ? 'c.NOTES' : `'' AS NOTES`},
            c.STATUS,
            r.SCORE,
            r.PCT,
@@ -380,13 +415,14 @@ app.get('/api/admin/export.csv', async (_req, res) => {
     });
 
     const lines = [
-      'Code,Label,Status,Score,Pct,Result,TabSwitches,Incidents,SubmittedAt'
+      'Code,Seat,Notes,Status,Score,Pct,Result,TabSwitches,Incidents,SubmittedAt'
     ];
     for (const r of rows) {
       const resultLabel = r.PASS === null || r.PASS === undefined ? '' : (r.PASS ? 'PASS' : 'FAIL');
       lines.push([
         toCsvCell(r.ACCESS_CODE),
         toCsvCell(r.LABEL || ''),
+        toCsvCell(r.NOTES || ''),
         toCsvCell(r.STATUS || ''),
         toCsvCell(r.SCORE ?? ''),
         toCsvCell(r.PCT === null || r.PCT === undefined ? '' : `${r.PCT}%`),

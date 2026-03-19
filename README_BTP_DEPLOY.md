@@ -75,3 +75,11 @@ Use `--var default_domain=...` on deploy so the URL stays constant across pushes
 
 - App and API are served from the same domain, so no CORS setup is needed.
 - Sessions/results/codes are persisted in HANA through the Node API.
+
+## Migration (Admin Notes)
+
+If you are adopting the newer HTML admin functionality with seat notes, run:
+
+- [`migrations/2026-03-18_add_notes_to_access_codes.sql`](/Users/I848070/Documents/Github/ITIL-EvalApp/migrations/2026-03-18_add_notes_to_access_codes.sql)
+
+This migration is idempotent and only adds `ACCESS_CODES.NOTES` if it does not already exist.

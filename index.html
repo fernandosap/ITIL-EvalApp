@@ -1041,8 +1041,13 @@ function onBlur() {
 }
 function onFocus() {
   if(S.screen!=='exam'||S.submitted||!_blurTime) return;
-  const secs = Math.round((Date.now()-_blurTime)/1000);
+  const awayMs = Date.now() - _blurTime;
+  const secs = Math.round(awayMs/1000);
   _blurTime = null;
+  // Very short focus losses can indicate screenshot/snipping shortcuts on some OS/browser combos.
+  if (awayMs > 0 && awayMs < 450) {
+    log('possible_screenshot', `Brief focus loss: ${awayMs}ms`);
+  }
   if(secs>=2){
     log('focus_returned',`Away ${secs}s`);
     modal('⚠️','Browser Window Lost Focus',
@@ -1109,6 +1114,25 @@ document.addEventListener('keydown',e=>{
   if(S.screen!=='exam') return;
   if(e.key==='F12'||(e.ctrlKey&&'uUiIjJsS'.includes(e.key))){
     e.preventDefault(); log('shortcut',`Ctrl+${e.key}`);
+    return;
+  }
+
+  const isWinPrintScreen = e.key==='PrintScreen' && !e.metaKey;
+  const isAltPrintScreen = e.key==='PrintScreen' && e.altKey;
+  const isCtrlP = e.ctrlKey && (e.key==='p'||e.key==='P');
+  const isCtrlShiftS = e.ctrlKey && e.shiftKey && (e.key==='s'||e.key==='S');
+  const isSnippingTool = e.metaKey && e.shiftKey && (e.key==='s'||e.key==='S');
+  if(isWinPrintScreen||isAltPrintScreen||isCtrlP||isCtrlShiftS||isSnippingTool){
+    e.preventDefault();
+    const label = isWinPrintScreen ? 'PrintScreen'
+                : isAltPrintScreen ? 'Alt+PrintScreen'
+                : isCtrlP          ? 'Ctrl+P (print/screenshot)'
+                : isCtrlShiftS     ? 'Ctrl+Shift+S'
+                : 'Win+Shift+S (Snipping Tool)';
+    log('screenshot_attempt', label);
+    modal('🚨','Screenshot Detected',
+      `A screenshot attempt (${label}) has been detected and logged against your access code.\n\nScreenshots of this exam are strictly prohibited. This incident will be reviewed by your proctor and may affect the validity of your result.\n\nPlease do not attempt to capture exam content.`,
+      [{label:'I understand', cls:'btn-danger'}]);
   }
 });
 
@@ -1222,20 +1246,32 @@ function showAdmin() {
   S.screen = 'admin';
   document.body.classList.remove('exam-bg');
   const cb = codebookGet();
-  const codes = Object.entries(cb).sort((a,b)=>a[0].localeCompare(b[0]));
+  const codes = Object.entries(cb).sort((a,b)=>{
+    const na = parseInt((a[1].label||'').replace(/\D/g,''), 10) || 0;
+    const nb = parseInt((b[1].label||'').replace(/\D/g,''), 10) || 0;
+    return na - nb;
+  });
   const unused = codes.filter(([,v])=>v.status==='unused').length;
   const active = codes.filter(([,v])=>v.status==='active').length;
   const completed = codes.filter(([,v])=>v.status==='completed').length;
 
   const rows = codes.length === 0
-    ? '<tr><td colspan="7" style="text-align:center;padding:32px;color:#aaa">No codes generated yet. Use the form below.</td></tr>'
+    ? '<tr><td colspan="8" style="text-align:center;padding:32px;color:#aaa">No codes generated yet. Use the form below.</td></tr>'
     : codes.map(([code,v]) => {
         const res = resultGet(code);
         const chipClass = v.status==='completed'?'chip-pass':v.status==='active'?'chip-active':'chip-unused';
         const statusLabel = v.status==='completed'?'Completed':v.status==='active'?'In Progress':'Unused';
+        const note = (v.notes||'').replace(/"/g,'&quot;');
         return `<tr>
           <td style="font-family:monospace;font-weight:800;font-size:15px;letter-spacing:2px;color:#1F3864">${code}</td>
           <td>${v.label||'—'}</td>
+          <td>
+            <input type="text" value="${note}" placeholder=""
+              onkeydown="if(event.key==='Enter'){this.blur()}"
+              style="width:100%;min-width:140px;border:1.5px solid #d0d8e8;border-radius:5px;padding:5px 8px;font-size:13px;color:#1a1a2e;background:white;box-sizing:border-box;outline:none;"
+              onfocus="this.style.borderColor='#2E75B6'"
+              onblur="saveNote('${code}',this.value);this.style.borderColor='#d0d8e8'">
+          </td>
           <td><span class="chip ${chipClass}">${statusLabel}</span></td>
           <td style="text-align:center">${res?`<strong>${res.score}/30</strong> <span style="font-size:11px;color:#888">(${res.pct}%)</span>`:'—'}</td>
           <td style="text-align:center">${res?(res.pass?'<span class="chip chip-pass">PASS</span>':'<span class="chip chip-fail">FAIL</span>'):'—'}</td>
@@ -1246,10 +1282,10 @@ function showAdmin() {
         </tr>`;
       }).join('');
 
-  const csv = ['Code,Label,Status,Score,Pct,Result,TabSwitches,Incidents,SubmittedAt']
+  const csv = ['Code,Seat,Notes,Status,Score,Pct,Result,TabSwitches,Incidents,SubmittedAt']
     .concat(codes.map(([code,v]) => {
       const res = resultGet(code);
-      return `${code},"${v.label||''}",${v.status},${res?res.score:''},${res?res.pct+'%':''},${res?(res.pass?'PASS':'FAIL'):''},${res?res.tabSwitches||0:''},${res?res.incidentCount||0:''},"${res?res.submittedAt:''}"`;
+      return `${code},"${v.label||''}","${(v.notes||'').replace(/"/g,'""')}",${v.status},${res?res.score:''},${res?res.pct+'%':''},${res?(res.pass?'PASS':'FAIL'):''},${res?res.tabSwitches||0:''},${res?res.incidentCount||0:''},"${res?res.submittedAt:''}"`;
     })).join('\n');
   window._adminCsv = csv;
 
@@ -1302,7 +1338,7 @@ function showAdmin() {
     <div class="card" style="padding:0;overflow-x:auto">
       <table class="admin-table">
         <thead><tr>
-          <th>Code</th><th>Label</th><th>Status</th>
+          <th>Code</th><th>Label</th><th>Notes</th><th>Status</th>
           <th style="text-align:center">Score</th>
           <th style="text-align:center">Result</th>
           <th style="text-align:center">Flags</th>
@@ -1362,6 +1398,13 @@ function dlCodeMapping() {
   const a = document.createElement('a');
   a.href=url; a.download='ITIL4_Access_Codes.csv'; a.click();
   URL.revokeObjectURL(url);
+}
+
+function saveNote(code, val) {
+  const cb = codebookGet();
+  if (!cb[code]) return;
+  cb[code].notes = (val || '').trim();
+  codebookSet(cb);
 }
 
 function confirmReset(code) {
