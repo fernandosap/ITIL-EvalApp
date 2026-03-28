@@ -5,6 +5,7 @@ const CFG = {
 };
 
 let _adminToken = null;
+let _adminSystemStatus = null;
 const API_TIMEOUT_MS = 12000;
 const API_BASE_RETRY_MS = 600;
 const SAVE_UI = { cls: 'save-pill', text: 'Saved' };
@@ -863,19 +864,45 @@ async function showAdmin() {
   document.body.classList.remove('exam-bg');
   render('<div class="admin-wrap"><div style="padding:60px;text-align:center;color:white;font-size:18px">Loading admin data...</div></div>');
   let data;
+  let systemStatus;
   try {
-    data = await apiJson('/api/admin/codes', {}, { timeoutMs: 12000, retries: 1 });
+    [data, systemStatus] = await Promise.all([
+      apiJson('/api/admin/codes', {}, { timeoutMs: 12000, retries: 1 }),
+      apiJson('/api/admin/system-status', {}, { timeoutMs: 12000, retries: 1 })
+    ]);
   } catch (_e) {
     data = null;
+    systemStatus = null;
   }
   if (!data || data.error) {
     modal('❌', 'Error', 'Could not load admin data from the server.', [{ label: 'OK', cls: 'btn-primary' }]);
     return;
   }
+  _adminSystemStatus = systemStatus;
   _adminRows = data.codes || [];
   const unused = summaryValue(_adminRows, 'unused');
   const active = summaryValue(_adminRows, 'active');
   const completed = summaryValue(_adminRows, 'completed');
+  const warnings = Array.isArray(systemStatus?.warnings) ? systemStatus.warnings : [];
+  const systemBanner = systemStatus ? `
+    <div class="card" style="margin-bottom:16px;background:${systemStatus.ok ? 'rgba(238,247,242,.98)' : 'rgba(255,245,245,.98)'};border-left:6px solid ${systemStatus.ok ? '#2e7d32' : '#c0392b'}">
+      <div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:flex-start">
+        <div>
+          <div style="font-size:16px;font-weight:800;color:${systemStatus.ok ? '#1f5f2c' : '#9f2d22'}">
+            ${systemStatus.ok ? 'System status healthy' : 'System status needs attention'}
+          </div>
+          <div style="font-size:13px;color:#555;margin-top:4px">
+            ${systemStatus.questionCount} questions · ${systemStatus.accessCodeCount} codes · ${systemStatus.activeSessionCount} active sessions · ${systemStatus.resultCount} completed results
+          </div>
+        </div>
+        <div style="font-size:12px;color:#666;text-align:right">
+          <div>Schema: ${_esc(systemStatus.schema || '—')}</div>
+          <div>Notes: ${systemStatus.notesEnabled ? 'enabled' : 'missing'}</div>
+          <div>Admin env: ${systemStatus.adminConfigured ? 'configured' : 'missing'}</div>
+        </div>
+      </div>
+      ${warnings.length ? `<div style="margin-top:10px;font-size:13px;color:#7a251d">${warnings.map((w) => `• ${_esc(w)}`).join('<br>')}</div>` : ''}
+    </div>` : '';
 
   const rows = _adminRows.map((row) => `
     <tr>
@@ -904,6 +931,7 @@ async function showAdmin() {
         <button class="btn btn-secondary btn-sm" onclick="showAdmin()">↻ Refresh</button>
       </div>
     </div>
+    ${systemBanner}
     <div class="card" style="padding:0;overflow-x:auto">
       <table class="admin-table">
         <thead>

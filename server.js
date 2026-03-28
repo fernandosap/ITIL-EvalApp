@@ -792,6 +792,48 @@ app.get('/api/admin/codes', requireAdmin, async (_req, res) => {
   }
 });
 
+app.get('/api/admin/system-status', requireAdmin, async (_req, res) => {
+  try {
+    const status = await withDb(async (conn) => {
+      const questionBank = await loadQuestionBank(conn);
+      const hasNotes = await hasNotesColumn(conn);
+      const accessCodeRows = await execQuery(conn, 'SELECT COUNT(*) AS CNT FROM ACCESS_CODES');
+      const resultRows = await execQuery(conn, 'SELECT COUNT(*) AS CNT FROM EXAM_RESULTS');
+      const sessionRows = await execQuery(conn, 'SELECT COUNT(*) AS CNT FROM EXAM_SESSIONS');
+      return {
+        ok: questionBank.total > 0,
+        schema: HANA_SCHEMA,
+        questionCount: questionBank.total,
+        accessCodeCount: Number(accessCodeRows?.[0]?.CNT || 0),
+        resultCount: Number(resultRows?.[0]?.CNT || 0),
+        activeSessionCount: Number(sessionRows?.[0]?.CNT || 0),
+        notesEnabled: Boolean(hasNotes),
+        adminConfigured: Boolean(ADMIN_HASH),
+        warnings: [
+          ...(questionBank.total > 0 ? [] : ['Question bank is empty.']),
+          ...(hasNotes ? [] : ['ACCESS_CODES.NOTES column is missing.']),
+          ...(ADMIN_HASH ? [] : ['ADMIN_HASH is not configured on the server.'])
+        ]
+      };
+    });
+    res.json(status);
+  } catch (err) {
+    appLog('error', 'admin_system_status_failed', { message: err.message });
+    res.status(500).json({
+      ok: false,
+      schema: HANA_SCHEMA,
+      questionCount: 0,
+      accessCodeCount: 0,
+      resultCount: 0,
+      activeSessionCount: 0,
+      notesEnabled: false,
+      adminConfigured: Boolean(ADMIN_HASH),
+      warnings: ['Could not load system status from HANA.'],
+      error: 'admin_system_status_failed'
+    });
+  }
+});
+
 app.post('/api/admin/note', requireAdmin, async (req, res) => {
   const code = String(req.body?.code || '').trim().toUpperCase();
   const notes = String(req.body?.notes || '');
