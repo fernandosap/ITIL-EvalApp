@@ -3,6 +3,8 @@ set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_NAME="itil4-evalapp"
+APP_REVISION="${APP_REVISION:-$(git rev-parse --short HEAD 2>/dev/null || echo dev)}"
+APP_DEPLOYED_AT="${APP_DEPLOYED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 
 usage() {
   cat <<'EOF'
@@ -166,8 +168,12 @@ cf push \
   --var "hana_ssl_validate_certificate=$HANA_SSL_VALIDATE_CERTIFICATE"
 
 if [[ -n "${ADMIN_HASH:-}" ]]; then
-  echo "==> Configuring ADMIN_HASH for secure admin login"
-  cf set-env "$APP_NAME" ADMIN_HASH "$ADMIN_HASH"
+echo "==> Configuring ADMIN_HASH for secure admin login"
+cf set-env "$APP_NAME" ADMIN_HASH "$ADMIN_HASH"
+
+echo "==> Configuring build metadata"
+cf set-env "$APP_NAME" APP_REVISION "$APP_REVISION"
+cf set-env "$APP_NAME" APP_DEPLOYED_AT "$APP_DEPLOYED_AT"
   NEED_RESTAGE="true"
 else
   NEED_RESTAGE="false"

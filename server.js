@@ -6,6 +6,7 @@ const path = require('path');
 const crypto = require('crypto');
 const express = require('express');
 const hana = require('@sap/hana-client');
+const { version: APP_VERSION } = require('./package.json');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -27,6 +28,8 @@ const EXAM_DURATION_SECS = Number(process.env.EXAM_DURATION_SECS || 45 * 60);
 const EXAM_PASS_PCT = Number(process.env.EXAM_PASS_PCT || 80);
 const EXAM_ACTIVE = String(process.env.EXAM_ACTIVE || 'true').toLowerCase() !== 'false';
 const PROCTOR_ENABLED = String(process.env.PROCTOR_ENABLED || 'true').toLowerCase() !== 'false';
+const APP_REVISION = process.env.APP_REVISION || 'dev';
+const APP_DEPLOYED_AT = process.env.APP_DEPLOYED_AT || new Date().toISOString();
 
 const HAS_DB_CONFIG = Boolean(HANA_HOST && HANA_USER && HANA_PASSWORD && HANA_SCHEMA);
 const INDEX_PATH = path.join(__dirname, 'index.html');
@@ -807,6 +810,9 @@ app.get('/api/admin/system-status', requireAdmin, async (_req, res) => {
         accessCodeCount: Number(accessCodeRows?.[0]?.CNT || 0),
         resultCount: Number(resultRows?.[0]?.CNT || 0),
         activeSessionCount: Number(sessionRows?.[0]?.CNT || 0),
+        appVersion: APP_VERSION,
+        appRevision: APP_REVISION,
+        deployedAt: APP_DEPLOYED_AT,
         notesEnabled: Boolean(hasNotes),
         adminConfigured: Boolean(ADMIN_HASH),
         warnings: [
@@ -826,11 +832,34 @@ app.get('/api/admin/system-status', requireAdmin, async (_req, res) => {
       accessCodeCount: 0,
       resultCount: 0,
       activeSessionCount: 0,
+      appVersion: APP_VERSION,
+      appRevision: APP_REVISION,
+      deployedAt: APP_DEPLOYED_AT,
       notesEnabled: false,
       adminConfigured: Boolean(ADMIN_HASH),
       warnings: ['Could not load system status from HANA.'],
       error: 'admin_system_status_failed'
     });
+  }
+});
+
+app.get('/api/admin/question-probe', requireAdmin, async (_req, res) => {
+  try {
+    const questionBank = await getQuestionBank();
+    const idx = Math.floor(Math.random() * questionBank.total);
+    const question = questionBank.questions[idx];
+    res.json({
+      ok: true,
+      questionIndex: idx,
+      total: questionBank.total,
+      multi: Boolean(question.multi),
+      optionCount: Array.isArray(question.opts) ? question.opts.length : 0,
+      notePresent: Boolean(question.note),
+      stemPreview: String(question.stem || '').slice(0, 220)
+    });
+  } catch (err) {
+    appLog('error', 'admin_question_probe_failed', { message: err.message });
+    res.status(500).json({ ok: false, error: 'admin_question_probe_failed' });
   }
 });
 

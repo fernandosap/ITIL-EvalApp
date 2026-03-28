@@ -859,6 +859,24 @@ function flagsFor(code) {
   modal('🚨', `Flags for ${code}`, body, [{ label: 'Close', cls: 'btn-primary' }]);
 }
 
+async function probeQuestions() {
+  try {
+    const resp = await apiJson('/api/admin/question-probe', {}, { timeoutMs: 10000, retries: 0 });
+    if (!resp || !resp.ok) throw new Error('probe_failed');
+    const body = [
+      `Question ${resp.questionIndex + 1} of ${resp.total}`,
+      resp.multi ? 'Type: multi-select' : 'Type: single-select',
+      `Options: ${resp.optionCount}`,
+      `Note present: ${resp.notePresent ? 'yes' : 'no'}`,
+      '',
+      resp.stemPreview || '(no question text returned)'
+    ].join('\n');
+    modal('🧪', 'Question Bank Probe', body, [{ label: 'Close', cls: 'btn-primary' }]);
+  } catch (_e) {
+    modal('❌', 'Probe Failed', 'Could not read a sample question from HANA.', [{ label: 'OK', cls: 'btn-primary' }]);
+  }
+}
+
 async function showAdmin() {
   S.screen = 'admin';
   document.body.classList.remove('exam-bg');
@@ -896,6 +914,9 @@ async function showAdmin() {
           </div>
         </div>
         <div style="font-size:12px;color:#666;text-align:right">
+          <div>Version: ${_esc(systemStatus.appVersion || '—')}</div>
+          <div>Revision: ${_esc(systemStatus.appRevision || '—')}</div>
+          <div>Deployed: ${systemStatus.deployedAt ? _esc(new Date(systemStatus.deployedAt).toLocaleString()) : '—'}</div>
           <div>Schema: ${_esc(systemStatus.schema || '—')}</div>
           <div>Notes: ${systemStatus.notesEnabled ? 'enabled' : 'missing'}</div>
           <div>Admin env: ${systemStatus.adminConfigured ? 'configured' : 'missing'}</div>
@@ -927,6 +948,7 @@ async function showAdmin() {
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
         <button class="btn btn-primary btn-sm" onclick="generateCodes()">+ Generate Codes</button>
+        <button class="btn btn-secondary btn-sm" onclick="probeQuestions()">🧪 Probe Questions</button>
         <button class="btn btn-secondary btn-sm" onclick="downloadExport()">⬇ Export CSV</button>
         <button class="btn btn-secondary btn-sm" onclick="showAdmin()">↻ Refresh</button>
       </div>
@@ -1015,6 +1037,7 @@ window.resetCode = resetCode;
 window.generateCodes = generateCodes;
 window.downloadExport = downloadExport;
 window.flagsFor = flagsFor;
+window.probeQuestions = probeQuestions;
 
 window.addEventListener('beforeunload', () => {
   if (S.screen === 'exam' && !S.submitted) saveProgress();
