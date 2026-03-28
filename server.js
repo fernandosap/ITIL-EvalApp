@@ -30,6 +30,7 @@ const EXAM_ACTIVE = String(process.env.EXAM_ACTIVE || 'true').toLowerCase() !== 
 const PROCTOR_ENABLED = String(process.env.PROCTOR_ENABLED || 'true').toLowerCase() !== 'false';
 const APP_REVISION = process.env.APP_REVISION || 'dev';
 const APP_DEPLOYED_AT = process.env.APP_DEPLOYED_AT || new Date().toISOString();
+const STALE_SESSION_MINUTES = Math.max(5, Number(process.env.STALE_SESSION_MINUTES || 30));
 
 const HAS_DB_CONFIG = Boolean(HANA_HOST && HANA_USER && HANA_PASSWORD && HANA_SCHEMA);
 const INDEX_PATH = path.join(__dirname, 'index.html');
@@ -864,6 +865,15 @@ app.get('/api/admin/system-status', requireAdmin, async (_req, res) => {
       const accessCodeRows = await execQuery(conn, 'SELECT COUNT(*) AS CNT FROM ACCESS_CODES');
       const resultRows = await execQuery(conn, 'SELECT COUNT(*) AS CNT FROM EXAM_RESULTS');
       const sessionRows = await execQuery(conn, 'SELECT COUNT(*) AS CNT FROM EXAM_SESSIONS');
+      const staleSessionRows = await execQuery(
+        conn,
+        `SELECT ACCESS_CODE, UPDATED_AT
+           FROM EXAM_SESSIONS
+          WHERE UPDATED_AT < ADD_SECONDS(CURRENT_UTCTIMESTAMP, ?)
+          ORDER BY UPDATED_AT ASC
+          LIMIT 5`,
+        [-1 * STALE_SESSION_MINUTES * 60]
+      );
       const auditRows = auditEnabled ? await execQuery(conn, 'SELECT COUNT(*) AS CNT FROM ADMIN_AUDIT_LOG') : [{ CNT: 0 }];
       return {
         ok: questionBank.total > 0,
@@ -872,6 +882,12 @@ app.get('/api/admin/system-status', requireAdmin, async (_req, res) => {
         accessCodeCount: Number(accessCodeRows?.[0]?.CNT || 0),
         resultCount: Number(resultRows?.[0]?.CNT || 0),
         activeSessionCount: Number(sessionRows?.[0]?.CNT || 0),
+        staleSessionCount: staleSessionRows.length,
+        staleSessionMinutes: STALE_SESSION_MINUTES,
+        staleSessions: staleSessionRows.map((row) => ({
+          code: row.ACCESS_CODE,
+          updatedAt: row.UPDATED_AT ? new Date(row.UPDATED_AT).toISOString() : null
+        })),
         auditCount: Number(auditRows?.[0]?.CNT || 0),
         appVersion: APP_VERSION,
         appRevision: APP_REVISION,
@@ -882,6 +898,7 @@ app.get('/api/admin/system-status', requireAdmin, async (_req, res) => {
         warnings: [
           ...(questionBank.total > 0 ? [] : ['Question bank is empty.']),
           ...(hasNotes ? [] : ['ACCESS_CODES.NOTES column is missing.']),
+          ...(staleSessionRows.length ? [`${staleSessionRows.length} active session(s) look stale (${STALE_SESSION_MINUTES}+ min without a save).`] : []),
           ...(auditEnabled ? [] : ['ADMIN_AUDIT_LOG table is missing.']),
           ...(ADMIN_HASH ? [] : ['ADMIN_HASH is not configured on the server.'])
         ]
@@ -897,6 +914,9 @@ app.get('/api/admin/system-status', requireAdmin, async (_req, res) => {
       accessCodeCount: 0,
       resultCount: 0,
       activeSessionCount: 0,
+      staleSessionCount: 0,
+      staleSessionMinutes: STALE_SESSION_MINUTES,
+      staleSessions: [],
       auditCount: 0,
       appVersion: APP_VERSION,
       appRevision: APP_REVISION,

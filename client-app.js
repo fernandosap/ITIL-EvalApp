@@ -918,6 +918,7 @@ async function showAdmin() {
   const active = summaryValue(_adminRows, 'active');
   const completed = summaryValue(_adminRows, 'completed');
   const warnings = Array.isArray(systemStatus?.warnings) ? systemStatus.warnings : [];
+  const staleSessions = Array.isArray(systemStatus?.staleSessions) ? systemStatus.staleSessions : [];
   const systemBanner = systemStatus ? `
     <div class="card" style="margin-bottom:16px;background:${systemStatus.ok ? 'rgba(238,247,242,.98)' : 'rgba(255,245,245,.98)'};border-left:6px solid ${systemStatus.ok ? '#2e7d32' : '#c0392b'}">
       <div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:flex-start">
@@ -935,10 +936,15 @@ async function showAdmin() {
           <div>Deployed: ${systemStatus.deployedAt ? _esc(new Date(systemStatus.deployedAt).toLocaleString()) : '—'}</div>
           <div>Schema: ${_esc(systemStatus.schema || '—')}</div>
           <div>Notes: ${systemStatus.notesEnabled ? 'enabled' : 'missing'}</div>
+          <div>Stale sessions: ${systemStatus.staleSessionCount || 0}</div>
           <div>Audit log: ${systemStatus.auditEnabled ? `${systemStatus.auditCount} entries` : 'missing'}</div>
           <div>Admin env: ${systemStatus.adminConfigured ? 'configured' : 'missing'}</div>
         </div>
       </div>
+      ${staleSessions.length ? `<div style="margin-top:10px;padding:10px 12px;background:rgba(255,248,230,.9);border-radius:10px;color:#8a5b00;font-size:13px">
+        <strong>Stale active sessions (${systemStatus.staleSessionMinutes}+ min):</strong><br>
+        ${staleSessions.map((s) => `${_esc(s.code)} · last save ${s.updatedAt ? _esc(new Date(s.updatedAt).toLocaleString()) : 'unknown'}`).join('<br>')}
+      </div>` : ''}
       ${warnings.length ? `<div style="margin-top:10px;font-size:13px;color:#7a251d">${warnings.map((w) => `• ${_esc(w)}`).join('<br>')}</div>` : ''}
     </div>` : '';
 
