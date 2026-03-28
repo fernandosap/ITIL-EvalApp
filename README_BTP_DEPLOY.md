@@ -85,6 +85,7 @@ Use `--var default_domain=...` on deploy so the URL stays constant across pushes
 
 - App and API are served from the same domain, so no CORS setup is needed.
 - Sessions/results/codes are persisted in HANA through the Node API.
+- The question bank is also stored in HANA and is no longer committed in the active app code.
 
 ## Migration (Admin Notes)
 
@@ -93,3 +94,20 @@ If you are adopting the newer HTML admin functionality with seat notes, run:
 - [`migrations/2026-03-18_add_notes_to_access_codes.sql`](/Users/I848070/Documents/Github/ITIL-EvalApp/migrations/2026-03-18_add_notes_to_access_codes.sql)
 
 This migration is idempotent and only adds `ACCESS_CODES.NOTES` if it does not already exist.
+
+## Migration (Question Bank)
+
+Run this once in HANA to create the secure question storage table:
+
+- [2026-03-28_create_exam_questions.sql](/Users/I848070/Documents/Github/ITIL-EvalApp/migrations/2026-03-28_create_exam_questions.sql)
+
+The app now reads questions and answer keys from `EXAM_QUESTIONS`.
+
+## Secure Question Updates
+
+When updating exam content in the future:
+
+1. Do not embed questions, answers, access codes, or admin hashes in `index.html` or any standalone HTML file.
+2. Do not commit the active question bank into the repository.
+3. Load updated questions directly into `ITIL_EXAM.EXAM_QUESTIONS` in HANA.
+4. Deploy the app after the HANA content update if backend behavior changes.
