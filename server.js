@@ -979,6 +979,59 @@ app.get('/api/admin/audit', requireAdmin, async (req, res) => {
   }
 });
 
+app.post('/api/admin/clear-stale-sessions', requireAdmin, async (req, res) => {
+  try {
+    const payload = await withDb(async (conn) => {
+      const staleRows = await execQuery(
+        conn,
+        `SELECT ACCESS_CODE
+           FROM EXAM_SESSIONS
+          WHERE UPDATED_AT < ADD_SECONDS(CURRENT_UTCTIMESTAMP, ?)
+          ORDER BY UPDATED_AT ASC`,
+        [-1 * STALE_SESSION_MINUTES * 60]
+      );
+
+      const cleared = [];
+      for (const row of staleRows) {
+        const code = String(row.ACCESS_CODE || '').trim().toUpperCase();
+        if (!code) continue;
+        await deleteSession(conn, code);
+        await execQuery(
+          conn,
+          `UPDATE ACCESS_CODES
+              SET STATUS = 'unused',
+                  UPDATED_AT = CURRENT_UTCTIMESTAMP
+            WHERE ACCESS_CODE = ?
+              AND STATUS = 'active'
+              AND NOT EXISTS (
+                SELECT 1 FROM EXAM_RESULTS r WHERE r.ACCESS_CODE = ACCESS_CODES.ACCESS_CODE
+              )`,
+          [code]
+        );
+        cleared.push(code);
+      }
+
+      await writeAdminAudit(conn, {
+        action: 'admin_stale_sessions_cleared',
+        actor: 'admin',
+        clientIp: getClientIp(req),
+        details: { count: cleared.length, codes: cleared.slice(0, 20) }
+      });
+
+      return { ok: true, clearedCount: cleared.length, clearedCodes: cleared };
+    });
+
+    for (const [token, value] of _examSessions.entries()) {
+      if (payload.clearedCodes.includes(value.code)) _examSessions.delete(token);
+    }
+
+    res.json(payload);
+  } catch (err) {
+    appLog('error', 'admin_clear_stale_sessions_failed', { message: err.message });
+    res.status(500).json({ error: 'admin_clear_stale_sessions_failed' });
+  }
+});
+
 app.post('/api/admin/note', requireAdmin, async (req, res) => {
   const code = String(req.body?.code || '').trim().toUpperCase();
   const notes = String(req.body?.notes || '');

@@ -878,6 +878,21 @@ async function probeQuestions() {
   }
 }
 
+async function clearStaleSessions() {
+  modal('⚠️', 'Clear Stale Sessions', `Clear all stale active sessions older than ${_adminSystemStatus?.staleSessionMinutes || 30} minutes? This will remove saved in-progress state for those stale entries only.`, [
+    { label: 'Clear Stale Sessions', cls: 'btn-danger', action: async () => {
+      try {
+        const resp = await apiJson('/api/admin/clear-stale-sessions', { method: 'POST', body: JSON.stringify({}) }, { timeoutMs: 15000, retries: 0 });
+        if (!resp || !resp.ok) throw new Error('clear_failed');
+        modal('✅', 'Stale Sessions Cleared', `${resp.clearedCount} stale session(s) were cleared.`, [{ label: 'Refresh', cls: 'btn-primary', action: () => showAdmin() }]);
+      } catch (_e) {
+        modal('❌', 'Clear Failed', 'Could not clear stale sessions.', [{ label: 'OK', cls: 'btn-primary' }]);
+      }
+    }},
+    { label: 'Cancel', cls: 'btn-secondary' }
+  ]);
+}
+
 function auditActionLabel(action) {
   switch (action) {
     case 'admin_login_success': return 'Login success';
@@ -885,6 +900,7 @@ function auditActionLabel(action) {
     case 'admin_note_saved': return 'Note saved';
     case 'admin_code_reset': return 'Code reset';
     case 'admin_codes_generated': return 'Codes generated';
+    case 'admin_stale_sessions_cleared': return 'Stale sessions cleared';
     default: return action || 'Unknown action';
   }
 }
@@ -944,6 +960,7 @@ async function showAdmin() {
       ${staleSessions.length ? `<div style="margin-top:10px;padding:10px 12px;background:rgba(255,248,230,.9);border-radius:10px;color:#8a5b00;font-size:13px">
         <strong>Stale active sessions (${systemStatus.staleSessionMinutes}+ min):</strong><br>
         ${staleSessions.map((s) => `${_esc(s.code)} · last save ${s.updatedAt ? _esc(new Date(s.updatedAt).toLocaleString()) : 'unknown'}`).join('<br>')}
+        <div style="margin-top:10px"><button class="btn btn-danger btn-sm" onclick="clearStaleSessions()">Clear Stale Sessions</button></div>
       </div>` : ''}
       ${warnings.length ? `<div style="margin-top:10px;font-size:13px;color:#7a251d">${warnings.map((w) => `• ${_esc(w)}`).join('<br>')}</div>` : ''}
     </div>` : '';
@@ -1088,6 +1105,7 @@ window.generateCodes = generateCodes;
 window.downloadExport = downloadExport;
 window.flagsFor = flagsFor;
 window.probeQuestions = probeQuestions;
+window.clearStaleSessions = clearStaleSessions;
 
 window.addEventListener('beforeunload', () => {
   if (S.screen === 'exam' && !S.submitted) saveProgress();
