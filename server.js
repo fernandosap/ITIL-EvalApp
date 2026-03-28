@@ -117,6 +117,7 @@ function parseAnthropicText(content) {
 }
 
 let _hasNotesColumn = null;
+let _hasAuditLogTable = null;
 async function hasNotesColumn(conn) {
   if (_hasNotesColumn !== null) return _hasNotesColumn;
   const rows = await execQuery(
@@ -132,8 +133,28 @@ async function hasNotesColumn(conn) {
   return _hasNotesColumn;
 }
 
+async function hasAuditLogTable(conn) {
+  if (_hasAuditLogTable !== null) return _hasAuditLogTable;
+  const rows = await execQuery(
+    conn,
+    `SELECT COUNT(*) AS CNT
+       FROM SYS.TABLES
+      WHERE SCHEMA_NAME = ?
+        AND TABLE_NAME = 'ADMIN_AUDIT_LOG'`,
+    [String(HANA_SCHEMA || '').toUpperCase()]
+  );
+  _hasAuditLogTable = Number(rows?.[0]?.CNT || 0) > 0;
+  return _hasAuditLogTable;
+}
+
 function sha256(str) {
   return crypto.createHash('sha256').update(String(str)).digest('hex');
+}
+
+function getClientIp(req) {
+  const xfwd = req.headers['x-forwarded-for'];
+  if (typeof xfwd === 'string' && xfwd.trim()) return xfwd.split(',')[0].trim();
+  return req.socket?.remoteAddress || 'unknown';
 }
 
 function makePRNG(seed) {
@@ -201,6 +222,33 @@ function requireAdmin(req, res, next) {
   const token = String(req.headers['x-admin-token'] || '').trim();
   if (!isValidAdminToken(token)) return res.status(401).json({ error: 'unauthorized' });
   next();
+}
+
+async function writeAdminAudit(conn, entry) {
+  if (!(await hasAuditLogTable(conn))) return false;
+  await execQuery(
+    conn,
+    `INSERT INTO ADMIN_AUDIT_LOG (ACTION, TARGET_CODE, DETAILS_JSON, ACTOR, CLIENT_IP, CREATED_AT)
+     VALUES (?, ?, ?, ?, ?, CURRENT_UTCTIMESTAMP)`,
+    [
+      String(entry.action || 'unknown'),
+      entry.targetCode ? String(entry.targetCode) : null,
+      entry.details ? JSON.stringify(entry.details) : null,
+      String(entry.actor || 'admin'),
+      entry.clientIp ? String(entry.clientIp) : null
+    ]
+  );
+  return true;
+}
+
+async function tryWriteAdminAudit(entry) {
+  if (!HAS_DB_CONFIG) return false;
+  try {
+    return await withDb(async (conn) => writeAdminAudit(conn, entry));
+  } catch (err) {
+    appLog('warn', 'admin_audit_write_failed', { message: err.message, action: entry.action });
+    return false;
+  }
 }
 
 function createExamSessionFromBank(code, questionBank) {
@@ -747,14 +795,26 @@ app.get('/api/result/:code', async (req, res) => {
 
 app.post('/api/admin/login', (req, res) => {
   if (!ADMIN_HASH) return res.status(503).json({ ok: false, error: 'admin_not_configured' });
-  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+  const ip = getClientIp(req);
   if (!checkRateLimit(String(ip))) return res.status(429).json({ ok: false, error: 'too_many_attempts' });
 
   const hash = String(req.body?.hash || '').trim().toLowerCase();
   if (!hash || hash !== ADMIN_HASH) {
+    void tryWriteAdminAudit({
+      action: 'admin_login_failed',
+      actor: 'admin',
+      clientIp: ip,
+      details: { reason: 'invalid_credentials' }
+    });
     return setTimeout(() => res.status(401).json({ ok: false, error: 'invalid_credentials' }), 350);
   }
 
+  void tryWriteAdminAudit({
+    action: 'admin_login_success',
+    actor: 'admin',
+    clientIp: ip,
+    details: { ok: true }
+  });
   return res.json({ ok: true, token: createAdminToken() });
 });
 
@@ -800,9 +860,11 @@ app.get('/api/admin/system-status', requireAdmin, async (_req, res) => {
     const status = await withDb(async (conn) => {
       const questionBank = await loadQuestionBank(conn);
       const hasNotes = await hasNotesColumn(conn);
+      const auditEnabled = await hasAuditLogTable(conn);
       const accessCodeRows = await execQuery(conn, 'SELECT COUNT(*) AS CNT FROM ACCESS_CODES');
       const resultRows = await execQuery(conn, 'SELECT COUNT(*) AS CNT FROM EXAM_RESULTS');
       const sessionRows = await execQuery(conn, 'SELECT COUNT(*) AS CNT FROM EXAM_SESSIONS');
+      const auditRows = auditEnabled ? await execQuery(conn, 'SELECT COUNT(*) AS CNT FROM ADMIN_AUDIT_LOG') : [{ CNT: 0 }];
       return {
         ok: questionBank.total > 0,
         schema: HANA_SCHEMA,
@@ -810,14 +872,17 @@ app.get('/api/admin/system-status', requireAdmin, async (_req, res) => {
         accessCodeCount: Number(accessCodeRows?.[0]?.CNT || 0),
         resultCount: Number(resultRows?.[0]?.CNT || 0),
         activeSessionCount: Number(sessionRows?.[0]?.CNT || 0),
+        auditCount: Number(auditRows?.[0]?.CNT || 0),
         appVersion: APP_VERSION,
         appRevision: APP_REVISION,
         deployedAt: APP_DEPLOYED_AT,
         notesEnabled: Boolean(hasNotes),
+        auditEnabled,
         adminConfigured: Boolean(ADMIN_HASH),
         warnings: [
           ...(questionBank.total > 0 ? [] : ['Question bank is empty.']),
           ...(hasNotes ? [] : ['ACCESS_CODES.NOTES column is missing.']),
+          ...(auditEnabled ? [] : ['ADMIN_AUDIT_LOG table is missing.']),
           ...(ADMIN_HASH ? [] : ['ADMIN_HASH is not configured on the server.'])
         ]
       };
@@ -832,10 +897,12 @@ app.get('/api/admin/system-status', requireAdmin, async (_req, res) => {
       accessCodeCount: 0,
       resultCount: 0,
       activeSessionCount: 0,
+      auditCount: 0,
       appVersion: APP_VERSION,
       appRevision: APP_REVISION,
       deployedAt: APP_DEPLOYED_AT,
       notesEnabled: false,
+      auditEnabled: false,
       adminConfigured: Boolean(ADMIN_HASH),
       warnings: ['Could not load system status from HANA.'],
       error: 'admin_system_status_failed'
@@ -863,6 +930,35 @@ app.get('/api/admin/question-probe', requireAdmin, async (_req, res) => {
   }
 });
 
+app.get('/api/admin/audit', requireAdmin, async (req, res) => {
+  const limit = Math.min(Math.max(Number(req.query?.limit) || 20, 1), 100);
+  try {
+    const entries = await withDb(async (conn) => {
+      if (!(await hasAuditLogTable(conn))) return [];
+      const rows = await execQuery(
+        conn,
+        `SELECT AUDIT_ID, ACTION, TARGET_CODE, DETAILS_JSON, ACTOR, CLIENT_IP, CREATED_AT
+           FROM ADMIN_AUDIT_LOG
+          ORDER BY CREATED_AT DESC
+          LIMIT ${limit}`
+      );
+      return rows.map((row) => ({
+        id: row.AUDIT_ID,
+        action: row.ACTION,
+        targetCode: row.TARGET_CODE || '',
+        actor: row.ACTOR || 'admin',
+        clientIp: row.CLIENT_IP || '',
+        createdAt: row.CREATED_AT ? new Date(row.CREATED_AT).toISOString() : null,
+        details: parseJsonOrNull(row.DETAILS_JSON) || null
+      }));
+    });
+    res.json({ entries });
+  } catch (err) {
+    appLog('error', 'admin_audit_fetch_failed', { message: err.message });
+    res.status(500).json({ error: 'admin_audit_fetch_failed' });
+  }
+});
+
 app.post('/api/admin/note', requireAdmin, async (req, res) => {
   const code = String(req.body?.code || '').trim().toUpperCase();
   const notes = String(req.body?.notes || '');
@@ -873,6 +969,13 @@ app.post('/api/admin/note', requireAdmin, async (req, res) => {
       if (await hasNotesColumn(conn)) {
         await execQuery(conn, 'UPDATE ACCESS_CODES SET NOTES = ?, UPDATED_AT = CURRENT_UTCTIMESTAMP WHERE ACCESS_CODE = ?', [notes, code]);
       }
+      await writeAdminAudit(conn, {
+        action: 'admin_note_saved',
+        targetCode: code,
+        actor: 'admin',
+        clientIp: getClientIp(req),
+        details: { noteLength: notes.length }
+      });
     });
     res.json({ ok: true });
   } catch (err) {
@@ -890,6 +993,13 @@ app.post('/api/admin/reset', requireAdmin, async (req, res) => {
       await deleteSession(conn, code);
       await execQuery(conn, 'DELETE FROM EXAM_RESULTS WHERE ACCESS_CODE = ?', [code]);
       await execQuery(conn, 'UPDATE ACCESS_CODES SET STATUS = ?, SCORE = NULL, PCT = NULL, PASS = NULL, UPDATED_AT = CURRENT_UTCTIMESTAMP WHERE ACCESS_CODE = ?', ['unused', code]);
+      await writeAdminAudit(conn, {
+        action: 'admin_code_reset',
+        targetCode: code,
+        actor: 'admin',
+        clientIp: getClientIp(req),
+        details: { status: 'unused' }
+      });
     });
     for (const [token, value] of _examSessions.entries()) {
       if (value.code === code) _examSessions.delete(token);
@@ -933,6 +1043,12 @@ app.post('/api/admin/generate', requireAdmin, async (req, res) => {
         const params = hasNotes ? [created[i], label, ''] : [created[i], label];
         await execQuery(conn, sql, params);
       }
+      await writeAdminAudit(conn, {
+        action: 'admin_codes_generated',
+        actor: 'admin',
+        clientIp: getClientIp(req),
+        details: { count: created.length, firstCode: created[0] || null, lastCode: created[created.length - 1] || null }
+      });
       return created.length;
     });
 

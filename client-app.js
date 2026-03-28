@@ -6,6 +6,7 @@ const CFG = {
 
 let _adminToken = null;
 let _adminSystemStatus = null;
+let _adminAuditEntries = [];
 const API_TIMEOUT_MS = 12000;
 const API_BASE_RETRY_MS = 600;
 const SAVE_UI = { cls: 'save-pill', text: 'Saved' };
@@ -877,26 +878,41 @@ async function probeQuestions() {
   }
 }
 
+function auditActionLabel(action) {
+  switch (action) {
+    case 'admin_login_success': return 'Login success';
+    case 'admin_login_failed': return 'Login failed';
+    case 'admin_note_saved': return 'Note saved';
+    case 'admin_code_reset': return 'Code reset';
+    case 'admin_codes_generated': return 'Codes generated';
+    default: return action || 'Unknown action';
+  }
+}
+
 async function showAdmin() {
   S.screen = 'admin';
   document.body.classList.remove('exam-bg');
   render('<div class="admin-wrap"><div style="padding:60px;text-align:center;color:white;font-size:18px">Loading admin data...</div></div>');
   let data;
   let systemStatus;
+  let auditData;
   try {
-    [data, systemStatus] = await Promise.all([
+    [data, systemStatus, auditData] = await Promise.all([
       apiJson('/api/admin/codes', {}, { timeoutMs: 12000, retries: 1 }),
-      apiJson('/api/admin/system-status', {}, { timeoutMs: 12000, retries: 1 })
+      apiJson('/api/admin/system-status', {}, { timeoutMs: 12000, retries: 1 }),
+      apiJson('/api/admin/audit?limit=12', {}, { timeoutMs: 12000, retries: 1 })
     ]);
   } catch (_e) {
     data = null;
     systemStatus = null;
+    auditData = null;
   }
   if (!data || data.error) {
     modal('❌', 'Error', 'Could not load admin data from the server.', [{ label: 'OK', cls: 'btn-primary' }]);
     return;
   }
   _adminSystemStatus = systemStatus;
+  _adminAuditEntries = Array.isArray(auditData?.entries) ? auditData.entries : [];
   _adminRows = data.codes || [];
   const unused = summaryValue(_adminRows, 'unused');
   const active = summaryValue(_adminRows, 'active');
@@ -919,6 +935,7 @@ async function showAdmin() {
           <div>Deployed: ${systemStatus.deployedAt ? _esc(new Date(systemStatus.deployedAt).toLocaleString()) : '—'}</div>
           <div>Schema: ${_esc(systemStatus.schema || '—')}</div>
           <div>Notes: ${systemStatus.notesEnabled ? 'enabled' : 'missing'}</div>
+          <div>Audit log: ${systemStatus.auditEnabled ? `${systemStatus.auditCount} entries` : 'missing'}</div>
           <div>Admin env: ${systemStatus.adminConfigured ? 'configured' : 'missing'}</div>
         </div>
       </div>
@@ -954,6 +971,33 @@ async function showAdmin() {
       </div>
     </div>
     ${systemBanner}
+    <div class="card" style="margin-bottom:16px">
+      <div style="display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+        <div style="font-size:16px;font-weight:800;color:#1F3864">Recent Admin Activity</div>
+        <div style="font-size:12px;color:#666">${_adminAuditEntries.length ? `${_adminAuditEntries.length} latest events` : 'No audit events yet'}</div>
+      </div>
+      <div style="overflow-x:auto">
+        <table class="admin-table">
+          <thead>
+            <tr>
+              <th>Time</th><th>Action</th><th>Target</th><th>IP</th><th>Details</th>
+            </tr>
+          </thead>
+          <tbody>${
+            _adminAuditEntries.length
+              ? _adminAuditEntries.map((entry) => `
+                <tr>
+                  <td style="white-space:nowrap">${entry.createdAt ? _esc(new Date(entry.createdAt).toLocaleString()) : '—'}</td>
+                  <td>${_esc(auditActionLabel(entry.action))}</td>
+                  <td style="font-family:monospace">${_esc(entry.targetCode || '—')}</td>
+                  <td style="font-family:monospace">${_esc(entry.clientIp || '—')}</td>
+                  <td>${_esc(entry.details ? JSON.stringify(entry.details) : '—')}</td>
+                </tr>`).join('')
+              : '<tr><td colspan="5" style="text-align:center;color:#888;padding:16px">No admin audit activity recorded yet</td></tr>'
+          }</tbody>
+        </table>
+      </div>
+    </div>
     <div class="card" style="padding:0;overflow-x:auto">
       <table class="admin-table">
         <thead>
