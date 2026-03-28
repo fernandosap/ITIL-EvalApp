@@ -6,7 +6,6 @@ const path = require('path');
 const crypto = require('crypto');
 const express = require('express');
 const hana = require('@sap/hana-client');
-const { QUESTIONS, ANSWER_KEY } = require('./exam-data');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -39,6 +38,7 @@ const _examSessions = new Map();
 const _validateAttempts = new Map();
 const VALIDATE_MAX = 10;
 const VALIDATE_WINDOW = 10 * 60 * 1000;
+let _questionBankCache = null;
 
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: false }));
@@ -151,10 +151,10 @@ function seededShuffle(arr, rng) {
   return out;
 }
 
-function buildOrdering(code) {
+function buildOrdering(questions, code) {
   const rng = makePRNG(code);
-  const qOrder = seededShuffle(QUESTIONS.map((_, idx) => idx), rng);
-  const optOrders = qOrder.map((qIdx) => seededShuffle(QUESTIONS[qIdx].opts.map((_, idx) => idx), rng));
+  const qOrder = seededShuffle(questions.map((_, idx) => idx), rng);
+  const optOrders = qOrder.map((qIdx) => seededShuffle(questions[qIdx].opts.map((_, idx) => idx), rng));
   return { qOrder, optOrders };
 }
 
@@ -200,8 +200,8 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-function createExamSession(code) {
-  const { qOrder, optOrders } = buildOrdering(code);
+function createExamSessionFromBank(code, questionBank) {
+  const { qOrder, optOrders } = buildOrdering(questionBank.questions, code);
   const token = crypto.randomBytes(32).toString('hex');
   _examSessions.set(token, {
     code,
@@ -249,14 +249,61 @@ function checkRateLimit(ip) {
   return true;
 }
 
-function getExamConfig() {
+async function loadQuestionBank(conn) {
+  if (_questionBankCache) return _questionBankCache;
+
+  const rows = await execQuery(
+    conn,
+    `SELECT QUESTION_INDEX, STEM, NOTE, OPTS_JSON, ANSWER_JSON, MULTI
+       FROM EXAM_QUESTIONS
+      ORDER BY QUESTION_INDEX ASC`
+  );
+
+  const questions = rows.map((row) => {
+    const opts = parseJsonOrNull(row.OPTS_JSON);
+    const answer = parseJsonOrNull(row.ANSWER_JSON);
+    if (!Array.isArray(opts) || !Array.isArray(answer)) {
+      throw new Error(`Invalid question payload for QUESTION_INDEX=${row.QUESTION_INDEX}`);
+    }
+    return {
+      stem: String(row.STEM || ''),
+      note: row.NOTE || null,
+      opts: opts.map((opt) => String(opt)),
+      multi: Boolean(row.MULTI)
+    };
+  });
+
+  const answerKey = rows.map((row) => {
+    const answer = parseJsonOrNull(row.ANSWER_JSON);
+    if (!Array.isArray(answer)) throw new Error(`Invalid answer payload for QUESTION_INDEX=${row.QUESTION_INDEX}`);
+    return answer.map((value) => Number(value));
+  });
+
+  if (!questions.length) {
+    throw new Error('Question bank is empty. Load EXAM_QUESTIONS before starting the app.');
+  }
+
+  _questionBankCache = {
+    questions,
+    answerKey,
+    total: questions.length
+  };
+  return _questionBankCache;
+}
+
+async function getQuestionBank() {
+  return withDb(async (conn) => loadQuestionBank(conn));
+}
+
+function getExamConfig(questionBank) {
+  const total = Number(questionBank?.total || 0);
   return {
     examName: EXAM_NAME,
     examActive: EXAM_ACTIVE,
     durationSecs: EXAM_DURATION_SECS,
     passPct: EXAM_PASS_PCT,
-    passScore: Math.ceil(QUESTIONS.length * EXAM_PASS_PCT / 100),
-    total: QUESTIONS.length,
+    passScore: Math.ceil(total * EXAM_PASS_PCT / 100),
+    total,
     proctorEnabled: PROCTOR_ENABLED
   };
 }
@@ -370,7 +417,7 @@ async function saveResult(conn, code, result) {
     [
       code,
       result.score ?? 0,
-      result.total ?? QUESTIONS.length,
+      result.total ?? 0,
       result.pct ?? 0,
       result.pass ? 1 : 0,
       result.autoSubmit ? 1 : 0,
@@ -395,7 +442,8 @@ async function updateCodeStatus(conn, code, status, result = null) {
   );
 }
 
-function gradeExamFromSession(session, answers) {
+function gradeExamFromSession(session, answers, questionBank) {
+  const answerKey = questionBank.answerKey;
   let score = 0;
   const questionResults = [];
 
@@ -406,13 +454,13 @@ function gradeExamFromSession(session, answers) {
       .filter((idx) => Number.isInteger(idx) && idx >= 0 && idx < optionOrder.length)
       .map((idx) => optionOrder[idx])
       .sort((a, b) => a - b);
-    const expected = (ANSWER_KEY[questionIdx] || []).slice().sort((a, b) => a - b);
+    const expected = (answerKey[questionIdx] || []).slice().sort((a, b) => a - b);
     const correct = originalSelection.join(',') === expected.join(',');
     if (correct) score += 1;
     questionResults.push({ displayIdx, questionIdx, correct, given: originalSelection, expected });
   });
 
-  const total = QUESTIONS.length;
+  const total = questionBank.total;
   const pct = Math.round((score / total) * 100);
   const pass = pct >= EXAM_PASS_PCT;
   return { score, total, pct, pass, questionResults };
@@ -482,18 +530,25 @@ app.post('/api/proctor/check', async (req, res) => {
 app.get('/api/health', async (_req, res) => {
   if (!HAS_DB_CONFIG) return res.status(500).json({ ok: false, message: 'Missing HANA env vars.' });
   try {
-    await withDb(async (conn) => {
+    const questionBank = await withDb(async (conn) => {
       await execQuery(conn, 'SELECT 1 AS OK FROM DUMMY');
+      return loadQuestionBank(conn);
     });
-    res.json({ ok: true, db: 'connected', schema: HANA_SCHEMA, totalQuestions: QUESTIONS.length });
+    res.json({ ok: true, db: 'connected', schema: HANA_SCHEMA, totalQuestions: questionBank.total });
   } catch (err) {
     appLog('error', 'health_failed', { message: err.message });
     res.status(500).json({ ok: false, message: err.message });
   }
 });
 
-app.get('/api/status', (_req, res) => {
-  res.json(getExamConfig());
+app.get('/api/status', async (_req, res) => {
+  try {
+    const questionBank = await getQuestionBank();
+    res.json(getExamConfig(questionBank));
+  } catch (err) {
+    appLog('error', 'status_failed', { message: err.message });
+    res.status(500).json({ error: 'status_failed', message: err.message });
+  }
 });
 
 app.get('/api/bootstrap', (_req, res) => {
@@ -501,9 +556,6 @@ app.get('/api/bootstrap', (_req, res) => {
 });
 
 app.post('/api/validate', async (req, res) => {
-  const cfg = getExamConfig();
-  if (!cfg.examActive) return res.json({ valid: false, reason: 'exam_not_active' });
-
   const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
   if (!checkRateLimit(String(ip))) return res.status(429).json({ valid: false, reason: 'too_many_attempts' });
 
@@ -511,6 +563,10 @@ app.post('/api/validate', async (req, res) => {
   if (!/^[A-Z2-9]{6}$/.test(code)) return res.json({ valid: false, reason: 'invalid_format' });
 
   try {
+    const questionBank = await getQuestionBank();
+    const cfg = getExamConfig(questionBank);
+    if (!cfg.examActive) return res.json({ valid: false, reason: 'exam_not_active' });
+
     const result = await withDb(async (conn) => {
       const codeRow = await getCodeRow(conn, code);
       if (!codeRow) return { valid: false, reason: 'not_found' };
@@ -541,6 +597,7 @@ app.post('/api/session/start', async (req, res) => {
   if (!/^[A-Z2-9]{6}$/.test(code)) return res.status(400).json({ error: 'invalid_code' });
 
   try {
+    const questionBank = await getQuestionBank();
     const payload = await withDb(async (conn) => {
       const codeRow = await getCodeRow(conn, code);
       if (!codeRow) return { status: 404, body: { error: 'code_not_found' } };
@@ -552,7 +609,7 @@ app.post('/api/session/start', async (req, res) => {
 
       if (fresh) await deleteSession(conn, code);
       const progress = fresh ? null : await getSavedSession(conn, code);
-      const { token } = createExamSession(code);
+      const { token } = createExamSessionFromBank(code, questionBank);
       await updateCodeStatus(conn, code, 'active');
 
       return {
@@ -561,7 +618,7 @@ app.post('/api/session/start', async (req, res) => {
           ok: true,
           examToken: token,
           progress,
-          ...getExamConfig()
+          ...getExamConfig(questionBank)
         }
       };
     });
@@ -573,24 +630,31 @@ app.post('/api/session/start', async (req, res) => {
   }
 });
 
-app.get('/api/question/:displayIdx', requireExamSession, (req, res) => {
+app.get('/api/question/:displayIdx', requireExamSession, async (req, res) => {
   const displayIdx = Number(req.params.displayIdx);
   const session = req.examSession;
   if (!Number.isInteger(displayIdx) || displayIdx < 0 || displayIdx >= session.qOrder.length) {
     return res.status(400).json({ error: 'invalid_question_index' });
   }
 
-  const questionIdx = session.qOrder[displayIdx];
-  const question = QUESTIONS[questionIdx];
-  const optionOrder = session.optOrders[displayIdx];
-  res.json({
-    displayIdx,
-    total: QUESTIONS.length,
-    stem: question.stem,
-    note: question.note || null,
-    multi: Boolean(question.multi),
-    opts: optionOrder.map((idx) => question.opts[idx])
-  });
+  try {
+    const questionBank = await getQuestionBank();
+    const questionIdx = session.qOrder[displayIdx];
+    const question = questionBank.questions[questionIdx];
+    const optionOrder = session.optOrders[displayIdx];
+    if (!question) return res.status(404).json({ error: 'question_not_found' });
+    res.json({
+      displayIdx,
+      total: questionBank.total,
+      stem: question.stem,
+      note: question.note || null,
+      multi: Boolean(question.multi),
+      opts: optionOrder.map((idx) => question.opts[idx])
+    });
+  } catch (err) {
+    appLog('error', 'question_fetch_failed', { message: err.message, displayIdx });
+    res.status(500).json({ error: 'question_fetch_failed', message: err.message });
+  }
 });
 
 app.post('/api/progress', requireExamSession, async (req, res) => {
@@ -631,7 +695,8 @@ app.post('/api/submit', requireExamSession, async (req, res) => {
   const autoSubmit = Boolean(req.body?.autoSubmit);
 
   try {
-    const result = gradeExamFromSession(session, answers);
+    const questionBank = await getQuestionBank();
+    const result = gradeExamFromSession(session, answers, questionBank);
     const record = {
       code,
       score: result.score,
