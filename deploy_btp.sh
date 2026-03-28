@@ -26,6 +26,8 @@ Notes:
   - Required HANA vars:
     HANA_HOST, HANA_PORT, HANA_USER, HANA_PASSWORD, HANA_SCHEMA,
     HANA_ENCRYPT, HANA_SSL_VALIDATE_CERTIFICATE
+  - Recommended admin auth var:
+    ADMIN_HASH
   - Optional Anthropic vars for AI proctoring:
     ANTHROPIC_API_KEY, ANTHROPIC_MODEL, ANTHROPIC_VERSION
 EOF
@@ -163,6 +165,15 @@ cf push \
   --var "hana_encrypt=$HANA_ENCRYPT" \
   --var "hana_ssl_validate_certificate=$HANA_SSL_VALIDATE_CERTIFICATE"
 
+if [[ -n "${ADMIN_HASH:-}" ]]; then
+  echo "==> Configuring ADMIN_HASH for secure admin login"
+  cf set-env "$APP_NAME" ADMIN_HASH "$ADMIN_HASH"
+  NEED_RESTAGE="true"
+else
+  NEED_RESTAGE="false"
+  echo "==> ADMIN_HASH not set; admin login will be disabled until it is configured"
+fi
+
 if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
   echo "==> Configuring Anthropic env vars for server-side proctoring"
   cf set-env "$APP_NAME" ANTHROPIC_API_KEY "$ANTHROPIC_API_KEY"
@@ -172,10 +183,14 @@ if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
   if [[ -n "${ANTHROPIC_VERSION:-}" ]]; then
     cf set-env "$APP_NAME" ANTHROPIC_VERSION "$ANTHROPIC_VERSION"
   fi
-  echo "==> Restaging app to apply Anthropic env vars"
-  cf restage "$APP_NAME"
+  NEED_RESTAGE="true"
 else
   echo "==> ANTHROPIC_API_KEY not set; AI proctoring endpoint will stay disabled"
+fi
+
+if [[ "$NEED_RESTAGE" == "true" ]]; then
+  echo "==> Restaging app to apply environment variable changes"
+  cf restage "$APP_NAME"
 fi
 
 echo "==> Deployment complete. App details:"

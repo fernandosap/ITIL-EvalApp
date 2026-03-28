@@ -3,8 +3,10 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const express = require('express');
 const hana = require('@sap/hana-client');
+const { QUESTIONS, ANSWER_KEY } = require('./exam-data');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -20,18 +22,29 @@ const HANA_SSL_VALIDATE_CERTIFICATE =
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514';
 const ANTHROPIC_VERSION = process.env.ANTHROPIC_VERSION || '2023-06-01';
+const ADMIN_HASH = (process.env.ADMIN_HASH || '').trim().toLowerCase();
+const EXAM_NAME = process.env.EXAM_NAME || 'ITIL 4 Foundation';
+const EXAM_DURATION_SECS = Number(process.env.EXAM_DURATION_SECS || 45 * 60);
+const EXAM_PASS_PCT = Number(process.env.EXAM_PASS_PCT || 80);
+const EXAM_ACTIVE = String(process.env.EXAM_ACTIVE || 'true').toLowerCase() !== 'false';
+const PROCTOR_ENABLED = String(process.env.PROCTOR_ENABLED || 'true').toLowerCase() !== 'false';
 
 const HAS_DB_CONFIG = Boolean(HANA_HOST && HANA_USER && HANA_PASSWORD && HANA_SCHEMA);
-
 const INDEX_PATH = path.join(__dirname, 'index.html');
+const CLIENT_APP_PATH = path.join(__dirname, 'client-app.js');
+
+const EXAM_TTL_MS = 90 * 60 * 1000;
+const ADMIN_TTL_MS = 8 * 60 * 60 * 1000;
+const _examSessions = new Map();
+const _validateAttempts = new Map();
+const VALIDATE_MAX = 10;
+const VALIDATE_WINDOW = 10 * 60 * 1000;
 
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: false }));
 
 function dbConnect() {
-  if (!HAS_DB_CONFIG) {
-    throw new Error('HANA env vars are missing.');
-  }
+  if (!HAS_DB_CONFIG) throw new Error('HANA env vars are missing.');
   const conn = hana.createConnection();
   conn.connect({
     serverNode: `${HANA_HOST}:${HANA_PORT}`,
@@ -63,6 +76,16 @@ function closeConn(conn) {
   });
 }
 
+async function withDb(fn) {
+  const conn = dbConnect();
+  try {
+    await execQuery(conn, `SET SCHEMA "${HANA_SCHEMA}"`);
+    return await fn(conn);
+  } finally {
+    await closeConn(conn);
+  }
+}
+
 function parseJsonOrNull(s) {
   if (!s) return null;
   try {
@@ -73,19 +96,12 @@ function parseJsonOrNull(s) {
 }
 
 function appLog(level, event, meta = {}) {
-  const payload = {
-    ts: new Date().toISOString(),
-    level,
-    event,
-    ...meta
-  };
-  console.log(JSON.stringify(payload));
+  console.log(JSON.stringify({ ts: new Date().toISOString(), level, event, ...meta }));
 }
 
 function toCsvCell(v) {
   if (v === null || v === undefined) return '';
-  const s = String(v);
-  return `"${s.replace(/"/g, '""')}"`;
+  return `"${String(v).replace(/"/g, '""')}"`;
 }
 
 function parseAnthropicText(content) {
@@ -109,28 +125,303 @@ async function hasNotesColumn(conn) {
         AND COLUMN_NAME = 'NOTES'`,
     [String(HANA_SCHEMA || '').toUpperCase()]
   );
-  const cnt = rows && rows[0] ? Number(rows[0].CNT || 0) : 0;
-  _hasNotesColumn = cnt > 0;
+  _hasNotesColumn = Number(rows?.[0]?.CNT || 0) > 0;
   return _hasNotesColumn;
 }
 
-async function withDb(fn) {
-  const conn = dbConnect();
-  try {
-    await execQuery(conn, `SET SCHEMA "${HANA_SCHEMA}"`);
-    return await fn(conn);
-  } finally {
-    await closeConn(conn);
+function sha256(str) {
+  return crypto.createHash('sha256').update(String(str)).digest('hex');
+}
+
+function makePRNG(seed) {
+  let s = 0;
+  for (let i = 0; i < seed.length; i++) s = (Math.imul(s, 31) + seed.charCodeAt(i)) >>> 0;
+  return function prng() {
+    s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+    return s / 4294967296;
+  };
+}
+
+function seededShuffle(arr, rng) {
+  const out = [...arr];
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    [out[i], out[j]] = [out[j], out[i]];
   }
+  return out;
+}
+
+function buildOrdering(code) {
+  const rng = makePRNG(code);
+  const qOrder = seededShuffle(QUESTIONS.map((_, idx) => idx), rng);
+  const optOrders = qOrder.map((qIdx) => seededShuffle(QUESTIONS[qIdx].opts.map((_, idx) => idx), rng));
+  return { qOrder, optOrders };
+}
+
+function sanitizeProgress(progress) {
+  if (!progress || typeof progress !== 'object') return null;
+  return {
+    answers: Array.isArray(progress.answers) ? progress.answers : [],
+    visited: Array.isArray(progress.visited) ? progress.visited : [],
+    currentQ: Number.isInteger(progress.currentQ) ? progress.currentQ : (Number(progress.currentQ) || 0),
+    incidents: Array.isArray(progress.incidents) ? progress.incidents : [],
+    tabSwitches: Number(progress.tabSwitches) || 0,
+    elapsedMs: Number(progress.elapsedMs) || 0
+  };
+}
+
+function createAdminToken() {
+  if (!ADMIN_HASH) throw new Error('ADMIN_HASH is not configured.');
+  const expiry = Date.now() + ADMIN_TTL_MS;
+  const nonce = crypto.randomBytes(16).toString('hex');
+  const payload = `${expiry}:${nonce}`;
+  const sig = crypto.createHmac('sha256', ADMIN_HASH).update(payload).digest('hex');
+  return Buffer.from(`${payload}:${sig}`).toString('base64url');
+}
+
+function isValidAdminToken(token) {
+  try {
+    if (!token) return false;
+    const decoded = Buffer.from(token, 'base64url').toString();
+    const [expiry, nonce, sig] = decoded.split(':');
+    if (!expiry || !nonce || !sig) return false;
+    if (Date.now() > Number(expiry)) return false;
+    const expected = crypto.createHmac('sha256', ADMIN_HASH).update(`${expiry}:${nonce}`).digest('hex');
+    if (sig.length !== expected.length) return false;
+    return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
+  } catch (_e) {
+    return false;
+  }
+}
+
+function requireAdmin(req, res, next) {
+  const token = String(req.headers['x-admin-token'] || '').trim();
+  if (!isValidAdminToken(token)) return res.status(401).json({ error: 'unauthorized' });
+  next();
+}
+
+function createExamSession(code) {
+  const { qOrder, optOrders } = buildOrdering(code);
+  const token = crypto.randomBytes(32).toString('hex');
+  _examSessions.set(token, {
+    code,
+    qOrder,
+    optOrders,
+    createdAt: Date.now(),
+    expires: Date.now() + EXAM_TTL_MS
+  });
+  return { token, qOrder, optOrders };
+}
+
+function getExamSession(token) {
+  const session = token ? _examSessions.get(token) : null;
+  if (!session) return null;
+  if (session.expires < Date.now()) {
+    _examSessions.delete(token);
+    return null;
+  }
+  session.expires = Date.now() + EXAM_TTL_MS;
+  return session;
+}
+
+function requireExamSession(req, res, next) {
+  const token = String(req.headers['x-exam-token'] || '').trim();
+  const session = getExamSession(token);
+  if (!session) return res.status(401).json({ error: 'invalid_exam_session' });
+  req.examSession = session;
+  next();
+}
+
+function checkRateLimit(ip) {
+  const now = Date.now();
+  let entry = _validateAttempts.get(ip);
+  if (!entry || entry.resetAt < now) {
+    entry = { count: 0, resetAt: now + VALIDATE_WINDOW };
+    _validateAttempts.set(ip, entry);
+  }
+  entry.count += 1;
+  if (entry.count > VALIDATE_MAX) return false;
+  if (_validateAttempts.size > 1000) {
+    for (const [key, value] of _validateAttempts.entries()) {
+      if (value.resetAt < now) _validateAttempts.delete(key);
+    }
+  }
+  return true;
+}
+
+function getExamConfig() {
+  return {
+    examName: EXAM_NAME,
+    examActive: EXAM_ACTIVE,
+    durationSecs: EXAM_DURATION_SECS,
+    passPct: EXAM_PASS_PCT,
+    passScore: Math.ceil(QUESTIONS.length * EXAM_PASS_PCT / 100),
+    total: QUESTIONS.length,
+    proctorEnabled: PROCTOR_ENABLED
+  };
+}
+
+async function getCodeRow(conn, code) {
+  const hasNotes = await hasNotesColumn(conn);
+  const rows = await execQuery(
+    conn,
+    `SELECT ACCESS_CODE, LABEL, ${hasNotes ? 'NOTES,' : ''} STATUS, SCORE, PCT, PASS, CREATED_AT
+       FROM ACCESS_CODES
+      WHERE ACCESS_CODE = ?`,
+    [code]
+  );
+  if (!rows.length) return null;
+  const r = rows[0];
+  return {
+    accessCode: r.ACCESS_CODE,
+    label: r.LABEL || null,
+    notes: hasNotes ? (r.NOTES || '') : '',
+    status: r.STATUS || 'unused',
+    score: r.SCORE,
+    pct: r.PCT,
+    pass: r.PASS,
+    createdAt: r.CREATED_AT || null
+  };
+}
+
+async function getSavedSession(conn, code) {
+  const rows = await execQuery(
+    conn,
+    `SELECT SESSION_JSON, ELAPSED_MS, TAB_SWITCHES
+       FROM EXAM_SESSIONS
+      WHERE ACCESS_CODE = ?`,
+    [code]
+  );
+  if (!rows.length) return null;
+  const parsed = parseJsonOrNull(rows[0].SESSION_JSON);
+  const progress = sanitizeProgress(parsed);
+  if (!progress) return null;
+  progress.elapsedMs = Number(rows[0].ELAPSED_MS || progress.elapsedMs || 0);
+  progress.tabSwitches = Number(rows[0].TAB_SWITCHES || progress.tabSwitches || 0);
+  return progress;
+}
+
+async function saveSession(conn, code, progress) {
+  const payload = {
+    answers: progress.answers || [],
+    visited: progress.visited || [],
+    currentQ: progress.currentQ || 0,
+    incidents: progress.incidents || [],
+    tabSwitches: progress.tabSwitches || 0,
+    elapsedMs: progress.elapsedMs || 0
+  };
+  await execQuery(
+    conn,
+    `MERGE INTO EXAM_SESSIONS T
+      USING (SELECT ? AS ACCESS_CODE, ? AS SESSION_JSON, ? AS ELAPSED_MS, ? AS TAB_SWITCHES FROM DUMMY) S
+         ON (T.ACCESS_CODE = S.ACCESS_CODE)
+      WHEN MATCHED THEN UPDATE SET
+        T.SESSION_JSON = S.SESSION_JSON,
+        T.ELAPSED_MS = S.ELAPSED_MS,
+        T.TAB_SWITCHES = S.TAB_SWITCHES,
+        T.UPDATED_AT = CURRENT_UTCTIMESTAMP
+      WHEN NOT MATCHED THEN INSERT
+        (ACCESS_CODE, SESSION_JSON, ELAPSED_MS, TAB_SWITCHES, UPDATED_AT)
+        VALUES (S.ACCESS_CODE, S.SESSION_JSON, S.ELAPSED_MS, S.TAB_SWITCHES, CURRENT_UTCTIMESTAMP)`,
+    [code, JSON.stringify(payload), payload.elapsedMs, payload.tabSwitches]
+  );
+}
+
+async function deleteSession(conn, code) {
+  await execQuery(conn, 'DELETE FROM EXAM_SESSIONS WHERE ACCESS_CODE = ?', [code]);
+}
+
+async function getResultRecord(conn, code) {
+  const rows = await execQuery(
+    conn,
+    `SELECT RESULT_JSON
+       FROM EXAM_RESULTS
+      WHERE ACCESS_CODE = ?`,
+    [code]
+  );
+  if (!rows.length) return null;
+  return parseJsonOrNull(rows[0].RESULT_JSON);
+}
+
+async function saveResult(conn, code, result) {
+  await execQuery(
+    conn,
+    `MERGE INTO EXAM_RESULTS T
+      USING (
+        SELECT ? AS ACCESS_CODE, ? AS SCORE, ? AS TOTAL, ? AS PCT, ? AS PASS, ? AS AUTO_SUBMIT,
+               ? AS DURATION_SECS, ? AS TAB_SWITCHES, ? AS INCIDENT_COUNT, ? AS RESULT_JSON
+          FROM DUMMY
+      ) S
+         ON (T.ACCESS_CODE = S.ACCESS_CODE)
+      WHEN MATCHED THEN UPDATE SET
+        T.SCORE = S.SCORE,
+        T.TOTAL = S.TOTAL,
+        T.PCT = S.PCT,
+        T.PASS = S.PASS,
+        T.AUTO_SUBMIT = S.AUTO_SUBMIT,
+        T.DURATION_SECS = S.DURATION_SECS,
+        T.TAB_SWITCHES = S.TAB_SWITCHES,
+        T.INCIDENT_COUNT = S.INCIDENT_COUNT,
+        T.RESULT_JSON = S.RESULT_JSON,
+        T.SUBMITTED_AT = CURRENT_UTCTIMESTAMP
+      WHEN NOT MATCHED THEN INSERT
+        (ACCESS_CODE, SCORE, TOTAL, PCT, PASS, AUTO_SUBMIT, DURATION_SECS, TAB_SWITCHES, INCIDENT_COUNT, RESULT_JSON, SUBMITTED_AT)
+        VALUES (S.ACCESS_CODE, S.SCORE, S.TOTAL, S.PCT, S.PASS, S.AUTO_SUBMIT, S.DURATION_SECS, S.TAB_SWITCHES, S.INCIDENT_COUNT, S.RESULT_JSON, CURRENT_UTCTIMESTAMP)`,
+    [
+      code,
+      result.score ?? 0,
+      result.total ?? QUESTIONS.length,
+      result.pct ?? 0,
+      result.pass ? 1 : 0,
+      result.autoSubmit ? 1 : 0,
+      result.durationSecs ?? 0,
+      result.tabSwitches ?? 0,
+      result.incidentCount ?? 0,
+      JSON.stringify(result)
+    ]
+  );
+}
+
+async function updateCodeStatus(conn, code, status, result = null) {
+  await execQuery(
+    conn,
+    `UPDATE ACCESS_CODES
+        SET STATUS = ?,
+            SCORE = ?,
+            PCT = ?,
+            PASS = ?
+      WHERE ACCESS_CODE = ?`,
+    [status, result?.score ?? null, result?.pct ?? null, result?.pass == null ? null : (result.pass ? 1 : 0), code]
+  );
+}
+
+function gradeExamFromSession(session, answers) {
+  let score = 0;
+  const questionResults = [];
+
+  session.qOrder.forEach((questionIdx, displayIdx) => {
+    const displaySelection = Array.isArray(answers[displayIdx]) ? answers[displayIdx].map(Number) : [];
+    const optionOrder = session.optOrders[displayIdx];
+    const originalSelection = displaySelection
+      .filter((idx) => Number.isInteger(idx) && idx >= 0 && idx < optionOrder.length)
+      .map((idx) => optionOrder[idx])
+      .sort((a, b) => a - b);
+    const expected = (ANSWER_KEY[questionIdx] || []).slice().sort((a, b) => a - b);
+    const correct = originalSelection.join(',') === expected.join(',');
+    if (correct) score += 1;
+    questionResults.push({ displayIdx, questionIdx, correct, given: originalSelection, expected });
+  });
+
+  const total = QUESTIONS.length;
+  const pct = Math.round((score / total) * 100);
+  const pass = pct >= EXAM_PASS_PCT;
+  return { score, total, pct, pass, questionResults };
 }
 
 app.post('/api/proctor/check', async (req, res) => {
   const imageB64 = req.body && typeof req.body.imageB64 === 'string' ? req.body.imageB64 : '';
   if (!imageB64) return res.status(400).json({ error: 'missing_image' });
-
-  if (!ANTHROPIC_API_KEY) {
-    return res.json({ enabled: false, flag: false, reason: null });
-  }
+  if (!ANTHROPIC_API_KEY) return res.json({ enabled: false, flag: false, reason: null });
 
   try {
     const prompt =
@@ -189,320 +480,360 @@ app.post('/api/proctor/check', async (req, res) => {
 });
 
 app.get('/api/health', async (_req, res) => {
-  if (!HAS_DB_CONFIG) {
-    res.status(500).json({ ok: false, message: 'Missing HANA env vars.' });
-    return;
-  }
+  if (!HAS_DB_CONFIG) return res.status(500).json({ ok: false, message: 'Missing HANA env vars.' });
   try {
     await withDb(async (conn) => {
       await execQuery(conn, 'SELECT 1 AS OK FROM DUMMY');
     });
-    res.json({ ok: true, db: 'connected', schema: HANA_SCHEMA });
+    res.json({ ok: true, db: 'connected', schema: HANA_SCHEMA, totalQuestions: QUESTIONS.length });
   } catch (err) {
     appLog('error', 'health_failed', { message: err.message });
     res.status(500).json({ ok: false, message: err.message });
   }
 });
 
-app.get('/api/bootstrap', async (_req, res) => {
+app.get('/api/status', (_req, res) => {
+  res.json(getExamConfig());
+});
+
+app.get('/api/bootstrap', (_req, res) => {
+  res.status(410).json({ error: 'bootstrap_removed', message: 'Client bootstrap is disabled for security reasons.' });
+});
+
+app.post('/api/validate', async (req, res) => {
+  const cfg = getExamConfig();
+  if (!cfg.examActive) return res.json({ valid: false, reason: 'exam_not_active' });
+
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+  if (!checkRateLimit(String(ip))) return res.status(429).json({ valid: false, reason: 'too_many_attempts' });
+
+  const code = String(req.body?.code || '').trim().toUpperCase();
+  if (!/^[A-Z2-9]{6}$/.test(code)) return res.json({ valid: false, reason: 'invalid_format' });
+
+  try {
+    const result = await withDb(async (conn) => {
+      const codeRow = await getCodeRow(conn, code);
+      if (!codeRow) return { valid: false, reason: 'not_found' };
+
+      const savedResult = await getResultRecord(conn, code);
+      if (savedResult || codeRow.status === 'completed') {
+        return { valid: true, status: 'completed', result: savedResult || null };
+      }
+
+      const progress = await getSavedSession(conn, code);
+      if (progress || codeRow.status === 'active') {
+        return { valid: true, status: 'active', progress: progress || null };
+      }
+
+      return { valid: true, status: 'unused' };
+    });
+
+    res.json({ ...cfg, ...result });
+  } catch (err) {
+    appLog('error', 'validate_failed', { code, message: err.message });
+    res.status(500).json({ error: 'validate_failed', message: err.message });
+  }
+});
+
+app.post('/api/session/start', async (req, res) => {
+  const code = String(req.body?.code || '').trim().toUpperCase();
+  const fresh = Boolean(req.body?.fresh);
+  if (!/^[A-Z2-9]{6}$/.test(code)) return res.status(400).json({ error: 'invalid_code' });
+
   try {
     const payload = await withDb(async (conn) => {
-      const hasNotes = await hasNotesColumn(conn);
-      const codeRows = await execQuery(
-        conn,
-        `SELECT ACCESS_CODE, LABEL, ${hasNotes ? 'NOTES,' : ''} STATUS, CREATED_AT, SCORE, PCT, PASS
-         FROM ACCESS_CODES`
-      );
-      const sessionRows = await execQuery(
-        conn,
-        `SELECT ACCESS_CODE, SESSION_JSON
-         FROM EXAM_SESSIONS`
-      );
-      const resultRows = await execQuery(
-        conn,
-        `SELECT ACCESS_CODE, RESULT_JSON
-         FROM EXAM_RESULTS`
-      );
+      const codeRow = await getCodeRow(conn, code);
+      if (!codeRow) return { status: 404, body: { error: 'code_not_found' } };
 
-      const codebook = {};
-      for (const r of codeRows) {
-        codebook[r.ACCESS_CODE] = {
-          label: r.LABEL || null,
-          notes: hasNotes ? (r.NOTES || '') : '',
-          status: r.STATUS || 'unused',
-          createdAt: r.CREATED_AT ? new Date(r.CREATED_AT).toISOString() : null,
-          score: r.SCORE === null ? undefined : r.SCORE,
-          pct: r.PCT === null ? undefined : r.PCT,
-          pass: r.PASS === null ? undefined : Boolean(r.PASS)
-        };
+      const savedResult = await getResultRecord(conn, code);
+      if (savedResult || codeRow.status === 'completed') {
+        return { status: 409, body: { error: 'exam_completed' } };
       }
 
-      const sessions = {};
-      for (const r of sessionRows) {
-        const parsed = parseJsonOrNull(r.SESSION_JSON);
-        if (parsed) sessions[r.ACCESS_CODE] = parsed;
-      }
+      if (fresh) await deleteSession(conn, code);
+      const progress = fresh ? null : await getSavedSession(conn, code);
+      const { token } = createExamSession(code);
+      await updateCodeStatus(conn, code, 'active');
 
-      const results = {};
-      for (const r of resultRows) {
-        const parsed = parseJsonOrNull(r.RESULT_JSON);
-        if (parsed) results[r.ACCESS_CODE] = parsed;
-      }
-
-      return { codebook, sessions, results };
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          examToken: token,
+          progress,
+          ...getExamConfig()
+        }
+      };
     });
 
-    res.json(payload);
+    res.status(payload.status).json(payload.body);
   } catch (err) {
-    appLog('error', 'bootstrap_failed', { message: err.message });
-    res.status(500).json({ error: 'bootstrap_failed', message: err.message });
+    appLog('error', 'session_start_failed', { code, message: err.message });
+    res.status(500).json({ error: 'session_start_failed', message: err.message });
   }
 });
 
-app.put('/api/codebook', async (req, res) => {
-  const codebook = req.body && req.body.codebook ? req.body.codebook : null;
-  if (!codebook || typeof codebook !== 'object') {
-    res.status(400).json({ error: 'invalid_payload' });
-    return;
+app.get('/api/question/:displayIdx', requireExamSession, (req, res) => {
+  const displayIdx = Number(req.params.displayIdx);
+  const session = req.examSession;
+  if (!Number.isInteger(displayIdx) || displayIdx < 0 || displayIdx >= session.qOrder.length) {
+    return res.status(400).json({ error: 'invalid_question_index' });
   }
+
+  const questionIdx = session.qOrder[displayIdx];
+  const question = QUESTIONS[questionIdx];
+  const optionOrder = session.optOrders[displayIdx];
+  res.json({
+    displayIdx,
+    total: QUESTIONS.length,
+    stem: question.stem,
+    note: question.note || null,
+    multi: Boolean(question.multi),
+    opts: optionOrder.map((idx) => question.opts[idx])
+  });
+});
+
+app.post('/api/progress', requireExamSession, async (req, res) => {
+  const session = req.examSession;
+  const code = String(req.body?.code || '').trim().toUpperCase();
+  if (code !== session.code) return res.status(403).json({ error: 'code_mismatch' });
+
+  const progress = sanitizeProgress({
+    answers: req.body?.answers,
+    visited: req.body?.visited,
+    currentQ: req.body?.currentQ,
+    incidents: req.body?.incidents,
+    tabSwitches: req.body?.tabSwitches,
+    elapsedMs: req.body?.elapsedMs
+  });
 
   try {
     await withDb(async (conn) => {
-      const hasNotes = await hasNotesColumn(conn);
-      const sql = hasNotes
-        ? `
-          MERGE INTO ACCESS_CODES T
-          USING (SELECT ? AS ACCESS_CODE, ? AS LABEL, ? AS NOTES, ? AS STATUS, ? AS SCORE, ? AS PCT, ? AS PASS FROM DUMMY) S
-          ON (T.ACCESS_CODE = S.ACCESS_CODE)
-          WHEN MATCHED THEN UPDATE SET
-            T.LABEL = S.LABEL,
-            T.NOTES = S.NOTES,
-            T.STATUS = S.STATUS,
-            T.SCORE = S.SCORE,
-            T.PCT = S.PCT,
-            T.PASS = S.PASS,
-            T.UPDATED_AT = CURRENT_UTCTIMESTAMP
-          WHEN NOT MATCHED THEN INSERT
-            (ACCESS_CODE, LABEL, NOTES, STATUS, SCORE, PCT, PASS, CREATED_AT, UPDATED_AT)
-            VALUES (S.ACCESS_CODE, S.LABEL, S.NOTES, S.STATUS, S.SCORE, S.PCT, S.PASS, CURRENT_UTCTIMESTAMP, CURRENT_UTCTIMESTAMP)
-        `
-        : `
-          MERGE INTO ACCESS_CODES T
-          USING (SELECT ? AS ACCESS_CODE, ? AS LABEL, ? AS STATUS, ? AS SCORE, ? AS PCT, ? AS PASS FROM DUMMY) S
-          ON (T.ACCESS_CODE = S.ACCESS_CODE)
-          WHEN MATCHED THEN UPDATE SET
-            T.LABEL = S.LABEL,
-            T.STATUS = S.STATUS,
-            T.SCORE = S.SCORE,
-            T.PCT = S.PCT,
-            T.PASS = S.PASS,
-            T.UPDATED_AT = CURRENT_UTCTIMESTAMP
-          WHEN NOT MATCHED THEN INSERT
-            (ACCESS_CODE, LABEL, STATUS, SCORE, PCT, PASS, CREATED_AT, UPDATED_AT)
-            VALUES (S.ACCESS_CODE, S.LABEL, S.STATUS, S.SCORE, S.PCT, S.PASS, CURRENT_UTCTIMESTAMP, CURRENT_UTCTIMESTAMP)
-        `;
-
-      for (const [code, v] of Object.entries(codebook)) {
-        const row = v || {};
-        const params = hasNotes
-          ? [code, row.label || null, row.notes || '', row.status || 'unused', row.score ?? null, row.pct ?? null, row.pass ?? null]
-          : [code, row.label || null, row.status || 'unused', row.score ?? null, row.pct ?? null, row.pass ?? null];
-        await execQuery(conn, sql, params);
-      }
+      await saveSession(conn, code, progress);
+      await updateCodeStatus(conn, code, 'active');
     });
     res.json({ ok: true });
   } catch (err) {
-    appLog('error', 'codebook_save_failed', { message: err.message });
-    res.status(500).json({ error: 'codebook_save_failed', message: err.message });
+    appLog('error', 'progress_save_failed', { code, message: err.message });
+    res.status(500).json({ error: 'progress_save_failed', message: err.message });
   }
 });
 
-app.put('/api/session/:code', async (req, res) => {
-  const code = (req.params.code || '').toUpperCase();
-  if (!code) return res.status(400).json({ error: 'invalid_code' });
-  const session = req.body && req.body.session ? req.body.session : null;
-  if (!session || typeof session !== 'object') return res.status(400).json({ error: 'invalid_payload' });
+app.post('/api/submit', requireExamSession, async (req, res) => {
+  const session = req.examSession;
+  const code = String(req.body?.code || '').trim().toUpperCase();
+  if (code !== session.code) return res.status(403).json({ error: 'code_mismatch' });
+
+  const answers = Array.isArray(req.body?.answers) ? req.body.answers : [];
+  const durationSecs = Math.max(10, Math.min(Number(req.body?.durationSecs) || 0, EXAM_DURATION_SECS + 300));
+  const tabSwitches = Number(req.body?.tabSwitches) || 0;
+  const incidents = Array.isArray(req.body?.incidents) ? req.body.incidents : [];
+  const autoSubmit = Boolean(req.body?.autoSubmit);
 
   try {
-    await withDb(async (conn) => {
-      const sql = `
-        MERGE INTO EXAM_SESSIONS T
-        USING (SELECT ? AS ACCESS_CODE, ? AS SESSION_JSON, ? AS ELAPSED_MS, ? AS TAB_SWITCHES FROM DUMMY) S
-        ON (T.ACCESS_CODE = S.ACCESS_CODE)
-        WHEN MATCHED THEN UPDATE SET
-          T.SESSION_JSON = S.SESSION_JSON,
-          T.ELAPSED_MS = S.ELAPSED_MS,
-          T.TAB_SWITCHES = S.TAB_SWITCHES,
-          T.UPDATED_AT = CURRENT_UTCTIMESTAMP
-        WHEN NOT MATCHED THEN INSERT
-          (ACCESS_CODE, SESSION_JSON, ELAPSED_MS, TAB_SWITCHES, UPDATED_AT)
-          VALUES (S.ACCESS_CODE, S.SESSION_JSON, S.ELAPSED_MS, S.TAB_SWITCHES, CURRENT_UTCTIMESTAMP)
-      `;
-      await execQuery(conn, sql, [
-        code,
-        JSON.stringify(session),
-        session.elapsed || 0,
-        session.tabSwitches || 0
-      ]);
-    });
-    res.json({ ok: true });
-  } catch (err) {
-    appLog('error', 'session_save_failed', { code, message: err.message });
-    res.status(500).json({ error: 'session_save_failed', message: err.message });
-  }
-});
-
-app.delete('/api/session/:code', async (req, res) => {
-  const code = (req.params.code || '').toUpperCase();
-  if (!code) return res.status(400).json({ error: 'invalid_code' });
-  try {
-    await withDb(async (conn) => {
-      await execQuery(conn, 'DELETE FROM EXAM_SESSIONS WHERE ACCESS_CODE = ?', [code]);
-    });
-    appLog('info', 'session_deleted', { code });
-    res.json({ ok: true });
-  } catch (err) {
-    appLog('error', 'session_delete_failed', { code, message: err.message });
-    res.status(500).json({ error: 'session_delete_failed', message: err.message });
-  }
-});
-
-app.put('/api/result/:code', async (req, res) => {
-  const code = (req.params.code || '').toUpperCase();
-  const result = req.body && req.body.result ? req.body.result : null;
-  if (!code) return res.status(400).json({ error: 'invalid_code' });
-  if (!result || typeof result !== 'object') return res.status(400).json({ error: 'invalid_payload' });
-
-  try {
-    await withDb(async (conn) => {
-      const sql = `
-        MERGE INTO EXAM_RESULTS T
-        USING (
-          SELECT
-            ? AS ACCESS_CODE,
-            ? AS SCORE,
-            ? AS TOTAL,
-            ? AS PCT,
-            ? AS PASS,
-            ? AS AUTO_SUBMIT,
-            ? AS DURATION_SECS,
-            ? AS TAB_SWITCHES,
-            ? AS INCIDENT_COUNT,
-            ? AS RESULT_JSON
-          FROM DUMMY
-        ) S
-        ON (T.ACCESS_CODE = S.ACCESS_CODE)
-        WHEN MATCHED THEN UPDATE SET
-          T.SCORE = S.SCORE,
-          T.TOTAL = S.TOTAL,
-          T.PCT = S.PCT,
-          T.PASS = S.PASS,
-          T.AUTO_SUBMIT = S.AUTO_SUBMIT,
-          T.DURATION_SECS = S.DURATION_SECS,
-          T.TAB_SWITCHES = S.TAB_SWITCHES,
-          T.INCIDENT_COUNT = S.INCIDENT_COUNT,
-          T.RESULT_JSON = S.RESULT_JSON,
-          T.SUBMITTED_AT = CURRENT_UTCTIMESTAMP
-        WHEN NOT MATCHED THEN INSERT
-          (ACCESS_CODE, SCORE, TOTAL, PCT, PASS, AUTO_SUBMIT, DURATION_SECS, TAB_SWITCHES, INCIDENT_COUNT, RESULT_JSON, SUBMITTED_AT)
-          VALUES (S.ACCESS_CODE, S.SCORE, S.TOTAL, S.PCT, S.PASS, S.AUTO_SUBMIT, S.DURATION_SECS, S.TAB_SWITCHES, S.INCIDENT_COUNT, S.RESULT_JSON, CURRENT_UTCTIMESTAMP)
-      `;
-      await execQuery(conn, sql, [
-        code,
-        result.score ?? 0,
-        result.total ?? 30,
-        result.pct ?? 0,
-        result.pass ?? false,
-        result.autoSubmit ?? false,
-        result.durationSecs ?? 0,
-        result.tabSwitches ?? 0,
-        result.incidentCount ?? 0,
-        JSON.stringify(result)
-      ]);
-    });
-    appLog('info', 'result_saved', {
+    const result = gradeExamFromSession(session, answers);
+    const record = {
       code,
-      score: result.score ?? 0,
-      pass: Boolean(result.pass),
-      incidentCount: result.incidentCount ?? 0,
-      autoSubmit: Boolean(result.autoSubmit)
-    });
-    res.json({ ok: true });
-  } catch (err) {
-    appLog('error', 'result_save_failed', { code, message: err.message });
-    res.status(500).json({ error: 'result_save_failed', message: err.message });
-  }
-});
+      score: result.score,
+      total: result.total,
+      pct: result.pct,
+      pass: result.pass,
+      autoSubmit,
+      durationSecs,
+      tabSwitches,
+      incidents,
+      incidentCount: incidents.length,
+      submittedAt: new Date().toISOString()
+    };
 
-app.delete('/api/result/:code', async (req, res) => {
-  const code = (req.params.code || '').toUpperCase();
-  if (!code) return res.status(400).json({ error: 'invalid_code' });
-  try {
     await withDb(async (conn) => {
-      await execQuery(conn, 'DELETE FROM EXAM_RESULTS WHERE ACCESS_CODE = ?', [code]);
+      await saveResult(conn, code, record);
+      await updateCodeStatus(conn, code, 'completed', record);
+      await deleteSession(conn, code);
     });
-    appLog('info', 'result_deleted', { code });
-    res.json({ ok: true });
+
+    for (const [token, value] of _examSessions.entries()) {
+      if (value.code === code) _examSessions.delete(token);
+    }
+
+    appLog('info', 'exam_submitted', { code, score: record.score, pct: record.pct, pass: record.pass });
+    res.json({ ok: true, result: record });
   } catch (err) {
-    appLog('error', 'result_delete_failed', { code, message: err.message });
-    res.status(500).json({ error: 'result_delete_failed', message: err.message });
+    appLog('error', 'submit_failed', { code, message: err.message });
+    res.status(500).json({ error: 'submit_failed', message: err.message });
   }
 });
 
-app.get('/api/admin/codes', async (_req, res) => {
+app.get('/api/result/:code', async (req, res) => {
+  const code = String(req.params.code || '').trim().toUpperCase();
+  if (!/^[A-Z2-9]{6}$/.test(code)) return res.status(400).json({ error: 'invalid_code' });
+  try {
+    const result = await withDb(async (conn) => getResultRecord(conn, code));
+    if (!result) return res.status(404).json({ error: 'not_found' });
+    res.json({ result });
+  } catch (err) {
+    appLog('error', 'result_fetch_failed', { code, message: err.message });
+    res.status(500).json({ error: 'result_fetch_failed', message: err.message });
+  }
+});
+
+app.post('/api/admin/login', (req, res) => {
+  if (!ADMIN_HASH) return res.status(503).json({ ok: false, error: 'admin_not_configured' });
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+  if (!checkRateLimit(String(ip))) return res.status(429).json({ ok: false, error: 'too_many_attempts' });
+
+  const hash = String(req.body?.hash || '').trim().toLowerCase();
+  if (!hash || hash !== ADMIN_HASH) {
+    return setTimeout(() => res.status(401).json({ ok: false, error: 'invalid_credentials' }), 350);
+  }
+
+  return res.json({ ok: true, token: createAdminToken() });
+});
+
+app.get('/api/admin/codes', requireAdmin, async (_req, res) => {
   try {
     const rows = await withDb(async (conn) => {
+      const hasNotes = await hasNotesColumn(conn);
       return execQuery(
         conn,
-        `SELECT c.ACCESS_CODE, c.LABEL, c.STATUS, c.SCORE, c.PCT, c.PASS, r.RESULT_JSON
-         FROM ACCESS_CODES c
-         LEFT JOIN EXAM_RESULTS r ON r.ACCESS_CODE = c.ACCESS_CODE
-         ORDER BY c.ACCESS_CODE ASC`
+        `SELECT c.ACCESS_CODE, c.LABEL, ${hasNotes ? 'c.NOTES,' : `'' AS NOTES,`} c.STATUS, c.SCORE, c.PCT, c.PASS,
+                r.DURATION_SECS, r.TAB_SWITCHES, r.INCIDENT_COUNT, r.SUBMITTED_AT, r.RESULT_JSON
+           FROM ACCESS_CODES c
+           LEFT JOIN EXAM_RESULTS r ON r.ACCESS_CODE = c.ACCESS_CODE
+          ORDER BY c.ACCESS_CODE ASC`
       );
     });
-    res.json({ rows });
+    const codes = rows.map((r) => {
+      const parsedResult = parseJsonOrNull(r.RESULT_JSON);
+      return {
+        code: r.ACCESS_CODE,
+        label: r.LABEL || '',
+        notes: r.NOTES || '',
+        status: r.STATUS || 'unused',
+        score: r.SCORE,
+        pct: r.PCT,
+        pass: r.PASS === null || r.PASS === undefined ? null : Boolean(r.PASS),
+        durationSecs: r.DURATION_SECS,
+        tabSwitches: r.TAB_SWITCHES || 0,
+        incidentCount: r.INCIDENT_COUNT || 0,
+        submittedAt: r.SUBMITTED_AT ? new Date(r.SUBMITTED_AT).toISOString() : null,
+        incidents: parsedResult?.incidents || []
+      };
+    });
+    res.json({ codes, examName: EXAM_NAME, examActive: EXAM_ACTIVE, proctorEnabled: PROCTOR_ENABLED });
   } catch (err) {
     appLog('error', 'admin_codes_failed', { message: err.message });
     res.status(500).json({ error: 'admin_codes_failed', message: err.message });
   }
 });
 
-app.get('/api/admin/export.csv', async (_req, res) => {
+app.post('/api/admin/note', requireAdmin, async (req, res) => {
+  const code = String(req.body?.code || '').trim().toUpperCase();
+  const notes = String(req.body?.notes || '');
+  if (!/^[A-Z2-9]{6}$/.test(code)) return res.status(400).json({ error: 'invalid_code' });
+
+  try {
+    await withDb(async (conn) => {
+      if (await hasNotesColumn(conn)) {
+        await execQuery(conn, 'UPDATE ACCESS_CODES SET NOTES = ?, UPDATED_AT = CURRENT_UTCTIMESTAMP WHERE ACCESS_CODE = ?', [notes, code]);
+      }
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    appLog('error', 'admin_note_failed', { code, message: err.message });
+    res.status(500).json({ error: 'admin_note_failed', message: err.message });
+  }
+});
+
+app.post('/api/admin/reset', requireAdmin, async (req, res) => {
+  const code = String(req.body?.code || '').trim().toUpperCase();
+  if (!/^[A-Z2-9]{6}$/.test(code)) return res.status(400).json({ error: 'invalid_code' });
+
+  try {
+    await withDb(async (conn) => {
+      await deleteSession(conn, code);
+      await execQuery(conn, 'DELETE FROM EXAM_RESULTS WHERE ACCESS_CODE = ?', [code]);
+      await execQuery(conn, 'UPDATE ACCESS_CODES SET STATUS = ?, SCORE = NULL, PCT = NULL, PASS = NULL, UPDATED_AT = CURRENT_UTCTIMESTAMP WHERE ACCESS_CODE = ?', ['unused', code]);
+    });
+    for (const [token, value] of _examSessions.entries()) {
+      if (value.code === code) _examSessions.delete(token);
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    appLog('error', 'admin_reset_failed', { code, message: err.message });
+    res.status(500).json({ error: 'admin_reset_failed', message: err.message });
+  }
+});
+
+app.post('/api/admin/generate', requireAdmin, async (req, res) => {
+  const count = Math.min(Math.max(Number(req.body?.count) || 10, 1), 200);
+  const chars = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+
+  try {
+    const added = await withDb(async (conn) => {
+      const hasNotes = await hasNotesColumn(conn);
+      const existingRows = await execQuery(conn, 'SELECT ACCESS_CODE FROM ACCESS_CODES');
+      const used = new Set(existingRows.map((r) => r.ACCESS_CODE));
+      const seatBase = existingRows.length + 1;
+      const created = [];
+
+      while (created.length < count) {
+        let code = '';
+        for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
+        if (!used.has(code)) {
+          used.add(code);
+          created.push(code);
+        }
+      }
+
+      const sql = hasNotes
+        ? `INSERT INTO ACCESS_CODES (ACCESS_CODE, LABEL, NOTES, STATUS, CREATED_AT, UPDATED_AT)
+             VALUES (?, ?, ?, 'unused', CURRENT_UTCTIMESTAMP, CURRENT_UTCTIMESTAMP)`
+        : `INSERT INTO ACCESS_CODES (ACCESS_CODE, LABEL, STATUS, CREATED_AT, UPDATED_AT)
+             VALUES (?, ?, 'unused', CURRENT_UTCTIMESTAMP, CURRENT_UTCTIMESTAMP)`;
+
+      for (let i = 0; i < created.length; i++) {
+        const label = `Seat ${String(seatBase + i).padStart(3, '0')}`;
+        const params = hasNotes ? [created[i], label, ''] : [created[i], label];
+        await execQuery(conn, sql, params);
+      }
+      return created.length;
+    });
+
+    res.json({ ok: true, added });
+  } catch (err) {
+    appLog('error', 'admin_generate_failed', { message: err.message });
+    res.status(500).json({ error: 'admin_generate_failed', message: err.message });
+  }
+});
+
+app.get('/api/admin/export.csv', requireAdmin, async (_req, res) => {
   try {
     const rows = await withDb(async (conn) => {
       const hasNotes = await hasNotesColumn(conn);
       return execQuery(
         conn,
-        `SELECT
-           c.ACCESS_CODE,
-           c.LABEL,
-           ${hasNotes ? 'c.NOTES' : `'' AS NOTES`},
-           c.STATUS,
-           r.SCORE,
-           r.PCT,
-           r.PASS,
-           r.TAB_SWITCHES,
-           r.INCIDENT_COUNT,
-           r.SUBMITTED_AT
-         FROM ACCESS_CODES c
-         LEFT JOIN EXAM_RESULTS r ON r.ACCESS_CODE = c.ACCESS_CODE
-         ORDER BY c.ACCESS_CODE ASC`
+        `SELECT c.ACCESS_CODE, c.LABEL, ${hasNotes ? 'c.NOTES,' : `'' AS NOTES,`} c.STATUS,
+                r.SCORE, r.PCT, r.PASS, r.DURATION_SECS, r.TAB_SWITCHES, r.INCIDENT_COUNT, r.SUBMITTED_AT
+           FROM ACCESS_CODES c
+           LEFT JOIN EXAM_RESULTS r ON r.ACCESS_CODE = c.ACCESS_CODE
+          ORDER BY c.ACCESS_CODE ASC`
       );
     });
 
-    const lines = [
-      'Code,Seat,Notes,Status,Score,Pct,Result,TabSwitches,Incidents,SubmittedAt'
-    ];
+    const lines = ['Code,Seat,Notes,Status,Score,Pct,Result,Duration,TabSwitches,Incidents,SubmittedAt'];
     for (const r of rows) {
       const resultLabel = r.PASS === null || r.PASS === undefined ? '' : (r.PASS ? 'PASS' : 'FAIL');
+      const duration = r.DURATION_SECS == null ? '' : `${Math.floor(r.DURATION_SECS / 60)}m ${String(r.DURATION_SECS % 60).padStart(2, '0')}s`;
       lines.push([
         toCsvCell(r.ACCESS_CODE),
         toCsvCell(r.LABEL || ''),
         toCsvCell(r.NOTES || ''),
         toCsvCell(r.STATUS || ''),
         toCsvCell(r.SCORE ?? ''),
-        toCsvCell(r.PCT === null || r.PCT === undefined ? '' : `${r.PCT}%`),
+        toCsvCell(r.PCT == null ? '' : `${r.PCT}%`),
         toCsvCell(resultLabel),
+        toCsvCell(duration),
         toCsvCell(r.TAB_SWITCHES ?? ''),
         toCsvCell(r.INCIDENT_COUNT ?? ''),
         toCsvCell(r.SUBMITTED_AT ? new Date(r.SUBMITTED_AT).toISOString() : '')
@@ -511,12 +842,15 @@ app.get('/api/admin/export.csv', async (_req, res) => {
 
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', 'attachment; filename="ITIL4_Exam_Results.csv"');
-    appLog('info', 'admin_export_csv', { rows: rows.length });
     res.send(lines.join('\n'));
   } catch (err) {
-    appLog('error', 'admin_export_csv_failed', { message: err.message });
-    res.status(500).json({ error: 'admin_export_csv_failed', message: err.message });
+    appLog('error', 'admin_export_failed', { message: err.message });
+    res.status(500).json({ error: 'admin_export_failed', message: err.message });
   }
+});
+
+app.get('/client-app.js', (_req, res) => {
+  res.type('application/javascript').sendFile(CLIENT_APP_PATH);
 });
 
 app.get('/', (_req, res) => {
@@ -525,6 +859,7 @@ app.get('/', (_req, res) => {
 
 app.get('*', (req, res, next) => {
   if (req.path.startsWith('/api/')) return next();
+  if (req.path === '/client-app.js' && fs.existsSync(CLIENT_APP_PATH)) return res.type('application/javascript').sendFile(CLIENT_APP_PATH);
   if (fs.existsSync(INDEX_PATH)) return res.sendFile(INDEX_PATH);
   return res.status(404).send('Not found');
 });
