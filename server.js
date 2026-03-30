@@ -375,16 +375,34 @@ function normalizeQuestionSetRow(row) {
   };
 }
 
-async function getQuestionSetRows(conn) {
-  const rows = await execQuery(
-    conn,
-    `SELECT QUESTION_SET_ID, NAME, DESCRIPTION, IS_ACTIVE,
-            DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, NUM_QUESTIONS,
-            CREATED_AT, UPDATED_AT
-       FROM QUESTION_SETS
-      ORDER BY IS_ACTIVE DESC, NAME ASC, QUESTION_SET_ID ASC`
-  );
-  return rows.map(normalizeQuestionSetRow);
+async function getQuestionSetRows(conn, options = {}) {
+  const includeCounts = Boolean(options.includeCounts);
+  const rows = includeCounts
+    ? await execQuery(
+        conn,
+        `SELECT qs.QUESTION_SET_ID, qs.NAME, qs.DESCRIPTION, qs.IS_ACTIVE,
+                qs.DURATION_MINUTES, qs.PASS_PCT, qs.PROCTOR_ENABLED, qs.NUM_QUESTIONS,
+                qs.CREATED_AT, qs.UPDATED_AT,
+                COUNT(q.QUESTION_ID) AS QUESTION_COUNT
+           FROM QUESTION_SETS qs
+           LEFT JOIN QUESTION_SET_QUESTIONS q ON q.QUESTION_SET_ID = qs.QUESTION_SET_ID
+          GROUP BY qs.QUESTION_SET_ID, qs.NAME, qs.DESCRIPTION, qs.IS_ACTIVE,
+                   qs.DURATION_MINUTES, qs.PASS_PCT, qs.PROCTOR_ENABLED, qs.NUM_QUESTIONS,
+                   qs.CREATED_AT, qs.UPDATED_AT
+          ORDER BY qs.IS_ACTIVE DESC, qs.NAME ASC, qs.QUESTION_SET_ID ASC`
+      )
+    : await execQuery(
+        conn,
+        `SELECT QUESTION_SET_ID, NAME, DESCRIPTION, IS_ACTIVE,
+                DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, NUM_QUESTIONS,
+                CREATED_AT, UPDATED_AT
+           FROM QUESTION_SETS
+          ORDER BY IS_ACTIVE DESC, NAME ASC, QUESTION_SET_ID ASC`
+      );
+  return rows.map((row) => ({
+    ...normalizeQuestionSetRow(row),
+    ...(includeCounts ? { questionCount: Number(row.QUESTION_COUNT || 0) } : {})
+  }));
 }
 
 async function getActiveQuestionSetRow(conn) {
@@ -1157,7 +1175,7 @@ app.get('/api/admin/codes', requireAdmin, async (_req, res) => {
              LEFT JOIN EXAM_RESULTS r ON r.ACCESS_CODE = c.ACCESS_CODE
             ORDER BY c.ACCESS_CODE ASC`
         ),
-        getQuestionSetRows(conn),
+        getQuestionSetRows(conn, { includeCounts: true }),
         getExamEnabled(conn)
       ]);
       return { rows, questionSets, examEnabled };
@@ -1199,7 +1217,7 @@ app.get('/api/admin/codes', requireAdmin, async (_req, res) => {
 app.get('/api/admin/system-status', requireAdmin, async (_req, res) => {
   try {
     const status = await withDb(async (conn) => {
-      const questionSets = await getQuestionSetRows(conn);
+      const questionSets = await getQuestionSetRows(conn, { includeCounts: true });
       const activeSet = questionSets.find((set) => set.isActive) || questionSets[0] || null;
       const activeQuestionSet = activeSet ? await loadQuestionSet(conn, activeSet.id) : null;
       const hasNotes = await hasNotesColumn(conn);
@@ -1636,25 +1654,7 @@ app.post('/api/admin/codes/:code/question-set', requireAdmin, async (req, res) =
 
 app.get('/api/admin/question-sets', requireAdmin, async (_req, res) => {
   try {
-    const sets = await withDb(async (conn) => {
-      const rows = await execQuery(
-        conn,
-        `SELECT qs.QUESTION_SET_ID, qs.NAME, qs.DESCRIPTION, qs.IS_ACTIVE,
-                qs.DURATION_MINUTES, qs.PASS_PCT, qs.PROCTOR_ENABLED, qs.NUM_QUESTIONS,
-                qs.CREATED_AT, qs.UPDATED_AT,
-                COUNT(q.QUESTION_ID) AS QUESTION_COUNT
-           FROM QUESTION_SETS qs
-           LEFT JOIN QUESTION_SET_QUESTIONS q ON q.QUESTION_SET_ID = qs.QUESTION_SET_ID
-          GROUP BY qs.QUESTION_SET_ID, qs.NAME, qs.DESCRIPTION, qs.IS_ACTIVE,
-                   qs.DURATION_MINUTES, qs.PASS_PCT, qs.PROCTOR_ENABLED, qs.NUM_QUESTIONS,
-                   qs.CREATED_AT, qs.UPDATED_AT
-          ORDER BY qs.IS_ACTIVE DESC, qs.NAME ASC, qs.QUESTION_SET_ID ASC`
-      );
-      return rows.map((row) => ({
-        ...normalizeQuestionSetRow(row),
-        questionCount: Number(row.QUESTION_COUNT || 0)
-      }));
-    });
+    const sets = await withDb(async (conn) => getQuestionSetRows(conn, { includeCounts: true }));
     res.json({ sets });
   } catch (err) {
     res.status(500).json({ error: 'admin_question_sets_failed', message: err.message });
