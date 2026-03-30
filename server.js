@@ -31,6 +31,7 @@ const PROCTOR_ENABLED = String(process.env.PROCTOR_ENABLED || 'true').toLowerCas
 const APP_REVISION = process.env.APP_REVISION || 'dev';
 const APP_DEPLOYED_AT = process.env.APP_DEPLOYED_AT || new Date().toISOString();
 const STALE_SESSION_MINUTES = Math.max(5, Number(process.env.STALE_SESSION_MINUTES || 30));
+const APP_SETTING_EXAMS_ENABLED = 'EXAMS_ENABLED';
 
 const HAS_DB_CONFIG = Boolean(HANA_HOST && HANA_USER && HANA_PASSWORD && HANA_SCHEMA);
 const INDEX_PATH = path.join(__dirname, 'index.html');
@@ -42,7 +43,7 @@ const _examSessions = new Map();
 const _validateAttempts = new Map();
 const VALIDATE_MAX = 10;
 const VALIDATE_WINDOW = 10 * 60 * 1000;
-let _questionBankCache = null;
+const _questionSetCache = new Map();
 
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: false }));
@@ -252,11 +253,21 @@ async function tryWriteAdminAudit(entry) {
   }
 }
 
-function createExamSessionFromBank(code, questionBank) {
-  const { qOrder, optOrders } = buildOrdering(questionBank.questions, code);
+function createExamSessionFromSet(code, questionSet) {
+  const selectedQuestions = pickQuestionsForSession(questionSet, code);
+  const { qOrder, optOrders } = buildOrdering(selectedQuestions, code);
+  const answerKey = selectedQuestions.map((question) => question.answer.slice());
   const token = crypto.randomBytes(32).toString('hex');
   _examSessions.set(token, {
     code,
+    questionSetId: questionSet.id,
+    questionSetName: questionSet.name,
+    passPct: Number(questionSet.passPct || 80) || 80,
+    durationSecs: (Number(questionSet.durationMinutes || 45) || 45) * 60,
+    proctorEnabled: questionSet.proctorEnabled !== false,
+    questions: selectedQuestions,
+    answerKey,
+    total: selectedQuestions.length,
     qOrder,
     optOrders,
     createdAt: Date.now(),
@@ -301,62 +312,275 @@ function checkRateLimit(ip) {
   return true;
 }
 
-async function loadQuestionBank(conn) {
-  if (_questionBankCache) return _questionBankCache;
+function clearQuestionSetCache(questionSetId = null) {
+  if (questionSetId == null) {
+    _questionSetCache.clear();
+    return;
+  }
+  _questionSetCache.delete(String(questionSetId));
+}
 
+async function hasAppSettingsTable(conn) {
   const rows = await execQuery(
     conn,
-    `SELECT QUESTION_INDEX, STEM, NOTE, OPTS_JSON, ANSWER_JSON, MULTI
-       FROM EXAM_QUESTIONS
-      ORDER BY QUESTION_INDEX ASC`
+    `SELECT COUNT(*) AS CNT
+       FROM TABLES
+      WHERE SCHEMA_NAME = CURRENT_SCHEMA
+        AND TABLE_NAME = 'APP_SETTINGS'`
+  );
+  return Number(rows?.[0]?.CNT || 0) > 0;
+}
+
+async function getAppSetting(conn, key, fallbackValue = null) {
+  if (!(await hasAppSettingsTable(conn))) return fallbackValue;
+  const rows = await execQuery(conn, 'SELECT SETTING_VALUE FROM APP_SETTINGS WHERE SETTING_KEY = ?', [key]);
+  if (!rows.length) return fallbackValue;
+  return rows[0].SETTING_VALUE == null ? fallbackValue : String(rows[0].SETTING_VALUE);
+}
+
+async function setAppSetting(conn, key, value) {
+  if (!(await hasAppSettingsTable(conn))) throw new Error('app_settings_missing');
+  await execQuery(
+    conn,
+    `MERGE INTO APP_SETTINGS T
+      USING (SELECT ? AS SETTING_KEY, ? AS SETTING_VALUE FROM DUMMY) S
+         ON (T.SETTING_KEY = S.SETTING_KEY)
+      WHEN MATCHED THEN UPDATE SET
+        T.SETTING_VALUE = S.SETTING_VALUE,
+        T.UPDATED_AT = CURRENT_UTCTIMESTAMP
+      WHEN NOT MATCHED THEN INSERT
+        (SETTING_KEY, SETTING_VALUE, UPDATED_AT)
+        VALUES (S.SETTING_KEY, S.SETTING_VALUE, CURRENT_UTCTIMESTAMP)`,
+    [key, String(value)]
+  );
+}
+
+async function getExamEnabled(conn) {
+  const value = await getAppSetting(conn, APP_SETTING_EXAMS_ENABLED, EXAM_ACTIVE ? 'true' : 'false');
+  return String(value).toLowerCase() !== 'false';
+}
+
+function normalizeQuestionSetRow(row) {
+  return {
+    id: Number(row.QUESTION_SET_ID),
+    name: String(row.NAME || 'Exam'),
+    description: row.DESCRIPTION || '',
+    isActive: Boolean(row.IS_ACTIVE),
+    durationMinutes: Number(row.DURATION_MINUTES || 45),
+    passPct: Number(row.PASS_PCT || 80),
+    proctorEnabled: row.PROCTOR_ENABLED == null ? true : Boolean(row.PROCTOR_ENABLED),
+    numQuestions: row.NUM_QUESTIONS == null ? null : Number(row.NUM_QUESTIONS),
+    createdAt: row.CREATED_AT ? new Date(row.CREATED_AT).toISOString() : null,
+    updatedAt: row.UPDATED_AT ? new Date(row.UPDATED_AT).toISOString() : null
+  };
+}
+
+async function getQuestionSetRows(conn) {
+  const rows = await execQuery(
+    conn,
+    `SELECT QUESTION_SET_ID, NAME, DESCRIPTION, IS_ACTIVE,
+            DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, NUM_QUESTIONS,
+            CREATED_AT, UPDATED_AT
+       FROM QUESTION_SETS
+      ORDER BY IS_ACTIVE DESC, NAME ASC, QUESTION_SET_ID ASC`
+  );
+  return rows.map(normalizeQuestionSetRow);
+}
+
+async function getActiveQuestionSetRow(conn) {
+  const rows = await execQuery(
+    conn,
+    `SELECT QUESTION_SET_ID, NAME, DESCRIPTION, IS_ACTIVE,
+            DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, NUM_QUESTIONS,
+            CREATED_AT, UPDATED_AT
+       FROM QUESTION_SETS
+      WHERE IS_ACTIVE = TRUE
+      ORDER BY QUESTION_SET_ID ASC
+      LIMIT 1`
+  );
+  if (rows.length) return normalizeQuestionSetRow(rows[0]);
+  const fallback = await execQuery(
+    conn,
+    `SELECT QUESTION_SET_ID, NAME, DESCRIPTION, IS_ACTIVE,
+            DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, NUM_QUESTIONS,
+            CREATED_AT, UPDATED_AT
+       FROM QUESTION_SETS
+      ORDER BY QUESTION_SET_ID ASC
+      LIMIT 1`
+  );
+  return fallback.length ? normalizeQuestionSetRow(fallback[0]) : null;
+}
+
+async function resolveQuestionSetIdForCode(conn, code) {
+  const assignedRows = await execQuery(
+    conn,
+    `SELECT QUESTION_SET_ID
+       FROM ACCESS_CODES
+      WHERE ACCESS_CODE = ?`,
+    [code]
+  );
+  const assigned = assignedRows?.[0]?.QUESTION_SET_ID;
+  if (assigned != null) return Number(assigned);
+  const active = await getActiveQuestionSetRow(conn);
+  return active ? Number(active.id) : null;
+}
+
+async function loadQuestionSet(conn, questionSetId, options = {}) {
+  const allowEmpty = Boolean(options.allowEmpty);
+  const cacheKey = String(questionSetId);
+  if (!allowEmpty && _questionSetCache.has(cacheKey)) return _questionSetCache.get(cacheKey);
+
+  const metaRows = await execQuery(
+    conn,
+    `SELECT QUESTION_SET_ID, NAME, DESCRIPTION, IS_ACTIVE,
+            DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, NUM_QUESTIONS,
+            CREATED_AT, UPDATED_AT
+       FROM QUESTION_SETS
+      WHERE QUESTION_SET_ID = ?`,
+    [questionSetId]
+  );
+  if (!metaRows.length) throw new Error(`Question set ${questionSetId} not found.`);
+
+  const sectionRows = await execQuery(
+    conn,
+    `SELECT SECTION_ID, QUESTION_SET_ID, NAME, DESCRIPTION, DISPLAY_ORDER, DRAW_COUNT,
+            CREATED_AT, UPDATED_AT
+       FROM QUESTION_SECTIONS
+      WHERE QUESTION_SET_ID = ?
+      ORDER BY DISPLAY_ORDER ASC, SECTION_ID ASC`,
+    [questionSetId]
   );
 
-  const questions = rows.map((row) => {
+  const questionRows = await execQuery(
+    conn,
+    `SELECT q.QUESTION_ID, q.QUESTION_SET_ID, q.SECTION_ID, q.QUESTION_INDEX,
+            q.STEM, q.NOTE, q.OPTS_JSON, q.ANSWER_JSON, q.MULTI,
+            s.NAME AS SECTION_NAME, s.DISPLAY_ORDER AS SECTION_ORDER, s.DRAW_COUNT AS SECTION_DRAW_COUNT
+       FROM QUESTION_SET_QUESTIONS q
+       LEFT JOIN QUESTION_SECTIONS s ON s.SECTION_ID = q.SECTION_ID
+      WHERE q.QUESTION_SET_ID = ?
+      ORDER BY q.QUESTION_INDEX ASC, q.QUESTION_ID ASC`,
+    [questionSetId]
+  );
+
+  const questions = questionRows.map((row) => {
     const opts = parseJsonOrNull(row.OPTS_JSON);
     const answer = parseJsonOrNull(row.ANSWER_JSON);
     if (!Array.isArray(opts) || !Array.isArray(answer)) {
-      throw new Error(`Invalid question payload for QUESTION_INDEX=${row.QUESTION_INDEX}`);
+      throw new Error(`Invalid question payload for QUESTION_ID=${row.QUESTION_ID}`);
     }
     return {
+      questionId: Number(row.QUESTION_ID),
+      questionSetId: Number(row.QUESTION_SET_ID),
+      sectionId: row.SECTION_ID == null ? null : Number(row.SECTION_ID),
+      questionIndex: Number(row.QUESTION_INDEX),
       stem: String(row.STEM || ''),
       note: row.NOTE || null,
       opts: opts.map((opt) => String(opt)),
-      multi: Boolean(row.MULTI)
+      answer: answer.map((value) => Number(value)),
+      multi: Boolean(row.MULTI),
+      sectionName: row.SECTION_NAME || '',
+      sectionOrder: row.SECTION_ORDER == null ? 0 : Number(row.SECTION_ORDER),
+      sectionDrawCount: row.SECTION_DRAW_COUNT == null ? null : Number(row.SECTION_DRAW_COUNT)
     };
   });
 
-  const answerKey = rows.map((row) => {
-    const answer = parseJsonOrNull(row.ANSWER_JSON);
-    if (!Array.isArray(answer)) throw new Error(`Invalid answer payload for QUESTION_INDEX=${row.QUESTION_INDEX}`);
-    return answer.map((value) => Number(value));
-  });
-
-  if (!questions.length) {
-    throw new Error('Question bank is empty. Load EXAM_QUESTIONS before starting the app.');
+  if (!allowEmpty && !questions.length) {
+    throw new Error(`Question set ${questionSetId} has no questions loaded.`);
   }
 
-  _questionBankCache = {
+  const questionSet = {
+    ...normalizeQuestionSetRow(metaRows[0]),
+    sections: sectionRows.map((row) => ({
+      id: Number(row.SECTION_ID),
+      questionSetId: Number(row.QUESTION_SET_ID),
+      name: String(row.NAME || ''),
+      description: row.DESCRIPTION || '',
+      displayOrder: Number(row.DISPLAY_ORDER || 0),
+      drawCount: row.DRAW_COUNT == null ? null : Number(row.DRAW_COUNT),
+      createdAt: row.CREATED_AT ? new Date(row.CREATED_AT).toISOString() : null,
+      updatedAt: row.UPDATED_AT ? new Date(row.UPDATED_AT).toISOString() : null
+    })),
     questions,
-    answerKey,
-    total: questions.length
+    totalQuestions: questions.length
   };
-  return _questionBankCache;
+
+  if (!allowEmpty) _questionSetCache.set(cacheKey, questionSet);
+  return questionSet;
 }
 
-async function getQuestionBank() {
-  return withDb(async (conn) => loadQuestionBank(conn));
+async function loadResolvedQuestionSet(conn, code) {
+  const questionSetId = await resolveQuestionSetIdForCode(conn, code);
+  if (!questionSetId) throw new Error('No active question set is configured.');
+  return loadQuestionSet(conn, questionSetId);
 }
 
-function getExamConfig(questionBank) {
-  const total = Number(questionBank?.total || 0);
+function pickQuestionsForSession(questionSet, code) {
+  const allQuestions = Array.isArray(questionSet?.questions) ? [...questionSet.questions] : [];
+  if (!allQuestions.length) throw new Error('Question set is empty.');
+
+  const requested = questionSet.numQuestions == null ? allQuestions.length : Number(questionSet.numQuestions);
+  const targetCount = Math.max(1, Math.min(Number.isFinite(requested) ? requested : allQuestions.length, allQuestions.length));
+  if (targetCount >= allQuestions.length) {
+    return allQuestions.sort((a, b) => a.questionIndex - b.questionIndex);
+  }
+
+  const rng = makePRNG(`${code}:${questionSet.id}`);
+  const hasSectionQuotas = allQuestions.some((q) => q.sectionId != null && q.sectionDrawCount != null);
+  if (!hasSectionQuotas) {
+    return seededShuffle(allQuestions, rng)
+      .slice(0, targetCount)
+      .sort((a, b) => a.questionIndex - b.questionIndex);
+  }
+
+  const chosen = [];
+  const used = new Set();
+  const bySection = new Map();
+
+  for (const question of allQuestions) {
+    const key = question.sectionId == null ? '__unsectioned__' : String(question.sectionId);
+    if (!bySection.has(key)) bySection.set(key, []);
+    bySection.get(key).push(question);
+  }
+
+  for (const [key, items] of bySection.entries()) {
+    const quota = key === '__unsectioned__' ? null : items[0].sectionDrawCount;
+    if (quota == null) continue;
+    const pickCount = Math.max(0, Math.min(Number(quota) || 0, items.length, targetCount - chosen.length));
+    const sample = seededShuffle(items, rng).slice(0, pickCount);
+    for (const q of sample) {
+      chosen.push(q);
+      used.add(q.questionId);
+    }
+    if (chosen.length >= targetCount) break;
+  }
+
+  if (chosen.length < targetCount) {
+    const remaining = allQuestions.filter((q) => !used.has(q.questionId));
+    const fill = seededShuffle(remaining, rng).slice(0, targetCount - chosen.length);
+    chosen.push(...fill);
+  }
+
+  return chosen
+    .slice(0, targetCount)
+    .sort((a, b) => a.questionIndex - b.questionIndex);
+}
+
+function buildExamConfigForSet(questionSet, totalOverride = null, examEnabled = EXAM_ACTIVE) {
+  const total = totalOverride == null
+    ? (questionSet.numQuestions == null ? Number(questionSet.totalQuestions || 0) : Math.min(Number(questionSet.numQuestions || 0), Number(questionSet.totalQuestions || 0)))
+    : Number(totalOverride || 0);
+  const durationSecs = (Number(questionSet.durationMinutes || 45) || 45) * 60;
+  const passPct = Number(questionSet.passPct || 80) || 80;
   return {
-    examName: EXAM_NAME,
-    examActive: EXAM_ACTIVE,
-    durationSecs: EXAM_DURATION_SECS,
-    passPct: EXAM_PASS_PCT,
-    passScore: Math.ceil(total * EXAM_PASS_PCT / 100),
+    examName: questionSet.name || EXAM_NAME,
+    examDescription: questionSet.description || '',
+    examActive: examEnabled,
+    durationSecs,
+    passPct,
+    passScore: Math.ceil(total * passPct / 100),
     total,
-    proctorEnabled: PROCTOR_ENABLED
+    proctorEnabled: questionSet.proctorEnabled !== false
   };
 }
 
@@ -442,6 +666,20 @@ async function getResultRecord(conn, code) {
   return parseJsonOrNull(rows[0].RESULT_JSON);
 }
 
+async function syncAccessCodeSummaryFromResult(conn, code, result) {
+  await execQuery(
+    conn,
+    `UPDATE ACCESS_CODES
+        SET STATUS = 'completed',
+            SCORE = ?,
+            PCT = ?,
+            PASS = ?,
+            UPDATED_AT = CURRENT_UTCTIMESTAMP
+      WHERE ACCESS_CODE = ?`,
+    [result?.score ?? null, result?.pct ?? null, result?.pass == null ? null : (result.pass ? 1 : 0), code]
+  );
+}
+
 async function saveResult(conn, code, result) {
   await execQuery(
     conn,
@@ -494,10 +732,11 @@ async function updateCodeStatus(conn, code, status, result = null) {
   );
 }
 
-function gradeExamFromSession(session, answers, questionBank) {
-  const answerKey = questionBank.answerKey;
+function gradeExamFromSession(session, answers) {
+  const answerKey = Array.isArray(session.answerKey) ? session.answerKey : [];
   let score = 0;
   const questionResults = [];
+  const sectionMap = new Map();
 
   session.qOrder.forEach((questionIdx, displayIdx) => {
     const displaySelection = Array.isArray(answers[displayIdx]) ? answers[displayIdx].map(Number) : [];
@@ -509,13 +748,61 @@ function gradeExamFromSession(session, answers, questionBank) {
     const expected = (answerKey[questionIdx] || []).slice().sort((a, b) => a - b);
     const correct = originalSelection.join(',') === expected.join(',');
     if (correct) score += 1;
-    questionResults.push({ displayIdx, questionIdx, correct, given: originalSelection, expected });
+    const question = session.questions?.[questionIdx];
+    const displayOptions = Array.isArray(optionOrder)
+      ? optionOrder.map((idx) => String(question?.opts?.[idx] || ''))
+      : (question?.opts || []).map((opt) => String(opt));
+    const toDisplayIndexes = (originalIndexes) => originalIndexes
+      .map((originalIdx) => optionOrder.findIndex((idx) => idx === originalIdx))
+      .filter((idx) => idx >= 0)
+      .sort((a, b) => a - b);
+    questionResults.push({
+      displayIdx,
+      questionIndex: question?.questionIndex ?? questionIdx,
+      questionId: question?.questionId ?? null,
+      correct,
+      given: originalSelection,
+      expected,
+      givenDisplay: toDisplayIndexes(originalSelection),
+      expectedDisplay: toDisplayIndexes(expected),
+      stem: question?.stem || '',
+      note: question?.note || null,
+      opts: Array.isArray(question?.opts) ? question.opts.map((opt) => String(opt)) : [],
+      displayOptions,
+      multi: Boolean(question?.multi),
+      sectionId: question?.sectionId ?? null,
+      sectionName: question?.sectionName || ''
+    });
+    if (question?.sectionId != null) {
+      const key = String(question.sectionId);
+      if (!sectionMap.has(key)) {
+        sectionMap.set(key, {
+          sectionId: question.sectionId,
+          name: question.sectionName || 'Section',
+          displayOrder: Number(question.sectionOrder || 0),
+          correct: 0,
+          total: 0
+        });
+      }
+      const section = sectionMap.get(key);
+      section.total += 1;
+      if (correct) section.correct += 1;
+    }
   });
 
-  const total = questionBank.total;
+  const total = Number(session.total || session.questions?.length || 0);
   const pct = Math.round((score / total) * 100);
-  const pass = pct >= EXAM_PASS_PCT;
-  return { score, total, pct, pass, questionResults };
+  const pass = pct >= Number(session.passPct || 80);
+  const sectionResults = [...sectionMap.values()]
+    .sort((a, b) => a.displayOrder - b.displayOrder)
+    .map((section) => ({
+      sectionId: section.sectionId,
+      name: section.name,
+      correct: section.correct,
+      total: section.total,
+      pct: section.total ? Math.round((section.correct / section.total) * 100) : 0
+    }));
+  return { score, total, pct, pass, questionResults, sectionResults };
 }
 
 app.post('/api/proctor/check', async (req, res) => {
@@ -582,11 +869,32 @@ app.post('/api/proctor/check', async (req, res) => {
 app.get('/api/health', async (_req, res) => {
   if (!HAS_DB_CONFIG) return res.status(500).json({ ok: false, message: 'Missing HANA env vars.' });
   try {
-    const questionBank = await withDb(async (conn) => {
+    const status = await withDb(async (conn) => {
       await execQuery(conn, 'SELECT 1 AS OK FROM DUMMY');
-      return loadQuestionBank(conn);
+      const activeSet = await getActiveQuestionSetRow(conn);
+      if (!activeSet) throw new Error('No active question set found.');
+      const questionSet = await loadQuestionSet(conn, activeSet.id);
+      const setRows = await execQuery(conn, 'SELECT COUNT(*) AS CNT FROM QUESTION_SETS');
+      const examEnabled = await getExamEnabled(conn);
+      return {
+        activeSet,
+        questionSet,
+        setCount: Number(setRows?.[0]?.CNT || 0),
+        examEnabled
+      };
     });
-    res.json({ ok: true, db: 'connected', schema: HANA_SCHEMA, totalQuestions: questionBank.total });
+    res.json({
+      ok: true,
+      db: 'connected',
+      schema: HANA_SCHEMA,
+      totalQuestions: status.questionSet.totalQuestions,
+      totalQuestionSets: status.setCount,
+      examActive: status.examEnabled,
+      activeQuestionSet: {
+        id: status.activeSet.id,
+        name: status.activeSet.name
+      }
+    });
   } catch (err) {
     appLog('error', 'health_failed', { message: err.message });
     res.status(500).json({ ok: false, message: err.message });
@@ -595,8 +903,14 @@ app.get('/api/health', async (_req, res) => {
 
 app.get('/api/status', async (_req, res) => {
   try {
-    const questionBank = await getQuestionBank();
-    res.json(getExamConfig(questionBank));
+    const status = await withDb(async (conn) => {
+      const activeSet = await getActiveQuestionSetRow(conn);
+      if (!activeSet) throw new Error('No active question set configured.');
+      const questionSet = await loadQuestionSet(conn, activeSet.id);
+      const examEnabled = await getExamEnabled(conn);
+      return buildExamConfigForSet(questionSet, null, examEnabled);
+    });
+    res.json(status);
   } catch (err) {
     appLog('error', 'status_failed', { message: err.message });
     res.status(500).json({ error: 'status_failed', message: err.message });
@@ -615,28 +929,28 @@ app.post('/api/validate', async (req, res) => {
   if (!/^[A-Z2-9]{6}$/.test(code)) return res.json({ valid: false, reason: 'invalid_format' });
 
   try {
-    const questionBank = await getQuestionBank();
-    const cfg = getExamConfig(questionBank);
-    if (!cfg.examActive) return res.json({ valid: false, reason: 'exam_not_active' });
-
     const result = await withDb(async (conn) => {
       const codeRow = await getCodeRow(conn, code);
       if (!codeRow) return { valid: false, reason: 'not_found' };
+      const questionSet = await loadResolvedQuestionSet(conn, code);
+      const examEnabled = await getExamEnabled(conn);
+      const cfg = buildExamConfigForSet(questionSet, null, examEnabled);
+      if (!cfg.examActive) return { valid: false, reason: 'exam_not_active', ...cfg };
 
       const savedResult = await getResultRecord(conn, code);
       if (savedResult || codeRow.status === 'completed') {
-        return { valid: true, status: 'completed', result: savedResult || null };
+        return { valid: true, status: 'completed', result: savedResult || null, questionSet: { id: questionSet.id, name: questionSet.name }, ...cfg };
       }
 
       const progress = await getSavedSession(conn, code);
       if (progress || codeRow.status === 'active') {
-        return { valid: true, status: 'active', progress: progress || null };
+        return { valid: true, status: 'active', progress: progress || null, questionSet: { id: questionSet.id, name: questionSet.name }, ...cfg };
       }
 
-      return { valid: true, status: 'unused' };
+      return { valid: true, status: 'unused', questionSet: { id: questionSet.id, name: questionSet.name }, ...cfg };
     });
 
-    res.json({ ...cfg, ...result });
+    res.json(result);
   } catch (err) {
     appLog('error', 'validate_failed', { code, message: err.message });
     res.status(500).json({ error: 'validate_failed', message: err.message });
@@ -649,10 +963,15 @@ app.post('/api/session/start', async (req, res) => {
   if (!/^[A-Z2-9]{6}$/.test(code)) return res.status(400).json({ error: 'invalid_code' });
 
   try {
-    const questionBank = await getQuestionBank();
     const payload = await withDb(async (conn) => {
       const codeRow = await getCodeRow(conn, code);
       if (!codeRow) return { status: 404, body: { error: 'code_not_found' } };
+      const questionSet = await loadResolvedQuestionSet(conn, code);
+      const examEnabled = await getExamEnabled(conn);
+      const sessionConfig = buildExamConfigForSet(questionSet, null, examEnabled);
+      if (!sessionConfig.examActive) {
+        return { status: 409, body: { error: 'exam_not_active', ...sessionConfig } };
+      }
 
       const savedResult = await getResultRecord(conn, code);
       if (savedResult || codeRow.status === 'completed') {
@@ -661,7 +980,7 @@ app.post('/api/session/start', async (req, res) => {
 
       if (fresh) await deleteSession(conn, code);
       const progress = fresh ? null : await getSavedSession(conn, code);
-      const { token } = createExamSessionFromBank(code, questionBank);
+      const { token } = createExamSessionFromSet(code, questionSet);
       await updateCodeStatus(conn, code, 'active');
 
       return {
@@ -670,7 +989,8 @@ app.post('/api/session/start', async (req, res) => {
           ok: true,
           examToken: token,
           progress,
-          ...getExamConfig(questionBank)
+          questionSet: { id: questionSet.id, name: questionSet.name },
+          ...sessionConfig
         }
       };
     });
@@ -690,14 +1010,13 @@ app.get('/api/question/:displayIdx', requireExamSession, async (req, res) => {
   }
 
   try {
-    const questionBank = await getQuestionBank();
     const questionIdx = session.qOrder[displayIdx];
-    const question = questionBank.questions[questionIdx];
+    const question = session.questions[questionIdx];
     const optionOrder = session.optOrders[displayIdx];
     if (!question) return res.status(404).json({ error: 'question_not_found' });
     res.json({
       displayIdx,
-      total: questionBank.total,
+      total: session.total,
       stem: question.stem,
       note: question.note || null,
       multi: Boolean(question.multi),
@@ -747,10 +1066,11 @@ app.post('/api/submit', requireExamSession, async (req, res) => {
   const autoSubmit = Boolean(req.body?.autoSubmit);
 
   try {
-    const questionBank = await getQuestionBank();
-    const result = gradeExamFromSession(session, answers, questionBank);
+    const result = gradeExamFromSession(session, answers);
     const record = {
       code,
+      questionSetId: session.questionSetId,
+      questionSetName: session.questionSetName,
       score: result.score,
       total: result.total,
       pct: result.pct,
@@ -760,6 +1080,8 @@ app.post('/api/submit', requireExamSession, async (req, res) => {
       tabSwitches,
       incidents,
       incidentCount: incidents.length,
+      questionResults: result.questionResults,
+      sectionResults: result.sectionResults,
       submittedAt: new Date().toISOString()
     };
 
@@ -821,35 +1143,53 @@ app.post('/api/admin/login', (req, res) => {
 
 app.get('/api/admin/codes', requireAdmin, async (_req, res) => {
   try {
-    const rows = await withDb(async (conn) => {
+    const payload = await withDb(async (conn) => {
       const hasNotes = await hasNotesColumn(conn);
-      return execQuery(
-        conn,
-        `SELECT c.ACCESS_CODE, c.LABEL, ${hasNotes ? 'c.NOTES,' : `'' AS NOTES,`} c.STATUS, c.SCORE, c.PCT, c.PASS,
-                r.DURATION_SECS, r.TAB_SWITCHES, r.INCIDENT_COUNT, r.SUBMITTED_AT, r.RESULT_JSON
-           FROM ACCESS_CODES c
-           LEFT JOIN EXAM_RESULTS r ON r.ACCESS_CODE = c.ACCESS_CODE
-          ORDER BY c.ACCESS_CODE ASC`
-      );
+      const [rows, questionSets, examEnabled] = await Promise.all([
+        execQuery(
+          conn,
+          `SELECT c.ACCESS_CODE, c.LABEL, ${hasNotes ? 'c.NOTES,' : `'' AS NOTES,`} c.STATUS, c.SCORE, c.PCT, c.PASS,
+                  c.QUESTION_SET_ID, qs.NAME AS QUESTION_SET_NAME, qs.IS_ACTIVE AS QUESTION_SET_ACTIVE,
+                  r.SCORE AS RESULT_SCORE, r.PCT AS RESULT_PCT, r.PASS AS RESULT_PASS,
+                  r.DURATION_SECS, r.TAB_SWITCHES, r.INCIDENT_COUNT, r.SUBMITTED_AT, r.RESULT_JSON
+             FROM ACCESS_CODES c
+             LEFT JOIN QUESTION_SETS qs ON qs.QUESTION_SET_ID = c.QUESTION_SET_ID
+             LEFT JOIN EXAM_RESULTS r ON r.ACCESS_CODE = c.ACCESS_CODE
+            ORDER BY c.ACCESS_CODE ASC`
+        ),
+        getQuestionSetRows(conn),
+        getExamEnabled(conn)
+      ]);
+      return { rows, questionSets, examEnabled };
     });
-    const codes = rows.map((r) => {
+    const codes = payload.rows.map((r) => {
       const parsedResult = parseJsonOrNull(r.RESULT_JSON);
       return {
         code: r.ACCESS_CODE,
         label: r.LABEL || '',
         notes: r.NOTES || '',
         status: r.STATUS || 'unused',
-        score: r.SCORE,
-        pct: r.PCT,
-        pass: r.PASS === null || r.PASS === undefined ? null : Boolean(r.PASS),
+        score: r.SCORE ?? r.RESULT_SCORE ?? parsedResult?.score ?? null,
+        pct: r.PCT ?? r.RESULT_PCT ?? parsedResult?.pct ?? null,
+        pass: r.PASS === null || r.PASS === undefined
+          ? (r.RESULT_PASS === null || r.RESULT_PASS === undefined ? (parsedResult?.pass ?? null) : Boolean(r.RESULT_PASS))
+          : Boolean(r.PASS),
         durationSecs: r.DURATION_SECS,
         tabSwitches: r.TAB_SWITCHES || 0,
         incidentCount: r.INCIDENT_COUNT || 0,
         submittedAt: r.SUBMITTED_AT ? new Date(r.SUBMITTED_AT).toISOString() : null,
-        incidents: parsedResult?.incidents || []
+        incidents: parsedResult?.incidents || [],
+        questionResults: Array.isArray(parsedResult?.questionResults) ? parsedResult.questionResults : [],
+        questionSetId: r.QUESTION_SET_ID == null ? null : Number(r.QUESTION_SET_ID),
+        questionSetName: r.QUESTION_SET_NAME || '',
+        questionSetActive: r.QUESTION_SET_ACTIVE == null ? false : Boolean(r.QUESTION_SET_ACTIVE)
       };
     });
-    res.json({ codes, examName: EXAM_NAME, examActive: EXAM_ACTIVE, proctorEnabled: PROCTOR_ENABLED });
+    res.json({
+      codes,
+      questionSets: payload.questionSets,
+      examActive: payload.examEnabled
+    });
   } catch (err) {
     appLog('error', 'admin_codes_failed', { message: err.message });
     res.status(500).json({ error: 'admin_codes_failed', message: err.message });
@@ -859,12 +1199,16 @@ app.get('/api/admin/codes', requireAdmin, async (_req, res) => {
 app.get('/api/admin/system-status', requireAdmin, async (_req, res) => {
   try {
     const status = await withDb(async (conn) => {
-      const questionBank = await loadQuestionBank(conn);
+      const questionSets = await getQuestionSetRows(conn);
+      const activeSet = questionSets.find((set) => set.isActive) || questionSets[0] || null;
+      const activeQuestionSet = activeSet ? await loadQuestionSet(conn, activeSet.id) : null;
       const hasNotes = await hasNotesColumn(conn);
       const auditEnabled = await hasAuditLogTable(conn);
+      const examEnabled = await getExamEnabled(conn);
       const accessCodeRows = await execQuery(conn, 'SELECT COUNT(*) AS CNT FROM ACCESS_CODES');
       const resultRows = await execQuery(conn, 'SELECT COUNT(*) AS CNT FROM EXAM_RESULTS');
       const sessionRows = await execQuery(conn, 'SELECT COUNT(*) AS CNT FROM EXAM_SESSIONS');
+      const questionRows = await execQuery(conn, 'SELECT COUNT(*) AS CNT FROM QUESTION_SET_QUESTIONS');
       const staleSessionRows = await execQuery(
         conn,
         `SELECT ACCESS_CODE, UPDATED_AT
@@ -876,12 +1220,16 @@ app.get('/api/admin/system-status', requireAdmin, async (_req, res) => {
       );
       const auditRows = auditEnabled ? await execQuery(conn, 'SELECT COUNT(*) AS CNT FROM ADMIN_AUDIT_LOG') : [{ CNT: 0 }];
       return {
-        ok: questionBank.total > 0,
+        ok: Boolean(activeQuestionSet && activeQuestionSet.totalQuestions > 0),
         schema: HANA_SCHEMA,
-        questionCount: questionBank.total,
+        questionCount: Number(questionRows?.[0]?.CNT || 0),
+        questionSetCount: questionSets.length,
+        activeQuestionSet: activeSet ? { id: activeSet.id, name: activeSet.name } : null,
+        activeQuestionCount: activeQuestionSet ? activeQuestionSet.totalQuestions : 0,
         accessCodeCount: Number(accessCodeRows?.[0]?.CNT || 0),
         resultCount: Number(resultRows?.[0]?.CNT || 0),
         activeSessionCount: Number(sessionRows?.[0]?.CNT || 0),
+        examEnabled,
         staleSessionCount: staleSessionRows.length,
         staleSessionMinutes: STALE_SESSION_MINUTES,
         staleSessions: staleSessionRows.map((row) => ({
@@ -896,7 +1244,9 @@ app.get('/api/admin/system-status', requireAdmin, async (_req, res) => {
         auditEnabled,
         adminConfigured: Boolean(ADMIN_HASH),
         warnings: [
-          ...(questionBank.total > 0 ? [] : ['Question bank is empty.']),
+          ...(questionSets.length ? [] : ['No question sets found.']),
+          ...(activeQuestionSet && activeQuestionSet.totalQuestions > 0 ? [] : ['Active question set has no questions.']),
+          ...(examEnabled ? [] : ['Exam access is currently disabled. Candidates cannot enter codes.']),
           ...(hasNotes ? [] : ['ACCESS_CODES.NOTES column is missing.']),
           ...(staleSessionRows.length ? [`${staleSessionRows.length} active session(s) look stale (${STALE_SESSION_MINUTES}+ min without a save).`] : []),
           ...(auditEnabled ? [] : ['ADMIN_AUDIT_LOG table is missing.']),
@@ -911,9 +1261,13 @@ app.get('/api/admin/system-status', requireAdmin, async (_req, res) => {
       ok: false,
       schema: HANA_SCHEMA,
       questionCount: 0,
+      questionSetCount: 0,
+      activeQuestionSet: null,
+      activeQuestionCount: 0,
       accessCodeCount: 0,
       resultCount: 0,
       activeSessionCount: 0,
+      examEnabled: EXAM_ACTIVE,
       staleSessionCount: 0,
       staleSessionMinutes: STALE_SESSION_MINUTES,
       staleSessions: [],
@@ -927,26 +1281,6 @@ app.get('/api/admin/system-status', requireAdmin, async (_req, res) => {
       warnings: ['Could not load system status from HANA.'],
       error: 'admin_system_status_failed'
     });
-  }
-});
-
-app.get('/api/admin/question-probe', requireAdmin, async (_req, res) => {
-  try {
-    const questionBank = await getQuestionBank();
-    const idx = Math.floor(Math.random() * questionBank.total);
-    const question = questionBank.questions[idx];
-    res.json({
-      ok: true,
-      questionIndex: idx,
-      total: questionBank.total,
-      multi: Boolean(question.multi),
-      optionCount: Array.isArray(question.opts) ? question.opts.length : 0,
-      notePresent: Boolean(question.note),
-      stemPreview: String(question.stem || '').slice(0, 220)
-    });
-  } catch (err) {
-    appLog('error', 'admin_question_probe_failed', { message: err.message });
-    res.status(500).json({ ok: false, error: 'admin_question_probe_failed' });
   }
 });
 
@@ -976,6 +1310,55 @@ app.get('/api/admin/audit', requireAdmin, async (req, res) => {
   } catch (err) {
     appLog('error', 'admin_audit_fetch_failed', { message: err.message });
     res.status(500).json({ error: 'admin_audit_fetch_failed' });
+  }
+});
+
+app.post('/api/admin/exam-availability', requireAdmin, async (req, res) => {
+  const enabled = req.body?.enabled !== false;
+  try {
+    await withDb(async (conn) => {
+      await setAppSetting(conn, APP_SETTING_EXAMS_ENABLED, enabled ? 'true' : 'false');
+      await writeAdminAudit(conn, {
+        action: 'admin_exam_availability_updated',
+        actor: 'admin',
+        clientIp: getClientIp(req),
+        details: { enabled }
+      });
+    });
+    res.json({ ok: true, enabled });
+  } catch (err) {
+    appLog('error', 'admin_exam_availability_failed', { message: err.message });
+    res.status(500).json({ error: 'admin_exam_availability_failed' });
+  }
+});
+
+app.get('/api/admin/results/:code/review', requireAdmin, async (req, res) => {
+  const code = String(req.params.code || '').trim().toUpperCase();
+  if (!/^[A-Z2-9]{6}$/.test(code)) return res.status(400).json({ error: 'invalid_code' });
+  try {
+    const payload = await withDb(async (conn) => {
+      const codeRow = await getCodeRow(conn, code);
+      if (!codeRow) throw new Error('code_not_found');
+      const result = await getResultRecord(conn, code);
+      if (!result) throw new Error('result_not_found');
+      return {
+        code,
+        label: codeRow.label || '',
+        status: codeRow.status || 'completed',
+        result
+      };
+    });
+    res.json({
+      ok: true,
+      code: payload.code,
+      label: payload.label,
+      status: payload.status,
+      result: payload.result,
+      reviewAvailable: Array.isArray(payload.result?.questionResults) && payload.result.questionResults.length > 0
+    });
+  } catch (err) {
+    const status = err.message === 'code_not_found' || err.message === 'result_not_found' ? 404 : 500;
+    res.status(status).json({ error: err.message });
   }
 });
 
@@ -1084,6 +1467,35 @@ app.post('/api/admin/reset', requireAdmin, async (req, res) => {
   }
 });
 
+app.delete('/api/admin/codes/:code', requireAdmin, async (req, res) => {
+  const code = String(req.params.code || '').trim().toUpperCase();
+  if (!/^[A-Z2-9]{6}$/.test(code)) return res.status(400).json({ error: 'invalid_code' });
+
+  try {
+    await withDb(async (conn) => {
+      const codeRow = await getCodeRow(conn, code);
+      if (!codeRow) throw new Error('code_not_found');
+      await deleteSession(conn, code);
+      await execQuery(conn, 'DELETE FROM EXAM_RESULTS WHERE ACCESS_CODE = ?', [code]);
+      await execQuery(conn, 'DELETE FROM ACCESS_CODES WHERE ACCESS_CODE = ?', [code]);
+      await writeAdminAudit(conn, {
+        action: 'admin_code_deleted',
+        targetCode: code,
+        actor: 'admin',
+        clientIp: getClientIp(req),
+        details: { previousStatus: codeRow.status || 'unknown' }
+      });
+    });
+    for (const [token, value] of _examSessions.entries()) {
+      if (value.code === code) _examSessions.delete(token);
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    const status = err.message === 'code_not_found' ? 404 : 500;
+    res.status(status).json({ error: err.message });
+  }
+});
+
 app.post('/api/admin/generate', requireAdmin, async (req, res) => {
   const count = Math.min(Math.max(Number(req.body?.count) || 10, 1), 200);
   const chars = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
@@ -1132,6 +1544,534 @@ app.post('/api/admin/generate', requireAdmin, async (req, res) => {
   }
 });
 
+app.post('/api/admin/results/repair-summaries', requireAdmin, async (req, res) => {
+  try {
+    const payload = await withDb(async (conn) => {
+      const rows = await execQuery(conn, 'SELECT ACCESS_CODE, RESULT_JSON FROM EXAM_RESULTS');
+      let repaired = 0;
+      let skipped = 0;
+      for (const row of rows) {
+        const result = parseJsonOrNull(row.RESULT_JSON);
+        if (!result || typeof result.score !== 'number' || typeof result.pct !== 'number') {
+          skipped += 1;
+          continue;
+        }
+        await syncAccessCodeSummaryFromResult(conn, row.ACCESS_CODE, result);
+        repaired += 1;
+      }
+      await writeAdminAudit(conn, {
+        action: 'admin_result_summaries_repaired',
+        actor: 'admin',
+        clientIp: getClientIp(req),
+        details: { repaired, skipped }
+      });
+      return { repaired, skipped };
+    });
+    res.json({ ok: true, ...payload });
+  } catch (err) {
+    appLog('error', 'admin_repair_result_summaries_failed', { message: err.message });
+    res.status(500).json({ error: 'admin_repair_result_summaries_failed' });
+  }
+});
+
+app.post('/api/admin/results/clear-summaries', requireAdmin, async (req, res) => {
+  try {
+    await withDb(async (conn) => {
+      await execQuery(conn, 'UPDATE ACCESS_CODES SET SCORE = NULL, PCT = NULL, PASS = NULL, UPDATED_AT = CURRENT_UTCTIMESTAMP');
+      await execQuery(conn, 'UPDATE EXAM_RESULTS SET SCORE = NULL, PCT = NULL, PASS = NULL');
+      await writeAdminAudit(conn, {
+        action: 'admin_result_summaries_cleared',
+        actor: 'admin',
+        clientIp: getClientIp(req),
+        details: { scope: 'all' }
+      });
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    appLog('error', 'admin_clear_result_summaries_failed', { message: err.message });
+    res.status(500).json({ error: 'admin_clear_result_summaries_failed' });
+  }
+});
+
+app.post('/api/admin/codes/:code/question-set', requireAdmin, async (req, res) => {
+  const code = String(req.params.code || '').trim().toUpperCase();
+  const questionSetIdRaw = req.body?.questionSetId;
+  const questionSetId = questionSetIdRaw == null || questionSetIdRaw === '' ? null : Number(questionSetIdRaw);
+  if (!/^[A-Z2-9]{6}$/.test(code)) return res.status(400).json({ error: 'invalid_code' });
+  if (questionSetIdRaw != null && questionSetIdRaw !== '' && !Number.isInteger(questionSetId)) {
+    return res.status(400).json({ error: 'invalid_question_set_id' });
+  }
+
+  try {
+    await withDb(async (conn) => {
+      const codeRow = await getCodeRow(conn, code);
+      if (!codeRow) throw new Error('code_not_found');
+      if (codeRow.status !== 'unused') throw new Error('code_assignment_requires_unused_status');
+      if (questionSetId != null) {
+        const qs = await execQuery(conn, 'SELECT QUESTION_SET_ID FROM QUESTION_SETS WHERE QUESTION_SET_ID = ?', [questionSetId]);
+        if (!qs.length) throw new Error('question_set_not_found');
+      }
+      await execQuery(
+        conn,
+        'UPDATE ACCESS_CODES SET QUESTION_SET_ID = ?, UPDATED_AT = CURRENT_UTCTIMESTAMP WHERE ACCESS_CODE = ?',
+        [questionSetId, code]
+      );
+      await writeAdminAudit(conn, {
+        action: 'admin_code_question_set_assigned',
+        targetCode: code,
+        actor: 'admin',
+        clientIp: getClientIp(req),
+        details: { questionSetId }
+      });
+    });
+    res.json({ ok: true, questionSetId });
+  } catch (err) {
+    const status =
+      err.message === 'code_not_found' ? 404 :
+      err.message === 'question_set_not_found' ? 404 :
+      err.message === 'code_assignment_requires_unused_status' ? 400 : 500;
+    res.status(status).json({ error: err.message });
+  }
+});
+
+app.get('/api/admin/question-sets', requireAdmin, async (_req, res) => {
+  try {
+    const sets = await withDb(async (conn) => {
+      const rows = await execQuery(
+        conn,
+        `SELECT qs.QUESTION_SET_ID, qs.NAME, qs.DESCRIPTION, qs.IS_ACTIVE,
+                qs.DURATION_MINUTES, qs.PASS_PCT, qs.PROCTOR_ENABLED, qs.NUM_QUESTIONS,
+                qs.CREATED_AT, qs.UPDATED_AT,
+                COUNT(q.QUESTION_ID) AS QUESTION_COUNT
+           FROM QUESTION_SETS qs
+           LEFT JOIN QUESTION_SET_QUESTIONS q ON q.QUESTION_SET_ID = qs.QUESTION_SET_ID
+          GROUP BY qs.QUESTION_SET_ID, qs.NAME, qs.DESCRIPTION, qs.IS_ACTIVE,
+                   qs.DURATION_MINUTES, qs.PASS_PCT, qs.PROCTOR_ENABLED, qs.NUM_QUESTIONS,
+                   qs.CREATED_AT, qs.UPDATED_AT
+          ORDER BY qs.IS_ACTIVE DESC, qs.NAME ASC, qs.QUESTION_SET_ID ASC`
+      );
+      return rows.map((row) => ({
+        ...normalizeQuestionSetRow(row),
+        questionCount: Number(row.QUESTION_COUNT || 0)
+      }));
+    });
+    res.json({ sets });
+  } catch (err) {
+    res.status(500).json({ error: 'admin_question_sets_failed', message: err.message });
+  }
+});
+
+app.post('/api/admin/question-sets', requireAdmin, async (req, res) => {
+  const name = String(req.body?.name || '').trim();
+  const description = String(req.body?.description || '').trim();
+  if (!name) return res.status(400).json({ error: 'name_required' });
+
+  try {
+    const created = await withDb(async (conn) => {
+      await execQuery(
+        conn,
+        `INSERT INTO QUESTION_SETS
+          (NAME, DESCRIPTION, IS_ACTIVE, DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, NUM_QUESTIONS, CREATED_AT, UPDATED_AT)
+         VALUES (?, ?, FALSE, 45, 80, TRUE, NULL, CURRENT_UTCTIMESTAMP, CURRENT_UTCTIMESTAMP)`,
+        [name, description || null]
+      );
+      const rows = await execQuery(
+        conn,
+        `SELECT QUESTION_SET_ID, NAME, DESCRIPTION, IS_ACTIVE, DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, NUM_QUESTIONS, CREATED_AT, UPDATED_AT
+           FROM QUESTION_SETS
+          WHERE NAME = ?
+          ORDER BY QUESTION_SET_ID DESC
+          LIMIT 1`,
+        [name]
+      );
+      await writeAdminAudit(conn, {
+        action: 'admin_question_set_created',
+        actor: 'admin',
+        clientIp: getClientIp(req),
+        details: { name }
+      });
+      return normalizeQuestionSetRow(rows[0]);
+    });
+    res.json({ ok: true, questionSet: created });
+  } catch (err) {
+    res.status(500).json({ error: 'admin_question_set_create_failed', message: err.message });
+  }
+});
+
+app.post('/api/admin/question-sets/:id/config', requireAdmin, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid_question_set_id' });
+  const name = String(req.body?.name || '').trim();
+  const description = String(req.body?.description || '').trim();
+  const durationMinutes = Math.max(1, Math.min(Number(req.body?.durationMinutes) || 45, 240));
+  const passPct = Math.max(1, Math.min(Number(req.body?.passPct) || 80, 100));
+  const proctorEnabled = req.body?.proctorEnabled !== false;
+  const numQuestionsRaw = req.body?.numQuestions;
+  const numQuestions = numQuestionsRaw == null || numQuestionsRaw === '' ? null : Math.max(1, Number(numQuestionsRaw));
+  if (!name) return res.status(400).json({ error: 'name_required' });
+
+  try {
+    await withDb(async (conn) => {
+      await execQuery(
+        conn,
+        `UPDATE QUESTION_SETS
+            SET NAME = ?,
+                DESCRIPTION = ?,
+                DURATION_MINUTES = ?,
+                PASS_PCT = ?,
+                PROCTOR_ENABLED = ?,
+                NUM_QUESTIONS = ?,
+                UPDATED_AT = CURRENT_UTCTIMESTAMP
+          WHERE QUESTION_SET_ID = ?`,
+        [name, description || null, durationMinutes, passPct, proctorEnabled ? 1 : 0, numQuestions, id]
+      );
+      clearQuestionSetCache(id);
+      await writeAdminAudit(conn, {
+        action: 'admin_question_set_config_updated',
+        actor: 'admin',
+        clientIp: getClientIp(req),
+        details: { questionSetId: id, name, durationMinutes, passPct, proctorEnabled, numQuestions }
+      });
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: 'admin_question_set_config_failed', message: err.message });
+  }
+});
+
+app.post('/api/admin/question-sets/:id/activate', requireAdmin, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid_question_set_id' });
+
+  try {
+    await withDb(async (conn) => {
+      await execQuery(conn, 'UPDATE QUESTION_SETS SET IS_ACTIVE = FALSE, UPDATED_AT = CURRENT_UTCTIMESTAMP');
+      await execQuery(
+        conn,
+        'UPDATE QUESTION_SETS SET IS_ACTIVE = TRUE, UPDATED_AT = CURRENT_UTCTIMESTAMP WHERE QUESTION_SET_ID = ?',
+        [id]
+      );
+      clearQuestionSetCache();
+      await writeAdminAudit(conn, {
+        action: 'admin_question_set_activated',
+        actor: 'admin',
+        clientIp: getClientIp(req),
+        details: { questionSetId: id }
+      });
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: 'admin_question_set_activate_failed', message: err.message });
+  }
+});
+
+app.delete('/api/admin/question-sets/:id', requireAdmin, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid_question_set_id' });
+
+  try {
+    await withDb(async (conn) => {
+      const rows = await execQuery(conn, 'SELECT IS_ACTIVE FROM QUESTION_SETS WHERE QUESTION_SET_ID = ?', [id]);
+      if (!rows.length) throw new Error('question_set_not_found');
+      if (rows[0].IS_ACTIVE) throw new Error('cannot_delete_active_question_set');
+      await execQuery(conn, 'DELETE FROM QUESTION_SETS WHERE QUESTION_SET_ID = ?', [id]);
+      clearQuestionSetCache(id);
+      await writeAdminAudit(conn, {
+        action: 'admin_question_set_deleted',
+        actor: 'admin',
+        clientIp: getClientIp(req),
+        details: { questionSetId: id }
+      });
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    const status =
+      err.message === 'question_set_not_found' ? 404 :
+      err.message === 'cannot_delete_active_question_set' ? 400 : 500;
+    res.status(status).json({ error: err.message });
+  }
+});
+
+app.get('/api/admin/question-sets/:id/questions', requireAdmin, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid_question_set_id' });
+
+  try {
+    const payload = await withDb(async (conn) => {
+      const questionSet = await loadQuestionSet(conn, id, { allowEmpty: true });
+      return {
+        questionSet: {
+          id: questionSet.id,
+          name: questionSet.name,
+          description: questionSet.description,
+          isActive: questionSet.isActive
+        },
+        questions: questionSet.questions.map((question) => ({
+          id: question.questionId,
+          qNum: question.questionIndex,
+          stem: question.stem,
+          note: question.note || '',
+          opts: question.opts,
+          correctIndices: question.answer,
+          multi: Boolean(question.multi),
+          sectionId: question.sectionId
+        }))
+      };
+    });
+    res.json(payload);
+  } catch (err) {
+    res.status(500).json({ error: 'admin_question_set_questions_failed', message: err.message });
+  }
+});
+
+app.post('/api/admin/question-sets/:setId/questions', requireAdmin, async (req, res) => {
+  const setId = Number(req.params.setId);
+  if (!Number.isInteger(setId)) return res.status(400).json({ error: 'invalid_question_set_id' });
+
+  const questionId = req.body?.id == null || req.body?.id === '' ? null : Number(req.body.id);
+  const qNum = Number(req.body?.qNum);
+  const stem = String(req.body?.stem || '').trim();
+  const note = String(req.body?.note || '').trim();
+  const opts = Array.isArray(req.body?.opts) ? req.body.opts.map((item) => String(item || '').trim()).filter(Boolean) : [];
+  const correctIndices = Array.isArray(req.body?.correctIndices) ? req.body.correctIndices.map((item) => Number(item)).filter((n) => Number.isInteger(n) && n >= 0) : [];
+  const multi = Boolean(req.body?.multi);
+  const sectionId = req.body?.sectionId == null || req.body?.sectionId === '' ? null : Number(req.body.sectionId);
+
+  if (!Number.isInteger(qNum) || qNum < 1) return res.status(400).json({ error: 'invalid_question_number' });
+  if (!stem) return res.status(400).json({ error: 'stem_required' });
+  if (opts.length < 2) return res.status(400).json({ error: 'at_least_two_options_required' });
+  if (!correctIndices.length) return res.status(400).json({ error: 'correct_indices_required' });
+  if (!multi && correctIndices.length !== 1) return res.status(400).json({ error: 'single_select_requires_exactly_one_correct_option' });
+  if (correctIndices.some((idx) => idx >= opts.length)) return res.status(400).json({ error: 'correct_index_out_of_range' });
+
+  try {
+    await withDb(async (conn) => {
+      if (sectionId != null) {
+        const sections = await execQuery(conn, 'SELECT SECTION_ID FROM QUESTION_SECTIONS WHERE SECTION_ID = ? AND QUESTION_SET_ID = ?', [sectionId, setId]);
+        if (!sections.length) throw new Error('section_not_found');
+      }
+      if (questionId != null) {
+        await execQuery(
+          conn,
+          `UPDATE QUESTION_SET_QUESTIONS
+              SET QUESTION_INDEX = ?,
+                  STEM = ?,
+                  NOTE = ?,
+                  OPTS_JSON = ?,
+                  ANSWER_JSON = ?,
+                  MULTI = ?,
+                  SECTION_ID = ?,
+                  UPDATED_AT = CURRENT_UTCTIMESTAMP
+            WHERE QUESTION_ID = ?
+              AND QUESTION_SET_ID = ?`,
+          [qNum, stem, note || null, JSON.stringify(opts), JSON.stringify(correctIndices), multi ? 1 : 0, sectionId, questionId, setId]
+        );
+      } else {
+        await execQuery(
+          conn,
+          `INSERT INTO QUESTION_SET_QUESTIONS
+            (QUESTION_SET_ID, SECTION_ID, QUESTION_INDEX, STEM, NOTE, OPTS_JSON, ANSWER_JSON, MULTI, CREATED_AT, UPDATED_AT)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_UTCTIMESTAMP, CURRENT_UTCTIMESTAMP)`,
+          [setId, sectionId, qNum, stem, note || null, JSON.stringify(opts), JSON.stringify(correctIndices), multi ? 1 : 0]
+        );
+      }
+      clearQuestionSetCache(setId);
+      await writeAdminAudit(conn, {
+        action: questionId != null ? 'admin_question_updated' : 'admin_question_created',
+        actor: 'admin',
+        clientIp: getClientIp(req),
+        details: { questionSetId: setId, questionId, qNum }
+      });
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: 'admin_question_save_failed', message: err.message });
+  }
+});
+
+app.delete('/api/admin/question-sets/:setId/questions/:questionId', requireAdmin, async (req, res) => {
+  const setId = Number(req.params.setId);
+  const questionId = Number(req.params.questionId);
+  if (!Number.isInteger(setId) || !Number.isInteger(questionId)) return res.status(400).json({ error: 'invalid_identifier' });
+
+  try {
+    await withDb(async (conn) => {
+      await execQuery(conn, 'DELETE FROM QUESTION_SET_QUESTIONS WHERE QUESTION_ID = ? AND QUESTION_SET_ID = ?', [questionId, setId]);
+      clearQuestionSetCache(setId);
+      await writeAdminAudit(conn, {
+        action: 'admin_question_deleted',
+        actor: 'admin',
+        clientIp: getClientIp(req),
+        details: { questionSetId: setId, questionId }
+      });
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: 'admin_question_delete_failed', message: err.message });
+  }
+});
+
+app.get('/api/admin/question-sets/:setId/sections', requireAdmin, async (req, res) => {
+  const setId = Number(req.params.setId);
+  if (!Number.isInteger(setId)) return res.status(400).json({ error: 'invalid_question_set_id' });
+
+  try {
+    const sections = await withDb(async (conn) => {
+      const rows = await execQuery(
+        conn,
+        `SELECT s.SECTION_ID, s.QUESTION_SET_ID, s.NAME, s.DESCRIPTION, s.DISPLAY_ORDER, s.DRAW_COUNT,
+                s.CREATED_AT, s.UPDATED_AT, COUNT(q.QUESTION_ID) AS QUESTION_COUNT
+           FROM QUESTION_SECTIONS s
+           LEFT JOIN QUESTION_SET_QUESTIONS q ON q.SECTION_ID = s.SECTION_ID
+          WHERE s.QUESTION_SET_ID = ?
+          GROUP BY s.SECTION_ID, s.QUESTION_SET_ID, s.NAME, s.DESCRIPTION, s.DISPLAY_ORDER, s.DRAW_COUNT, s.CREATED_AT, s.UPDATED_AT
+          ORDER BY s.DISPLAY_ORDER ASC, s.SECTION_ID ASC`,
+        [setId]
+      );
+      return rows.map((row) => ({
+        id: Number(row.SECTION_ID),
+        questionSetId: Number(row.QUESTION_SET_ID),
+        name: String(row.NAME || ''),
+        description: row.DESCRIPTION || '',
+        displayOrder: Number(row.DISPLAY_ORDER || 0),
+        drawCount: row.DRAW_COUNT == null ? null : Number(row.DRAW_COUNT),
+        questionCount: Number(row.QUESTION_COUNT || 0)
+      }));
+    });
+    res.json({ sections });
+  } catch (err) {
+    res.status(500).json({ error: 'admin_sections_failed', message: err.message });
+  }
+});
+
+app.post('/api/admin/question-sets/:setId/sections', requireAdmin, async (req, res) => {
+  const setId = Number(req.params.setId);
+  if (!Number.isInteger(setId)) return res.status(400).json({ error: 'invalid_question_set_id' });
+
+  const sectionId = req.body?.id == null || req.body?.id === '' ? null : Number(req.body.id);
+  const name = String(req.body?.name || '').trim();
+  const description = String(req.body?.description || '').trim();
+  const displayOrder = Number(req.body?.displayOrder) || 0;
+  const drawCountRaw = req.body?.drawCount;
+  const drawCount = drawCountRaw == null || drawCountRaw === '' ? null : Math.max(1, Number(drawCountRaw));
+  if (!name) return res.status(400).json({ error: 'name_required' });
+
+  try {
+    await withDb(async (conn) => {
+      if (sectionId != null) {
+        await execQuery(
+          conn,
+          `UPDATE QUESTION_SECTIONS
+              SET NAME = ?, DESCRIPTION = ?, DISPLAY_ORDER = ?, DRAW_COUNT = ?, UPDATED_AT = CURRENT_UTCTIMESTAMP
+            WHERE SECTION_ID = ? AND QUESTION_SET_ID = ?`,
+          [name, description || null, displayOrder, drawCount, sectionId, setId]
+        );
+      } else {
+        await execQuery(
+          conn,
+          `INSERT INTO QUESTION_SECTIONS
+            (QUESTION_SET_ID, NAME, DESCRIPTION, DISPLAY_ORDER, DRAW_COUNT, CREATED_AT, UPDATED_AT)
+           VALUES (?, ?, ?, ?, ?, CURRENT_UTCTIMESTAMP, CURRENT_UTCTIMESTAMP)`,
+          [setId, name, description || null, displayOrder, drawCount]
+        );
+      }
+      clearQuestionSetCache(setId);
+      await writeAdminAudit(conn, {
+        action: sectionId != null ? 'admin_section_updated' : 'admin_section_created',
+        actor: 'admin',
+        clientIp: getClientIp(req),
+        details: { questionSetId: setId, sectionId, name }
+      });
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: 'admin_section_save_failed', message: err.message });
+  }
+});
+
+app.delete('/api/admin/question-sets/:setId/sections/:sectionId', requireAdmin, async (req, res) => {
+  const setId = Number(req.params.setId);
+  const sectionId = Number(req.params.sectionId);
+  if (!Number.isInteger(setId) || !Number.isInteger(sectionId)) return res.status(400).json({ error: 'invalid_identifier' });
+
+  try {
+    await withDb(async (conn) => {
+      await execQuery(conn, 'UPDATE QUESTION_SET_QUESTIONS SET SECTION_ID = NULL, UPDATED_AT = CURRENT_UTCTIMESTAMP WHERE SECTION_ID = ? AND QUESTION_SET_ID = ?', [sectionId, setId]);
+      await execQuery(conn, 'DELETE FROM QUESTION_SECTIONS WHERE SECTION_ID = ? AND QUESTION_SET_ID = ?', [sectionId, setId]);
+      clearQuestionSetCache(setId);
+      await writeAdminAudit(conn, {
+        action: 'admin_section_deleted',
+        actor: 'admin',
+        clientIp: getClientIp(req),
+        details: { questionSetId: setId, sectionId }
+      });
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: 'admin_section_delete_failed', message: err.message });
+  }
+});
+
+app.post('/api/admin/question-sets/upload', requireAdmin, async (req, res) => {
+  const name = String(req.body?.name || '').trim();
+  const description = String(req.body?.description || '').trim();
+  const questions = Array.isArray(req.body?.questions) ? req.body.questions : [];
+  if (!name) return res.status(400).json({ error: 'name_required' });
+  if (!questions.length) return res.status(400).json({ error: 'questions_required' });
+
+  try {
+    const result = await withDb(async (conn) => {
+      await execQuery(
+        conn,
+        `INSERT INTO QUESTION_SETS
+          (NAME, DESCRIPTION, IS_ACTIVE, DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, NUM_QUESTIONS, CREATED_AT, UPDATED_AT)
+         VALUES (?, ?, FALSE, 45, 80, TRUE, NULL, CURRENT_UTCTIMESTAMP, CURRENT_UTCTIMESTAMP)`,
+        [name, description || null]
+      );
+      const createdRows = await execQuery(
+        conn,
+        `SELECT QUESTION_SET_ID
+           FROM QUESTION_SETS
+          WHERE NAME = ?
+          ORDER BY QUESTION_SET_ID DESC
+          LIMIT 1`,
+        [name]
+      );
+      const setId = Number(createdRows[0].QUESTION_SET_ID);
+
+      for (const entry of questions) {
+        const qNum = Number(entry.qNum);
+        const stem = String(entry.stem || '').trim();
+        const note = String(entry.note || '').trim();
+        const opts = Array.isArray(entry.opts) ? entry.opts.map((item) => String(item || '').trim()).filter(Boolean) : [];
+        const correctIndices = Array.isArray(entry.correctIndices) ? entry.correctIndices.map((item) => Number(item)).filter((n) => Number.isInteger(n) && n >= 0) : [];
+        const multi = Boolean(entry.multi);
+        if (!Number.isInteger(qNum) || !stem || opts.length < 2 || !correctIndices.length) {
+          throw new Error(`invalid_question_payload_${qNum || 'unknown'}`);
+        }
+        await execQuery(
+          conn,
+          `INSERT INTO QUESTION_SET_QUESTIONS
+            (QUESTION_SET_ID, QUESTION_INDEX, STEM, NOTE, OPTS_JSON, ANSWER_JSON, MULTI, CREATED_AT, UPDATED_AT)
+           VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_UTCTIMESTAMP, CURRENT_UTCTIMESTAMP)`,
+          [setId, qNum, stem, note || null, JSON.stringify(opts), JSON.stringify(correctIndices), multi ? 1 : 0]
+        );
+      }
+      clearQuestionSetCache(setId);
+      await writeAdminAudit(conn, {
+        action: 'admin_question_set_uploaded',
+        actor: 'admin',
+        clientIp: getClientIp(req),
+        details: { questionSetId: setId, name, count: questions.length }
+      });
+      return { setId, count: questions.length };
+    });
+    res.json({ ok: true, questionSetId: result.setId, count: result.count });
+  } catch (err) {
+    res.status(500).json({ error: 'admin_question_set_upload_failed', message: err.message });
+  }
+});
+
 app.get('/api/admin/export.csv', requireAdmin, async (_req, res) => {
   try {
     const rows = await withDb(async (conn) => {
@@ -1139,14 +2079,16 @@ app.get('/api/admin/export.csv', requireAdmin, async (_req, res) => {
       return execQuery(
         conn,
         `SELECT c.ACCESS_CODE, c.LABEL, ${hasNotes ? 'c.NOTES,' : `'' AS NOTES,`} c.STATUS,
+                qs.NAME AS QUESTION_SET_NAME,
                 r.SCORE, r.PCT, r.PASS, r.DURATION_SECS, r.TAB_SWITCHES, r.INCIDENT_COUNT, r.SUBMITTED_AT
            FROM ACCESS_CODES c
+           LEFT JOIN QUESTION_SETS qs ON qs.QUESTION_SET_ID = c.QUESTION_SET_ID
            LEFT JOIN EXAM_RESULTS r ON r.ACCESS_CODE = c.ACCESS_CODE
           ORDER BY c.ACCESS_CODE ASC`
       );
     });
 
-    const lines = ['Code,Seat,Notes,Status,Score,Pct,Result,Duration,TabSwitches,Incidents,SubmittedAt'];
+    const lines = ['Code,Seat,Notes,QuestionSet,Status,Score,Pct,Result,Duration,TabSwitches,Incidents,SubmittedAt'];
     for (const r of rows) {
       const resultLabel = r.PASS === null || r.PASS === undefined ? '' : (r.PASS ? 'PASS' : 'FAIL');
       const duration = r.DURATION_SECS == null ? '' : `${Math.floor(r.DURATION_SECS / 60)}m ${String(r.DURATION_SECS % 60).padStart(2, '0')}s`;
@@ -1154,6 +2096,7 @@ app.get('/api/admin/export.csv', requireAdmin, async (_req, res) => {
         toCsvCell(r.ACCESS_CODE),
         toCsvCell(r.LABEL || ''),
         toCsvCell(r.NOTES || ''),
+        toCsvCell(r.QUESTION_SET_NAME || ''),
         toCsvCell(r.STATUS || ''),
         toCsvCell(r.SCORE ?? ''),
         toCsvCell(r.PCT == null ? '' : `${r.PCT}%`),

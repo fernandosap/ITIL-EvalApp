@@ -7,6 +7,8 @@ const CFG = {
 let _adminToken = null;
 let _adminSystemStatus = null;
 let _adminAuditEntries = [];
+let _adminQuestionSets = [];
+let _activeQuestionSet = null;
 const API_TIMEOUT_MS = 12000;
 const API_BASE_RETRY_MS = 600;
 const SAVE_UI = { cls: 'save-pill', text: 'Saved' };
@@ -850,6 +852,21 @@ function summaryValue(rows, status) {
   return rows.filter((r) => r.status === status).length;
 }
 
+function seatSortValue(row) {
+  const label = String(row?.label || '');
+  const match = label.match(/(\d+)/);
+  if (match) return Number(match[1]);
+  return Number.MAX_SAFE_INTEGER;
+}
+
+function sortAdminRows(rows) {
+  return [...rows].sort((a, b) => {
+    const seatDiff = seatSortValue(a) - seatSortValue(b);
+    if (seatDiff !== 0) return seatDiff;
+    return String(a.code || '').localeCompare(String(b.code || ''));
+  });
+}
+
 function flagsFor(code) {
   const row = _adminRows.find((r) => r.code === code);
   if (!row || !row.incidents || !row.incidents.length) {
@@ -858,24 +875,6 @@ function flagsFor(code) {
   }
   const body = row.incidents.map((i) => `• ${i.time || ''} ${i.type || ''}${i.detail ? ` — ${i.detail}` : ''}`).join('\n');
   modal('🚨', `Flags for ${code}`, body, [{ label: 'Close', cls: 'btn-primary' }]);
-}
-
-async function probeQuestions() {
-  try {
-    const resp = await apiJson('/api/admin/question-probe', {}, { timeoutMs: 10000, retries: 0 });
-    if (!resp || !resp.ok) throw new Error('probe_failed');
-    const body = [
-      `Question ${resp.questionIndex + 1} of ${resp.total}`,
-      resp.multi ? 'Type: multi-select' : 'Type: single-select',
-      `Options: ${resp.optionCount}`,
-      `Note present: ${resp.notePresent ? 'yes' : 'no'}`,
-      '',
-      resp.stemPreview || '(no question text returned)'
-    ].join('\n');
-    modal('🧪', 'Question Bank Probe', body, [{ label: 'Close', cls: 'btn-primary' }]);
-  } catch (_e) {
-    modal('❌', 'Probe Failed', 'Could not read a sample question from HANA.', [{ label: 'OK', cls: 'btn-primary' }]);
-  }
 }
 
 async function clearStaleSessions() {
@@ -893,14 +892,186 @@ async function clearStaleSessions() {
   ]);
 }
 
+async function toggleExamAvailability(enabled) {
+  const title = enabled ? 'Open Exams' : 'Close Exams';
+  const body = enabled
+    ? 'Candidates will be able to enter access codes again.'
+    : 'Candidates will be blocked at the access-code screen until exams are turned back on.';
+  modal(enabled ? '🟢' : '⛔', title, body, [
+    {
+      label: enabled ? 'Open Exams' : 'Close Exams',
+      cls: enabled ? 'btn-primary' : 'btn-danger',
+      action: async () => {
+        try {
+          await apiJson('/api/admin/exam-availability', {
+            method: 'POST',
+            body: JSON.stringify({ enabled })
+          }, { timeoutMs: 10000, retries: 0 });
+          showAdmin();
+        } catch (_e) {
+          modal('❌', 'Update Failed', 'Could not update exam availability.', [{ label: 'OK', cls: 'btn-primary' }]);
+        }
+      }
+    },
+    { label: 'Cancel', cls: 'btn-secondary' }
+  ]);
+}
+
+async function repairResultSummaries() {
+  modal('🛠️', 'Repair Scores', 'This will refill missing score and percentage values from saved result records wherever possible.', [
+    {
+      label: 'Repair Scores',
+      cls: 'btn-primary',
+      action: async () => {
+        try {
+          const resp = await apiJson('/api/admin/results/repair-summaries', {
+            method: 'POST',
+            body: JSON.stringify({})
+          }, { timeoutMs: 20000, retries: 0 });
+          modal('✅', 'Repair Complete', `${resp.repaired || 0} completed row(s) were repaired.${resp.skipped ? ` ${resp.skipped} row(s) could not be repaired from historical data.` : ''}`, [
+            { label: 'Refresh', cls: 'btn-primary', action: () => showAdmin() }
+          ]);
+        } catch (_e) {
+          modal('❌', 'Repair Failed', 'Could not repair score summaries.', [{ label: 'OK', cls: 'btn-primary' }]);
+        }
+      }
+    },
+    { label: 'Cancel', cls: 'btn-secondary' }
+  ]);
+}
+
+async function clearResultSummaries() {
+  modal('⚠️', 'Clear All Scores', 'This will blank the score and percentage summary columns for all access codes and completed results. The underlying result JSON remains, but the overview table will show blank scores until repaired.', [
+    {
+      label: 'Clear All Scores',
+      cls: 'btn-danger',
+      action: async () => {
+        try {
+          await apiJson('/api/admin/results/clear-summaries', {
+            method: 'POST',
+            body: JSON.stringify({})
+          }, { timeoutMs: 20000, retries: 0 });
+          modal('✅', 'Scores Cleared', 'All summary score fields were cleared.', [
+            { label: 'Refresh', cls: 'btn-primary', action: () => showAdmin() }
+          ]);
+        } catch (_e) {
+          modal('❌', 'Clear Failed', 'Could not clear the score summaries.', [{ label: 'OK', cls: 'btn-primary' }]);
+        }
+      }
+    },
+    { label: 'Cancel', cls: 'btn-secondary' }
+  ]);
+}
+
+async function deleteCode(code, status) {
+  const detail = status === 'completed'
+    ? 'This will permanently remove the code, its saved result, and any stored progress.'
+    : status === 'active'
+      ? 'This will permanently remove the code and any in-progress session.'
+      : 'This will permanently remove the unused code.';
+  modal('⚠️', 'Delete Access Code', `${detail}\n\nCode: ${code}`, [
+    {
+      label: 'Delete Code',
+      cls: 'btn-danger',
+      action: async () => {
+        try {
+          await apiJson(`/api/admin/codes/${encodeURIComponent(code)}`, { method: 'DELETE' }, { timeoutMs: 12000, retries: 0 });
+          showAdmin();
+        } catch (_e) {
+          modal('❌', 'Delete Failed', 'The access code could not be deleted.', [{ label: 'OK', cls: 'btn-primary' }]);
+        }
+      }
+    },
+    { label: 'Cancel', cls: 'btn-secondary' }
+  ]);
+}
+
+async function reviewResult(code) {
+  render('<div class="admin-wrap"><div style="padding:60px;text-align:center;color:white;font-size:18px">Loading candidate answers...</div></div>');
+  try {
+    const resp = await apiJson(`/api/admin/results/${encodeURIComponent(code)}/review`, {}, { timeoutMs: 12000, retries: 1 });
+    if (!resp || !resp.ok) throw new Error('review_failed');
+    if (!resp.reviewAvailable) {
+      modal('ℹ️', 'Review Not Available', 'This completed exam does not include per-question answer detail. It was likely submitted before answer review was added.', [
+        { label: 'Back to Admin', cls: 'btn-primary', action: () => showAdmin() }
+      ]);
+      return;
+    }
+    const result = resp.result || {};
+    const questionResults = Array.isArray(result.questionResults) ? result.questionResults : [];
+    const rows = questionResults.map((item, idx) => {
+      const opts = Array.isArray(item.opts) ? item.opts : [];
+      const formatIndexes = (indexes) => {
+        if (!Array.isArray(indexes) || !indexes.length) return 'No answer selected';
+        return indexes.map((originalIdx) => `${originalIdx + 1}. ${opts[originalIdx] || `Option ${originalIdx + 1}`}`).join('<br>');
+      };
+      return `
+        <tr>
+          <td style="text-align:center">${idx + 1}</td>
+          <td>
+            <div style="font-weight:700;color:#1F3864">${_esc(item.stem || 'Question')}</div>
+            ${item.note ? `<div style="font-size:12px;color:#666;margin-top:4px">${_esc(item.note)}</div>` : ''}
+            ${item.sectionName ? `<div style="font-size:11px;color:#7a8ca8;margin-top:6px;text-transform:uppercase;letter-spacing:.04em">${_esc(item.sectionName)}</div>` : ''}
+          </td>
+          <td style="font-size:12px;line-height:1.6">${formatIndexes(item.given)}</td>
+          <td style="font-size:12px;line-height:1.6">${formatIndexes(item.expected)}</td>
+          <td style="text-align:center">${item.correct ? '<span class="chip chip-pass">Correct</span>' : '<span class="chip chip-fail">Wrong</span>'}</td>
+        </tr>`;
+    }).join('');
+
+    render(`<div class="admin-wrap">
+      <div class="card" style="margin-bottom:16px">
+        <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap">
+          <div>
+            <div style="font-size:22px;font-weight:800;color:#1F3864">Answer Review</div>
+            <div style="font-size:13px;color:#666;margin-top:4px">${_esc(resp.label || code)} · ${_esc(result.questionSetName || 'Exam')}</div>
+            <div style="font-size:12px;color:#777;margin-top:6px">${result.score ?? '—'} / ${result.total ?? '—'} · ${result.pct == null ? '—' : `${result.pct}%`} · ${result.pass ? 'Passed' : 'Did not pass'}</div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button class="btn btn-secondary btn-sm" onclick="showAdmin()">← Back to Admin</button>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div style="overflow-x:auto">
+          <table class="admin-table">
+            <thead>
+              <tr><th style="text-align:center">#</th><th>Question</th><th>Your Answer</th><th>Correct Answer</th><th style="text-align:center">Result</th></tr>
+            </thead>
+            <tbody>${rows || '<tr><td colspan="5" style="text-align:center;color:#888;padding:18px">No answer detail available</td></tr>'}</tbody>
+          </table>
+        </div>
+      </div>
+    </div>`);
+  } catch (_e) {
+    modal('❌', 'Review Failed', 'Could not load the answer review for that exam.', [{ label: 'Back to Admin', cls: 'btn-primary', action: () => showAdmin() }]);
+  }
+}
+
 function auditActionLabel(action) {
   switch (action) {
     case 'admin_login_success': return 'Login success';
     case 'admin_login_failed': return 'Login failed';
+    case 'admin_exam_availability_updated': return 'Exam availability changed';
     case 'admin_note_saved': return 'Note saved';
     case 'admin_code_reset': return 'Code reset';
+    case 'admin_code_deleted': return 'Code deleted';
     case 'admin_codes_generated': return 'Codes generated';
     case 'admin_stale_sessions_cleared': return 'Stale sessions cleared';
+    case 'admin_result_summaries_repaired': return 'Scores repaired';
+    case 'admin_result_summaries_cleared': return 'Scores cleared';
+    case 'admin_code_question_set_assigned': return 'Code exam assigned';
+    case 'admin_question_set_created': return 'Exam created';
+    case 'admin_question_set_uploaded': return 'Exam uploaded';
+    case 'admin_question_set_config_updated': return 'Exam config updated';
+    case 'admin_question_set_activated': return 'Exam set active';
+    case 'admin_question_set_deleted': return 'Exam deleted';
+    case 'admin_question_created': return 'Question created';
+    case 'admin_question_updated': return 'Question updated';
+    case 'admin_question_deleted': return 'Question deleted';
+    case 'admin_section_created': return 'Section created';
+    case 'admin_section_updated': return 'Section updated';
+    case 'admin_section_deleted': return 'Section deleted';
     default: return action || 'Unknown action';
   }
 }
@@ -929,12 +1100,15 @@ async function showAdmin() {
   }
   _adminSystemStatus = systemStatus;
   _adminAuditEntries = Array.isArray(auditData?.entries) ? auditData.entries : [];
-  _adminRows = data.codes || [];
+  _adminRows = sortAdminRows(data.codes || []);
+  _adminQuestionSets = Array.isArray(data.questionSets) ? data.questionSets : [];
+  _activeQuestionSet = _adminQuestionSets.find((set) => set.isActive) || _adminQuestionSets[0] || null;
   const unused = summaryValue(_adminRows, 'unused');
   const active = summaryValue(_adminRows, 'active');
   const completed = summaryValue(_adminRows, 'completed');
   const warnings = Array.isArray(systemStatus?.warnings) ? systemStatus.warnings : [];
   const staleSessions = Array.isArray(systemStatus?.staleSessions) ? systemStatus.staleSessions : [];
+  const examOpen = systemStatus?.examEnabled !== false;
   const systemBanner = systemStatus ? `
     <div class="card" style="margin-bottom:16px;background:${systemStatus.ok ? 'rgba(238,247,242,.98)' : 'rgba(255,245,245,.98)'};border-left:6px solid ${systemStatus.ok ? '#2e7d32' : '#c0392b'}">
       <div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:flex-start">
@@ -943,7 +1117,7 @@ async function showAdmin() {
             ${systemStatus.ok ? 'System status healthy' : 'System status needs attention'}
           </div>
           <div style="font-size:13px;color:#555;margin-top:4px">
-            ${systemStatus.questionCount} questions · ${systemStatus.accessCodeCount} codes · ${systemStatus.activeSessionCount} active sessions · ${systemStatus.resultCount} completed results
+            ${systemStatus.questionCount} questions across ${systemStatus.questionSetCount || 0} exam set${systemStatus.questionSetCount === 1 ? '' : 's'} · ${systemStatus.accessCodeCount} codes · ${systemStatus.activeSessionCount} active sessions · ${systemStatus.resultCount} completed results
           </div>
         </div>
         <div style="font-size:12px;color:#666;text-align:right">
@@ -951,6 +1125,8 @@ async function showAdmin() {
           <div>Revision: ${_esc(systemStatus.appRevision || '—')}</div>
           <div>Deployed: ${systemStatus.deployedAt ? _esc(new Date(systemStatus.deployedAt).toLocaleString()) : '—'}</div>
           <div>Schema: ${_esc(systemStatus.schema || '—')}</div>
+          <div>Active exam: ${_esc(systemStatus.activeQuestionSet?.name || '—')}</div>
+          <div>Exam access: ${examOpen ? 'open' : 'closed'}</div>
           <div>Notes: ${systemStatus.notesEnabled ? 'enabled' : 'missing'}</div>
           <div>Stale sessions: ${systemStatus.staleSessionCount || 0}</div>
           <div>Audit log: ${systemStatus.auditEnabled ? `${systemStatus.auditCount} entries` : 'missing'}</div>
@@ -965,10 +1141,37 @@ async function showAdmin() {
       ${warnings.length ? `<div style="margin-top:10px;font-size:13px;color:#7a251d">${warnings.map((w) => `• ${_esc(w)}`).join('<br>')}</div>` : ''}
     </div>` : '';
 
+  const setRows = _adminQuestionSets.map((set) => `
+    <tr style="background:${set.isActive ? 'rgba(236,247,239,.9)' : 'white'}">
+      <td>
+        <strong>${_esc(set.name)}</strong>${set.isActive ? ' <span style="color:#1a5c1a;font-size:11px;font-weight:700">● DEFAULT</span>' : ''}
+        ${set.description ? `<div style="font-size:12px;color:#777;margin-top:3px">${_esc(set.description)}</div>` : ''}
+      </td>
+      <td style="text-align:center">${set.questionCount || 0}</td>
+      <td style="text-align:center">${set.numQuestions ? `${set.numQuestions} of ${set.questionCount || 0}` : `All ${set.questionCount || 0}`}</td>
+      <td style="text-align:center">${set.durationMinutes || 45}m</td>
+      <td style="text-align:center">${set.passPct || 80}%</td>
+      <td style="text-align:center">${set.proctorEnabled !== false ? 'On' : 'Off'}</td>
+      <td style="text-align:center;white-space:nowrap">
+        <button class="btn btn-secondary btn-sm" onclick="openQuestionSet(${set.id}, '${_esc(set.name)}')">Manage</button>
+        <button class="btn btn-secondary btn-sm" onclick="configQuestionSet(${set.id}, ${set.durationMinutes || 45}, ${set.passPct || 80}, ${set.proctorEnabled !== false}, ${set.numQuestions == null ? 'null' : set.numQuestions}, ${set.questionCount || 0})">Config</button>
+        ${!set.isActive ? `<button class="btn btn-primary btn-sm" onclick="activateQuestionSet(${set.id})">Set Default</button>` : ''}
+        ${!set.isActive ? `<button class="btn btn-danger btn-sm" onclick="deleteQuestionSet(${set.id}, '${_esc(set.name)}')">Delete</button>` : ''}
+      </td>
+    </tr>`).join('');
+
   const rows = _adminRows.map((row) => `
     <tr>
       <td style="font-family:monospace;font-weight:700">${_esc(row.code)}</td>
       <td>${_esc(row.label || '')}</td>
+      <td>
+        ${row.status === 'unused'
+          ? `<select style="margin:0;width:220px;font-size:12px;padding:6px 8px" onchange="assignQuestionSet('${row.code}', this.value)">
+              <option value="" ${row.questionSetId == null ? 'selected' : ''}>${_activeQuestionSet ? `${_esc(_activeQuestionSet.name)} (default)` : 'Default active set'}</option>
+              ${_adminQuestionSets.map((set) => `<option value="${set.id}" ${row.questionSetId === set.id ? 'selected' : ''}>${_esc(set.name)}${set.isActive ? ' ⭐' : ''}</option>`).join('')}
+            </select>`
+          : `<span style="font-size:12px;color:#555">${_esc(row.questionSetName || _activeQuestionSet?.name || 'Default active set')}</span>`}
+      </td>
       <td><input type="text" value="${_esc(row.notes || '')}" style="margin:0;width:220px;font-size:12px;padding:6px 8px" onblur="saveNote('${row.code}', this.value); this.style.borderColor='#d0d8e8'"></td>
       <td>${statusChip(row)}</td>
       <td style="text-align:center">${row.score == null ? '—' : row.score}</td>
@@ -977,23 +1180,50 @@ async function showAdmin() {
       <td style="text-align:center">${row.tabSwitches || 0}</td>
       <td style="text-align:center">${row.incidentCount ? `<button class="btn btn-secondary btn-sm" onclick="flagsFor('${row.code}')">${row.incidentCount}</button>` : '0'}</td>
       <td style="text-align:center">${row.submittedAt ? new Date(row.submittedAt).toLocaleString() : '—'}</td>
-      <td style="text-align:center"><button class="btn btn-danger btn-sm" onclick="resetCode('${row.code}')">Reset</button></td>
+      <td style="text-align:center;white-space:nowrap">
+        ${row.status === 'completed' ? `<button class="btn btn-secondary btn-sm" onclick="reviewResult('${row.code}')">Review</button>` : ''}
+        <button class="btn btn-danger btn-sm" onclick="resetCode('${row.code}')">Reset</button>
+        <button class="btn btn-danger btn-sm" onclick="deleteCode('${row.code}', '${row.status}')">Delete</button>
+      </td>
     </tr>`).join('');
 
   render(`<div class="admin-wrap">
     <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:16px">
       <div>
         <div style="font-size:22px;font-weight:800;color:white">Admin Console</div>
-        <div style="font-size:13px;color:rgba(255,255,255,.75)">${unused} unused · ${active} active · ${completed} completed</div>
+        <div style="font-size:13px;color:rgba(255,255,255,.75)">${unused} unused · ${active} active · ${completed} completed · ${_adminQuestionSets.length} exam set${_adminQuestionSets.length === 1 ? '' : 's'}</div>
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
         <button class="btn btn-primary btn-sm" onclick="generateCodes()">+ Generate Codes</button>
-        <button class="btn btn-secondary btn-sm" onclick="probeQuestions()">🧪 Probe Questions</button>
+        <button class="btn btn-primary btn-sm" onclick="createQuestionSet()">+ New Exam Set</button>
+        <button class="btn btn-secondary btn-sm" onclick="showUploadQuestionSet()">⬆ Upload Exam CSV</button>
+        <button class="btn btn-secondary btn-sm" onclick="toggleExamAvailability(${examOpen ? 'false' : 'true'})">${examOpen ? 'Close Exams' : 'Open Exams'}</button>
+        <button class="btn btn-secondary btn-sm" onclick="repairResultSummaries()">Repair Scores</button>
+        <button class="btn btn-secondary btn-sm" onclick="clearResultSummaries()">Clear Scores</button>
         <button class="btn btn-secondary btn-sm" onclick="downloadExport()">⬇ Export CSV</button>
         <button class="btn btn-secondary btn-sm" onclick="showAdmin()">↻ Refresh</button>
       </div>
     </div>
     ${systemBanner}
+    <div class="card" style="margin-bottom:16px">
+      <div style="display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+        <div>
+          <div style="font-size:16px;font-weight:800;color:#1F3864">Exam Sets</div>
+          <div style="font-size:12px;color:#666">${_activeQuestionSet ? `Default exam: ${_activeQuestionSet.name}` : 'No default exam set configured yet'}</div>
+        </div>
+        <div style="font-size:12px;color:#666">Manage exams, upload new banks, and assign a set per code.</div>
+      </div>
+      <div style="overflow-x:auto">
+        <table class="admin-table">
+          <thead>
+            <tr>
+              <th>Name</th><th style="text-align:center">Questions</th><th style="text-align:center">Delivered</th><th style="text-align:center">Duration</th><th style="text-align:center">Pass</th><th style="text-align:center">Proctor</th><th style="text-align:center">Actions</th>
+            </tr>
+          </thead>
+          <tbody>${setRows || '<tr><td colspan="7" style="text-align:center;color:#888;padding:18px">No exam sets found</td></tr>'}</tbody>
+        </table>
+      </div>
+    </div>
     <div class="card" style="margin-bottom:16px">
       <div style="display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
         <div style="font-size:16px;font-weight:800;color:#1F3864">Recent Admin Activity</div>
@@ -1022,16 +1252,584 @@ async function showAdmin() {
       </div>
     </div>
     <div class="card" style="padding:0;overflow-x:auto">
+      <div style="padding:14px 16px 0;font-size:12px;color:#666">Sorted by seat number to make the roster easier to scan.</div>
       <table class="admin-table">
         <thead>
           <tr>
-            <th>Code</th><th>Seat</th><th>Notes</th><th>Status</th><th style="text-align:center">Score</th><th style="text-align:center">Pct</th><th style="text-align:center">Duration</th><th style="text-align:center">Tabs</th><th style="text-align:center">Flags</th><th style="text-align:center">Submitted</th><th style="text-align:center">Action</th>
+            <th>Code</th><th>Seat</th><th>Exam Set</th><th>Notes</th><th>Status</th><th style="text-align:center">Score</th><th style="text-align:center">Pct</th><th style="text-align:center">Duration</th><th style="text-align:center">Tabs</th><th style="text-align:center">Flags</th><th style="text-align:center">Submitted</th><th style="text-align:center">Actions</th>
           </tr>
         </thead>
-        <tbody>${rows || '<tr><td colspan="11" style="text-align:center;color:#888;padding:20px">No access codes found</td></tr>'}</tbody>
+        <tbody>${rows || '<tr><td colspan="12" style="text-align:center;color:#888;padding:20px">No access codes found</td></tr>'}</tbody>
       </table>
     </div>
   </div>`);
+}
+
+async function assignQuestionSet(code, setIdValue) {
+  try {
+    await apiJson(`/api/admin/codes/${encodeURIComponent(code)}/question-set`, {
+      method: 'POST',
+      body: JSON.stringify({ questionSetId: setIdValue === '' ? null : Number(setIdValue) })
+    }, { timeoutMs: 10000, retries: 0 });
+    const row = _adminRows.find((item) => item.code === code);
+    if (row) {
+      row.questionSetId = setIdValue === '' ? null : Number(setIdValue);
+      const set = _adminQuestionSets.find((item) => item.id === row.questionSetId);
+      row.questionSetName = set ? set.name : '';
+    }
+  } catch (_e) {
+    modal('❌', 'Assignment Failed', 'Could not assign that exam set to the access code.', [{ label: 'OK', cls: 'btn-primary', action: () => showAdmin() }]);
+  }
+}
+
+async function createQuestionSet() {
+  const name = window.prompt('Name for the new exam set:', '');
+  if (!name || !name.trim()) return;
+  const description = window.prompt('Optional description for this exam set:', '') || '';
+  try {
+    const resp = await apiJson('/api/admin/question-sets', {
+      method: 'POST',
+      body: JSON.stringify({ name: name.trim(), description: description.trim() })
+    }, { timeoutMs: 10000, retries: 0 });
+    if (!resp || !resp.ok || !resp.questionSet) throw new Error('create_failed');
+    openQuestionSet(resp.questionSet.id, resp.questionSet.name);
+  } catch (_e) {
+    modal('❌', 'Create Failed', 'Could not create the new exam set.', [{ label: 'OK', cls: 'btn-primary' }]);
+  }
+}
+
+async function configQuestionSet(id, currentDuration, currentPassPct, currentProctor, currentNumQuestions, totalQuestions) {
+  const current = window.__currentQuestionSet || null;
+  const returnAction = current && current.id === id
+    ? `openQuestionSet(${id}, '${_esc(current.name || '')}')`
+    : 'showAdmin()';
+  const setMeta = _adminQuestionSets.find((set) => set.id === id) || {};
+  const setName = current && current.id === id ? current.name : (setMeta.name || 'Exam Set');
+  const setDescription = current && current.id === id ? (current.description || '') : (setMeta.description || '');
+
+  S.screen = 'admin-question-set-config';
+  document.body.classList.remove('exam-bg');
+  render(`<div class="admin-wrap">
+    <div class="card" style="max-width:760px;margin:0 auto">
+      <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;margin-bottom:14px">
+        <div>
+          <div style="font-size:22px;font-weight:800;color:#1F3864">Exam Set Configuration</div>
+          <div style="font-size:13px;color:#666;margin-top:4px">${_esc(setName)}</div>
+        </div>
+        <button class="btn btn-secondary btn-sm" onclick="${returnAction}">← Back</button>
+      </div>
+
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-bottom:18px">
+        <div style="padding:14px;border:1px solid #d8e1f0;border-radius:14px;background:#f8fbff">
+          <div style="font-size:12px;color:#6c7a90;margin-bottom:6px">Questions in bank</div>
+          <div style="font-size:28px;font-weight:800;color:#1F3864">${Number(totalQuestions || 0)}</div>
+        </div>
+        <div style="padding:14px;border:1px solid #d8e1f0;border-radius:14px;background:#f8fbff">
+          <div style="font-size:12px;color:#6c7a90;margin-bottom:6px">Current delivery mode</div>
+          <div style="font-size:18px;font-weight:800;color:#1F3864">${currentNumQuestions == null ? 'All questions' : `${currentNumQuestions} per attempt`}</div>
+        </div>
+      </div>
+      <label class="label">Exam Title</label>
+      <input id="cfg-name" type="text" value="${_esc(setName)}" placeholder="Exam title">
+      <div style="font-size:12px;color:#666;margin-top:-6px;margin-bottom:12px">This title appears on the candidate landing screen and in admin assignment lists.</div>
+
+      <label class="label">Description</label>
+      <input id="cfg-description" type="text" value="${_esc(setDescription)}" placeholder="Optional description">
+      <div style="font-size:12px;color:#666;margin-top:-6px;margin-bottom:12px">Optional context such as language, cohort, or version.</div>
+
+      <label class="label">Duration (minutes)</label>
+      <input id="cfg-duration" type="number" min="1" max="240" value="${Number(currentDuration || 45)}">
+      <div style="font-size:12px;color:#666;margin-top:-6px;margin-bottom:12px">How long candidates have before the exam auto-submits.</div>
+
+      <label class="label">Passing Percentage</label>
+      <input id="cfg-pass-pct" type="number" min="1" max="100" value="${Number(currentPassPct || 80)}">
+      <div style="font-size:12px;color:#666;margin-top:-6px;margin-bottom:12px">The score threshold required to pass this exam set.</div>
+
+      <label class="label">Questions Delivered Per Candidate</label>
+      <input id="cfg-num-questions" type="number" min="1" max="${Math.max(1, Number(totalQuestions || 1))}" value="${currentNumQuestions == null ? '' : Number(currentNumQuestions)}" placeholder="Leave blank to deliver all ${Number(totalQuestions || 0)} questions">
+      <div style="font-size:12px;color:#666;margin-top:-6px;margin-bottom:12px">Leave this blank to present the full question bank. Set a number to randomly draw a subset for each candidate.</div>
+
+      <label class="label">Proctoring</label>
+      <div style="display:flex;align-items:center;gap:10px;padding:12px 14px;border:1px solid #d0d8e8;border-radius:12px;background:#f8fbff;margin-bottom:18px">
+        <input id="cfg-proctor-enabled" type="checkbox" ${currentProctor ? 'checked' : ''} style="width:18px;height:18px">
+        <label for="cfg-proctor-enabled" style="margin:0;font-size:14px;color:#334">Require webcam and screen sharing for this exam set</label>
+      </div>
+
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn btn-primary" onclick="saveQuestionSetConfig(${id}, '${_esc(setName)}')">Save Configuration</button>
+        <button class="btn btn-secondary" onclick="${returnAction}">Cancel</button>
+      </div>
+    </div>
+  </div>`);
+}
+
+async function saveQuestionSetConfig(id, setName) {
+  const name = String($('cfg-name')?.value || '').trim();
+  const description = String($('cfg-description')?.value || '').trim();
+  const durationMinutes = Number($('cfg-duration')?.value || 0);
+  const passPct = Number($('cfg-pass-pct')?.value || 0);
+  const numQuestionsRaw = String($('cfg-num-questions')?.value || '').trim();
+  const numQuestions = numQuestionsRaw === '' ? null : Number(numQuestionsRaw);
+  const proctorEnabled = Boolean($('cfg-proctor-enabled')?.checked);
+
+  if (!name) {
+    modal('⚠️', 'Title Required', 'Please enter a title for the exam set.', [{ label: 'OK', cls: 'btn-primary' }]);
+    return;
+  }
+  if (!Number.isInteger(durationMinutes) || durationMinutes < 1 || durationMinutes > 240) {
+    modal('⚠️', 'Invalid Duration', 'Please enter a duration between 1 and 240 minutes.', [{ label: 'OK', cls: 'btn-primary' }]);
+    return;
+  }
+  if (!Number.isInteger(passPct) || passPct < 1 || passPct > 100) {
+    modal('⚠️', 'Invalid Passing Percentage', 'Please enter a passing percentage between 1 and 100.', [{ label: 'OK', cls: 'btn-primary' }]);
+    return;
+  }
+  if (numQuestions !== null && (!Number.isInteger(numQuestions) || numQuestions < 1)) {
+    modal('⚠️', 'Invalid Question Count', 'Questions delivered per candidate must be blank or a positive whole number.', [{ label: 'OK', cls: 'btn-primary' }]);
+    return;
+  }
+
+  try {
+    await apiJson(`/api/admin/question-sets/${id}/config`, {
+      method: 'POST',
+      body: JSON.stringify({
+        name,
+        description,
+        durationMinutes,
+        passPct,
+        numQuestions,
+        proctorEnabled
+      })
+    }, { timeoutMs: 10000, retries: 0 });
+
+    modal('✅', 'Configuration Saved', `The configuration for "${name}" was updated.`, [{
+      label: 'Continue',
+      cls: 'btn-primary',
+      action: () => {
+        const current = window.__currentQuestionSet || null;
+        if (current && current.id === id) openQuestionSet(id, name);
+        else showAdmin();
+      }
+    }]);
+  } catch (_e) {
+    modal('❌', 'Update Failed', 'Could not update that exam set configuration.', [{ label: 'OK', cls: 'btn-primary' }]);
+  }
+}
+
+async function activateQuestionSet(id) {
+  try {
+    await apiJson(`/api/admin/question-sets/${id}/activate`, { method: 'POST', body: JSON.stringify({}) }, { timeoutMs: 10000, retries: 0 });
+    showAdmin();
+  } catch (_e) {
+    modal('❌', 'Activation Failed', 'Could not set that exam as the default.', [{ label: 'OK', cls: 'btn-primary' }]);
+  }
+}
+
+function deleteQuestionSet(id, name) {
+  modal('⚠️', 'Delete Exam Set', `Delete "${name}"? This removes its questions and sections permanently.`, [
+    { label: 'Delete', cls: 'btn-danger', action: async () => {
+      try {
+        await apiJson(`/api/admin/question-sets/${id}`, { method: 'DELETE' }, { timeoutMs: 10000, retries: 0 });
+        showAdmin();
+      } catch (_e) {
+        modal('❌', 'Delete Failed', 'The exam set could not be deleted. Active sets cannot be deleted.', [{ label: 'OK', cls: 'btn-primary' }]);
+      }
+    }},
+    { label: 'Cancel', cls: 'btn-secondary' }
+  ]);
+}
+
+function downloadQuestionTemplate() {
+  const lines = [
+    'q_num,stem,note,multi,option_1,option_2,option_3,option_4,option_5,option_6,correct_indices',
+    '"1","What is the purpose of incident management?","Leave blank if you do not need a hint","false","Restore service quickly","Approve all changes","Create new services","Manage suppliers","","","0"',
+    '"2","Which TWO items are service management dimensions?","Use pipe characters for multi-select answers","true","Organizations and people","Value streams and processes","Incident logging","Server patching","","","0|1"',
+    '"3","What should a candidate do before starting the exam?","Optional hint shown to the candidate if you want","false","Read the instructions","Skip the tech check","Close the browser","Wait for a CAB meeting","","","0"'
+  ];
+  const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'exam_set_template_excel_friendly.csv';
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function showUploadQuestionSet() {
+  S.screen = 'admin-upload';
+  document.body.classList.remove('exam-bg');
+  render(`<div class="admin-wrap">
+    <div class="card" style="max-width:760px;margin:0 auto">
+      <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;margin-bottom:12px">
+        <div>
+          <div style="font-size:22px;font-weight:800;color:#1F3864">Upload Exam Set</div>
+          <div style="font-size:13px;color:#666">Import a new exam from a spreadsheet-friendly CSV without changing application code.</div>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn btn-secondary btn-sm" onclick="downloadQuestionTemplate()">Download Excel-Friendly Template</button>
+          <button class="btn btn-secondary btn-sm" onclick="showAdmin()">← Back to Admin</button>
+        </div>
+      </div>
+      <div style="padding:16px 18px;border:1px solid #d8e1f0;border-radius:14px;background:#f8fbff;margin-bottom:18px">
+        <div style="font-size:15px;font-weight:800;color:#1F3864;margin-bottom:10px">How this works</div>
+        <div style="font-size:13px;color:#445;line-height:1.7">
+          1. Download the template and open it in Excel, Google Sheets, or Numbers.<br>
+          2. Fill one row per question.<br>
+          3. Save the sheet as <strong>CSV</strong>.<br>
+          4. Upload it here and the app will create a new exam set for you.
+        </div>
+      </div>
+
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-bottom:18px">
+        <div style="padding:14px;border:1px solid #d8e1f0;border-radius:14px;background:#fff">
+          <div style="font-size:14px;font-weight:800;color:#1F3864;margin-bottom:8px">Required columns</div>
+          <div style="font-size:12px;color:#555;line-height:1.7">
+            <strong>q_num</strong>: question number<br>
+            <strong>stem</strong>: full question text<br>
+            <strong>multi</strong>: <code>true</code> or <code>false</code><br>
+            <strong>correct_indices</strong>: answer position(s)
+          </div>
+        </div>
+        <div style="padding:14px;border:1px solid #d8e1f0;border-radius:14px;background:#fff">
+          <div style="font-size:14px;font-weight:800;color:#1F3864;margin-bottom:8px">Options</div>
+          <div style="font-size:12px;color:#555;line-height:1.7">
+            Add answer choices in <code>option_1</code>, <code>option_2</code>, and so on.<br>
+            Leave unused option columns blank.
+          </div>
+        </div>
+        <div style="padding:14px;border:1px solid #d8e1f0;border-radius:14px;background:#fff">
+          <div style="font-size:14px;font-weight:800;color:#1F3864;margin-bottom:8px">Correct answers</div>
+          <div style="font-size:12px;color:#555;line-height:1.7">
+            Use <strong>zero-based indexes</strong>.<br>
+            Single answer: <code>0</code><br>
+            Multi answer: <code>0|2</code>
+          </div>
+        </div>
+      </div>
+
+      <label class="label">Exam Name</label>
+      <input id="upload-name" type="text" placeholder="e.g. ITIL 4 Practice Exam A">
+      <div style="font-size:12px;color:#666;margin-top:-6px;margin-bottom:12px">This is the name admins will see when assigning the exam to candidates.</div>
+      <label class="label">Description</label>
+      <input id="upload-desc" type="text" placeholder="Optional">
+      <div style="font-size:12px;color:#666;margin-top:-6px;margin-bottom:12px">Optional notes like cohort, language, version, or intended audience.</div>
+      <label class="label">CSV File</label>
+      <input id="upload-file" type="file" accept=".csv" style="width:100%">
+      <div style="font-size:12px;color:#666;margin:10px 0 18px;line-height:1.7">
+        Upload the CSV exported from your spreadsheet. The template already contains the correct headers, sample rows, and formatting examples.<br>
+        Tip: if Excel asks how to save, choose <strong>CSV UTF-8</strong> when available.
+      </div>
+      <button class="btn btn-primary btn-full" onclick="submitUploadedQuestionSet()">Upload Exam Set</button>
+    </div>
+  </div>`);
+}
+
+function parseQuestionCsv(text) {
+  const rows = [];
+  let row = [];
+  let cell = '';
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    const next = text[i + 1];
+    if (inQuotes) {
+      if (ch === '"' && next === '"') {
+        cell += '"';
+        i += 1;
+      } else if (ch === '"') {
+        inQuotes = false;
+      } else {
+        cell += ch;
+      }
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === ',') {
+      row.push(cell);
+      cell = '';
+    } else if (ch === '\n') {
+      row.push(cell);
+      rows.push(row);
+      row = [];
+      cell = '';
+    } else if (ch !== '\r') {
+      cell += ch;
+    }
+  }
+  if (cell.length || row.length) {
+    row.push(cell);
+    rows.push(row);
+  }
+  if (!rows.length) return [];
+
+  const headers = rows[0].map((h) => String(h || '').trim().toLowerCase());
+  const optionIndexes = headers
+    .map((header, idx) => ({ header, idx }))
+    .filter((item) => item.header.startsWith('option_'))
+    .map((item) => item.idx);
+
+  const qNumIdx = headers.indexOf('q_num');
+  const stemIdx = headers.indexOf('stem');
+  const noteIdx = headers.indexOf('note');
+  const multiIdx = headers.indexOf('multi');
+  const correctIdx = headers.indexOf('correct_indices');
+  if (qNumIdx === -1 || stemIdx === -1 || multiIdx === -1 || correctIdx === -1 || !optionIndexes.length) {
+    throw new Error('CSV headers are missing required columns.');
+  }
+
+  return rows.slice(1).filter((r) => r.some((cellValue) => String(cellValue || '').trim() !== '')).map((r) => {
+    const opts = optionIndexes.map((idx) => String(r[idx] || '').trim()).filter(Boolean);
+    const correctIndices = String(r[correctIdx] || '')
+      .split(/[|,]/)
+      .map((val) => Number(val.trim()))
+      .filter((n) => Number.isInteger(n) && n >= 0);
+    return {
+      qNum: Number(r[qNumIdx]),
+      stem: String(r[stemIdx] || '').trim(),
+      note: noteIdx === -1 ? '' : String(r[noteIdx] || '').trim(),
+      multi: /^(true|yes|1)$/i.test(String(r[multiIdx] || '').trim()),
+      opts,
+      correctIndices
+    };
+  });
+}
+
+async function submitUploadedQuestionSet() {
+  const name = String($('upload-name')?.value || '').trim();
+  const description = String($('upload-desc')?.value || '').trim();
+  const file = $('upload-file')?.files?.[0];
+  if (!name) {
+    modal('⚠️', 'Name Required', 'Please enter a name for the exam set.', [{ label: 'OK', cls: 'btn-primary' }]);
+    return;
+  }
+  if (!file) {
+    modal('⚠️', 'CSV Required', 'Please select a CSV file to upload.', [{ label: 'OK', cls: 'btn-primary' }]);
+    return;
+  }
+  try {
+    const text = await file.text();
+    const questions = parseQuestionCsv(text);
+    if (!questions.length) throw new Error('The CSV does not contain any questions.');
+    const resp = await apiJson('/api/admin/question-sets/upload', {
+      method: 'POST',
+      body: JSON.stringify({ name, description, questions })
+    }, { timeoutMs: 20000, retries: 0 });
+    if (!resp || !resp.ok) throw new Error('upload_failed');
+    modal('✅', 'Upload Complete', `${resp.count} questions were imported into "${name}".`, [{ label: 'Manage Exam Set', cls: 'btn-primary', action: () => openQuestionSet(resp.questionSetId, name) }]);
+  } catch (err) {
+    modal('❌', 'Upload Failed', err.message || 'Could not import that CSV file.', [{ label: 'OK', cls: 'btn-primary' }]);
+  }
+}
+
+async function openQuestionSet(setId, fallbackName) {
+  S.screen = 'admin-question-set';
+  render('<div class="admin-wrap"><div style="padding:60px;text-align:center;color:white;font-size:18px">Loading exam set…</div></div>');
+  try {
+    const [qData, sData, setList] = await Promise.all([
+      apiJson(`/api/admin/question-sets/${setId}/questions`, {}, { timeoutMs: 12000, retries: 1 }),
+      apiJson(`/api/admin/question-sets/${setId}/sections`, {}, { timeoutMs: 12000, retries: 1 }),
+      apiJson('/api/admin/question-sets', {}, { timeoutMs: 12000, retries: 1 })
+    ]);
+    const questionSet = qData?.questionSet || {};
+    const questions = Array.isArray(qData?.questions) ? qData.questions : [];
+    const sections = Array.isArray(sData?.sections) ? sData.sections : [];
+    const setMeta = (setList?.sets || []).find((item) => item.id === setId) || {};
+    const sectionMap = new Map(sections.map((s) => [s.id, s]));
+    const questionRows = questions.map((q) => `
+      <tr>
+        <td style="text-align:center">${q.qNum}</td>
+        <td>${_esc(String(q.stem || '').slice(0, 120))}${String(q.stem || '').length > 120 ? '…' : ''}</td>
+        <td>${_esc(sectionMap.get(q.sectionId)?.name || '—')}</td>
+        <td style="text-align:center">${q.multi ? 'Multi' : 'Single'}</td>
+        <td style="text-align:center">${Array.isArray(q.opts) ? q.opts.length : 0}</td>
+        <td style="text-align:center;white-space:nowrap">
+          <button class="btn btn-secondary btn-sm" onclick="showQuestionEditor(${setId}, ${q.id})">Edit</button>
+          <button class="btn btn-danger btn-sm" onclick="deleteQuestion(${setId}, ${q.id})">Delete</button>
+        </td>
+      </tr>`).join('');
+    const sectionRows = sections.map((section) => `
+      <tr>
+        <td>${_esc(section.name)}</td>
+        <td>${_esc(section.description || '—')}</td>
+        <td style="text-align:center">${section.displayOrder || 0}</td>
+        <td style="text-align:center">${section.drawCount == null ? '—' : section.drawCount}</td>
+        <td style="text-align:center">${section.questionCount || 0}</td>
+        <td style="text-align:center;white-space:nowrap">
+          <button class="btn btn-secondary btn-sm" onclick="editSectionPrompt(${setId}, ${section.id})">Edit</button>
+          <button class="btn btn-danger btn-sm" onclick="deleteSection(${setId}, ${section.id})">Delete</button>
+        </td>
+      </tr>`).join('');
+
+    window.__currentQuestionSet = {
+      id: setId,
+      name: questionSet.name || fallbackName || 'Exam Set',
+      description: questionSet.description || '',
+      isActive: Boolean(questionSet.isActive),
+      questions,
+      sections,
+      meta: setMeta
+    };
+
+    render(`<div class="admin-wrap">
+      <div class="card" style="margin-bottom:16px">
+        <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap">
+          <div>
+            <div style="font-size:22px;font-weight:800;color:#1F3864">${_esc(window.__currentQuestionSet.name)}</div>
+            <div style="font-size:13px;color:#666;margin-top:4px">${_esc(window.__currentQuestionSet.description || 'No description')} ${window.__currentQuestionSet.isActive ? '· Default exam set' : ''}</div>
+            <div style="font-size:12px;color:#777;margin-top:6px">${questions.length} questions · ${sections.length} sections · ${setMeta.numQuestions ? `${setMeta.numQuestions} delivered per candidate` : 'All questions delivered'} · ${setMeta.durationMinutes || 45}m · ${setMeta.passPct || 80}% pass</div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button class="btn btn-primary btn-sm" onclick="showQuestionEditor(${setId})">+ Add Question</button>
+            <button class="btn btn-secondary btn-sm" onclick="editSectionPrompt(${setId})">+ Add Section</button>
+            <button class="btn btn-secondary btn-sm" onclick="configQuestionSet(${setId}, ${setMeta.durationMinutes || 45}, ${setMeta.passPct || 80}, ${setMeta.proctorEnabled !== false}, ${setMeta.numQuestions == null ? 'null' : setMeta.numQuestions}, ${setMeta.questionCount || questions.length})">Config</button>
+            <button class="btn btn-secondary btn-sm" onclick="showAdmin()">← Back</button>
+          </div>
+        </div>
+      </div>
+      <div class="card" style="margin-bottom:16px">
+        <div style="font-size:16px;font-weight:800;color:#1F3864;margin-bottom:10px">Sections</div>
+        <div style="overflow-x:auto">
+          <table class="admin-table">
+            <thead><tr><th>Name</th><th>Description</th><th style="text-align:center">Order</th><th style="text-align:center">Draw</th><th style="text-align:center">Questions</th><th style="text-align:center">Actions</th></tr></thead>
+            <tbody>${sectionRows || '<tr><td colspan="6" style="text-align:center;color:#888;padding:16px">No sections defined yet</td></tr>'}</tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+          <div style="font-size:16px;font-weight:800;color:#1F3864">Questions</div>
+          <div style="font-size:12px;color:#666">Question content stays in HANA; candidates only receive one question at a time.</div>
+        </div>
+        <div style="overflow-x:auto">
+          <table class="admin-table">
+            <thead><tr><th style="text-align:center">#</th><th>Stem</th><th>Section</th><th style="text-align:center">Type</th><th style="text-align:center">Opts</th><th style="text-align:center">Actions</th></tr></thead>
+            <tbody>${questionRows || '<tr><td colspan="6" style="text-align:center;color:#888;padding:16px">No questions in this exam set yet</td></tr>'}</tbody>
+          </table>
+        </div>
+      </div>
+    </div>`);
+  } catch (_e) {
+    modal('❌', 'Load Failed', 'Could not load that exam set.', [{ label: 'Back to Admin', cls: 'btn-primary', action: () => showAdmin() }]);
+  }
+}
+
+function showQuestionEditor(setId, questionId) {
+  const current = window.__currentQuestionSet || { questions: [], sections: [] };
+  const question = current.questions.find((item) => item.id === questionId) || null;
+  const sectionOptions = ['<option value="">No section</option>']
+    .concat((current.sections || []).map((section) => `<option value="${section.id}" ${question?.sectionId === section.id ? 'selected' : ''}>${_esc(section.name)}</option>`))
+    .join('');
+  const optionLines = question ? (question.opts || []).join('\n') : '';
+  const answerLines = question ? (question.correctIndices || []).join(',') : '';
+  render(`<div class="admin-wrap">
+    <div class="card" style="max-width:860px;margin:0 auto">
+      <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;margin-bottom:12px">
+        <div>
+          <div style="font-size:22px;font-weight:800;color:#1F3864">${question ? 'Edit Question' : 'Add Question'}</div>
+          <div style="font-size:13px;color:#666">${_esc(current.name || 'Exam Set')}</div>
+        </div>
+        <button class="btn btn-secondary btn-sm" onclick="openQuestionSet(${setId}, '${_esc(current.name || '')}')">← Back</button>
+      </div>
+      <label class="label">Question Number</label>
+      <input id="qe-qnum" type="number" min="1" value="${question?.qNum || (current.questions.length + 1)}">
+      <label class="label">Question Stem</label>
+      <textarea id="qe-stem" rows="5" style="width:100%;padding:12px;border:1px solid #d0d8e8;border-radius:12px">${_esc(question?.stem || '')}</textarea>
+      <label class="label">Note / Hint</label>
+      <input id="qe-note" type="text" value="${_esc(question?.note || '')}" placeholder="Optional">
+      <label class="label">Section</label>
+      <select id="qe-section">${sectionOptions}</select>
+      <label class="label">Question Type</label>
+      <select id="qe-multi">
+        <option value="false" ${question?.multi ? '' : 'selected'}>Single-select</option>
+        <option value="true" ${question?.multi ? 'selected' : ''}>Multi-select</option>
+      </select>
+      <label class="label">Options (one per line)</label>
+      <textarea id="qe-opts" rows="8" style="width:100%;padding:12px;border:1px solid #d0d8e8;border-radius:12px" placeholder="Option A&#10;Option B&#10;Option C">${_esc(optionLines)}</textarea>
+      <label class="label">Correct Option Indexes</label>
+      <input id="qe-correct" type="text" value="${_esc(answerLines)}" placeholder="e.g. 1 or 0,2">
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:16px">
+        <button class="btn btn-primary" onclick="saveQuestionEditor(${setId}, ${question ? question.id : 'null'})">${question ? 'Save Question' : 'Create Question'}</button>
+        <button class="btn btn-secondary" onclick="openQuestionSet(${setId}, '${_esc(current.name || '')}')">Cancel</button>
+      </div>
+    </div>
+  </div>`);
+}
+
+async function saveQuestionEditor(setId, questionId) {
+  const opts = String($('qe-opts')?.value || '').split('\n').map((line) => line.trim()).filter(Boolean);
+  const correctIndices = String($('qe-correct')?.value || '').split(',').map((item) => Number(item.trim())).filter((n) => Number.isInteger(n) && n >= 0);
+  try {
+    await apiJson(`/api/admin/question-sets/${setId}/questions`, {
+      method: 'POST',
+      body: JSON.stringify({
+        id: questionId,
+        qNum: Number($('qe-qnum')?.value || 0),
+        stem: String($('qe-stem')?.value || ''),
+        note: String($('qe-note')?.value || ''),
+        sectionId: $('qe-section')?.value || null,
+        multi: $('qe-multi')?.value === 'true',
+        opts,
+        correctIndices
+      })
+    }, { timeoutMs: 12000, retries: 0 });
+    openQuestionSet(setId, window.__currentQuestionSet?.name || '');
+  } catch (_e) {
+    modal('❌', 'Save Failed', 'Could not save that question. Please check the question number, options, and correct indexes.', [{ label: 'OK', cls: 'btn-primary' }]);
+  }
+}
+
+function deleteQuestion(setId, questionId) {
+  modal('⚠️', 'Delete Question', 'Delete this question from the exam set?', [
+    { label: 'Delete', cls: 'btn-danger', action: async () => {
+      try {
+        await apiJson(`/api/admin/question-sets/${setId}/questions/${questionId}`, { method: 'DELETE' }, { timeoutMs: 10000, retries: 0 });
+        openQuestionSet(setId, window.__currentQuestionSet?.name || '');
+      } catch (_e) {
+        modal('❌', 'Delete Failed', 'Could not delete that question.', [{ label: 'OK', cls: 'btn-primary' }]);
+      }
+    }},
+    { label: 'Cancel', cls: 'btn-secondary' }
+  ]);
+}
+
+async function editSectionPrompt(setId, sectionId = null) {
+  const current = window.__currentQuestionSet || { sections: [] };
+  const section = current.sections.find((item) => item.id === sectionId) || null;
+  const name = window.prompt('Section name:', section?.name || '');
+  if (!name || !name.trim()) return;
+  const description = window.prompt('Section description (optional):', section?.description || '') || '';
+  const displayOrder = window.prompt('Display order:', section ? String(section.displayOrder || 0) : '0');
+  if (displayOrder == null) return;
+  const drawCount = window.prompt('Draw count (blank = no section quota):', section?.drawCount == null ? '' : String(section.drawCount));
+  if (drawCount == null) return;
+  try {
+    await apiJson(`/api/admin/question-sets/${setId}/sections`, {
+      method: 'POST',
+      body: JSON.stringify({
+        id: sectionId,
+        name: name.trim(),
+        description: description.trim(),
+        displayOrder: Number(displayOrder),
+        drawCount: drawCount.trim() === '' ? null : Number(drawCount)
+      })
+    }, { timeoutMs: 10000, retries: 0 });
+    openQuestionSet(setId, current.name || '');
+  } catch (_e) {
+    modal('❌', 'Section Save Failed', 'Could not save that section.', [{ label: 'OK', cls: 'btn-primary' }]);
+  }
+}
+
+function deleteSection(setId, sectionId) {
+  modal('⚠️', 'Delete Section', 'Delete this section? Questions stay in the set and become unsectioned.', [
+    { label: 'Delete', cls: 'btn-danger', action: async () => {
+      try {
+        await apiJson(`/api/admin/question-sets/${setId}/sections/${sectionId}`, { method: 'DELETE' }, { timeoutMs: 10000, retries: 0 });
+        openQuestionSet(setId, window.__currentQuestionSet?.name || '');
+      } catch (_e) {
+        modal('❌', 'Delete Failed', 'Could not delete that section.', [{ label: 'OK', cls: 'btn-primary' }]);
+      }
+    }},
+    { label: 'Cancel', cls: 'btn-secondary' }
+  ]);
 }
 
 async function saveNote(code, val) {
@@ -1099,13 +1897,32 @@ window.trySubmit = trySubmit;
 window.showAdminLogin = showAdminLogin;
 window.doLogin = doLogin;
 window.showAdmin = showAdmin;
+window.assignQuestionSet = assignQuestionSet;
+window.createQuestionSet = createQuestionSet;
+window.configQuestionSet = configQuestionSet;
+window.saveQuestionSetConfig = saveQuestionSetConfig;
+window.activateQuestionSet = activateQuestionSet;
+window.deleteQuestionSet = deleteQuestionSet;
+window.showUploadQuestionSet = showUploadQuestionSet;
+window.downloadQuestionTemplate = downloadQuestionTemplate;
+window.submitUploadedQuestionSet = submitUploadedQuestionSet;
+window.openQuestionSet = openQuestionSet;
+window.showQuestionEditor = showQuestionEditor;
+window.saveQuestionEditor = saveQuestionEditor;
+window.deleteQuestion = deleteQuestion;
+window.editSectionPrompt = editSectionPrompt;
+window.deleteSection = deleteSection;
 window.saveNote = saveNote;
 window.resetCode = resetCode;
+window.deleteCode = deleteCode;
 window.generateCodes = generateCodes;
 window.downloadExport = downloadExport;
 window.flagsFor = flagsFor;
-window.probeQuestions = probeQuestions;
 window.clearStaleSessions = clearStaleSessions;
+window.toggleExamAvailability = toggleExamAvailability;
+window.reviewResult = reviewResult;
+window.repairResultSummaries = repairResultSummaries;
+window.clearResultSummaries = clearResultSummaries;
 
 window.addEventListener('beforeunload', () => {
   if (S.screen === 'exam' && !S.submitted) saveProgress();
