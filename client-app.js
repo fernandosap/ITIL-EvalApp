@@ -786,6 +786,31 @@ function showResultsFromRecord(rec) {
   S.screen = 'results';
   document.body.classList.remove('exam-bg');
   const duration = durationLabel(rec.durationSecs || 0);
+  const sectionResults = Array.isArray(rec.sectionResults) ? rec.sectionResults : [];
+  const passPct = Number(rec.passPct || S.passPct || 80);
+  const passScore = rec.total ? Math.ceil((Number(rec.total) * passPct) / 100) : (S.passScore || 0);
+  const sectionBreakdown = sectionResults.length ? `
+    <div class="divider"></div>
+    <div style="text-align:left">
+      <div style="font-size:16px;font-weight:800;color:#1F3864;margin-bottom:10px">Performance by Segment</div>
+      <div style="display:grid;gap:10px">
+        ${sectionResults.map((section) => {
+          const wrong = Math.max(0, Number(section.total || 0) - Number(section.correct || 0));
+          return `<div style="border:1px solid #d9e3f0;border-radius:12px;padding:12px 14px;background:#f8fbff">
+            <div style="display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:6px">
+              <div style="font-weight:800;color:#1F3864">${_esc(section.name || 'Segment')}</div>
+              <div style="font-size:12px;color:#6c7a90">${Number(section.pct || 0)}%</div>
+            </div>
+            <div style="font-size:13px;color:#445;line-height:1.8">
+              <strong>Right:</strong> ${Number(section.correct || 0)}<br>
+              <strong>Wrong:</strong> ${wrong}<br>
+              <strong>Total:</strong> ${Number(section.total || 0)}
+            </div>
+          </div>`;
+        }).join('')}
+      </div>
+      <p style="font-size:12px;color:#667;margin-top:10px;margin-bottom:0">Use the segments with the lowest scores as your main study focus before the next attempt.</p>
+    </div>` : '';
   render(`<div class="screen" style="max-width:500px">
     <div class="card" style="margin-top:48px;text-align:center">
       <h2 style="text-align:center;margin-bottom:18px">${rec.autoSubmit ? '⏰ Time Expired — Auto-Submitted' : 'Exam Submitted'}</h2>
@@ -795,7 +820,7 @@ function showResultsFromRecord(rec) {
       </div>
       <div style="font-size:22px;font-weight:800;color:${rec.pass ? '#1a5c1a' : '#c0392b'};margin-bottom:4px">${rec.pass ? '✓ PASS' : '✗ DID NOT PASS'}</div>
       <div style="font-size:17px;font-weight:700;margin-bottom:4px">${rec.pct}%</div>
-      <div style="font-size:13px;color:#888;margin-bottom:22px">Pass threshold: ${S.passScore}/${S.total} (${S.passPct}%)</div>
+      <div style="font-size:13px;color:#888;margin-bottom:22px">Pass threshold: ${passScore}/${rec.total} (${passPct}%)</div>
       <div class="divider"></div>
       <div style="text-align:left;font-size:14px;color:#555;line-height:2.2">
         <div><strong>Access Code:</strong> <span style="font-family:monospace;font-size:16px;font-weight:800;letter-spacing:2px;color:#1F3864">${_esc(rec.code)}</span></div>
@@ -804,6 +829,7 @@ function showResultsFromRecord(rec) {
         ${rec.tabSwitches > 0 ? `<div style="color:#c55a11"><strong>Tab switches:</strong> ${rec.tabSwitches}</div>` : ''}
         ${rec.incidentCount > 0 ? `<div style="color:#c55a11"><strong>Flags logged:</strong> ${rec.incidentCount}</div>` : ''}
       </div>
+      ${sectionBreakdown}
       <div class="divider"></div>
       <p style="font-size:13px;color:#999">Your result has been recorded. You may close this window.</p>
     </div>
