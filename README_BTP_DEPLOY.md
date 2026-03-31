@@ -72,14 +72,26 @@ Open the generated route in your browser.
 
 ## Stable URL behavior
 
-This project is configured with a fixed route in `manifest.yml`:
+This project is configured with a fixed public hostname in `manifest.yml` and `deploy_btp.sh`.
+
+Default canonical URL:
+
+- `https://academycd-evalapp.cfapps.us10.hana.ondemand.com`
+
+Route template:
 
 ```yaml
 routes:
-  - route: itil4-evalapp.((default_domain))
+  - route: ((route_host)).((default_domain))
 ```
 
-Use `--var default_domain=...` on deploy so the URL stays constant across pushes.
+`deploy_btp.sh` passes `route_host` automatically and defaults it to `academycd-evalapp`.
+
+If you ever need a different hostname for a one-off deploy, override it like this:
+
+```bash
+ROUTE_HOST=my-other-host ./deploy_btp.sh --domain <your-default-domain>
+```
 
 ## Notes
 

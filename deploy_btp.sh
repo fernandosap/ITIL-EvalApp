@@ -3,6 +3,7 @@ set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_NAME="itil4-evalapp"
+ROUTE_HOST="${ROUTE_HOST:-academycd-evalapp}"
 APP_REVISION="${APP_REVISION:-$(git rev-parse --short HEAD 2>/dev/null || echo dev)}"
 APP_DEPLOYED_AT="${APP_DEPLOYED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 
@@ -21,6 +22,7 @@ Example:
 Notes:
   - This script expects manifest.yml in the same directory.
   - If you are already logged in and targeted, you can run it with no args.
+  - The public hostname defaults to `academycd-evalapp`. Override with ROUTE_HOST if needed.
   - It auto-detects API/org/space from `cf target` when omitted.
   - It auto-detects a shared external domain from `cf domains` when omitted.
   - If your landscape requires SSO, add --sso to force interactive SSO login.
@@ -159,6 +161,7 @@ cf target -o "$CF_ORG" -s "$CF_SPACE"
 echo "==> Deploying app with fixed route + HANA vars"
 cf push \
   --var "default_domain=$DEFAULT_DOMAIN" \
+  --var "route_host=$ROUTE_HOST" \
   --var "hana_host=$HANA_HOST" \
   --var "hana_port=$HANA_PORT" \
   --var "hana_user=$HANA_USER" \
