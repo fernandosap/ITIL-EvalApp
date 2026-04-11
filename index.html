@@ -160,6 +160,28 @@ input:focus{outline:none;border-color:#2E75B6}
 .webcam-preview{margin:14px 0;text-align:center;display:none}
 .webcam-preview video{width:180px;height:135px;border-radius:8px;border:2px solid #2E75B6;object-fit:cover;transform:scaleX(-1)}
 .no-select{-webkit-user-select:none;user-select:none}
+
+@media (max-width: 720px){
+  body{background:linear-gradient(180deg,#eaf7fb 0%,#c6dfea 100%)}
+  .screen{max-width:100%;padding:16px 10px 32px}
+  .card,.glass-card{padding:20px 16px;border-radius:14px}
+  .exam-header{padding:9px 10px;gap:8px;align-items:flex-start}
+  .header-code{font-size:13px;letter-spacing:1px}
+  .timer{font-size:18px;min-width:78px;padding:5px 8px}
+  .save-pill{min-width:82px;font-size:10px;padding:4px 6px}
+  .q-stem{font-size:15px;line-height:1.55}
+  .option{padding:12px 12px;font-size:14px}
+  .exam-nav{display:grid;grid-template-columns:1fr;gap:8px}
+  .exam-nav .btn,.exam-nav .sel-count{width:100%;text-align:center}
+  .webcam-corner{right:8px;bottom:8px}
+  .webcam-corner video{width:104px;height:78px}
+  .admin-wrap{width:100%;padding:12px 8px}
+  .admin-table{font-size:12px;min-width:980px}
+  .admin-table th,.admin-table td{padding:8px 9px}
+  .btn{padding:10px 16px}
+  .btn-sm{padding:7px 10px}
+  input[type="text"],input[type="password"],input[type="number"],select,textarea{font-size:16px}
+}
 </style>
 </head>
 <body>

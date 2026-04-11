@@ -107,6 +107,27 @@ If you are adopting the newer HTML admin functionality with seat notes, run:
 
 This migration is idempotent and only adds `ACCESS_CODES.NOTES` if it does not already exist.
 
+## Migration (Practice Mode, Analytics, Bulk Delete)
+
+Run this once before using practice/knowledge-check mode or bulk deletion:
+
+- [2026-04-09_practice_analytics_bulk_roles.sql](/Users/I848070/Documents/Github/ITIL-EvalApp/migrations/2026-04-09_practice_analytics_bulk_roles.sql)
+
+This adds per-exam mode fields to `QUESTION_SETS` and soft-delete metadata to `ACCESS_CODES`.
+
+Practice behavior is configured per exam set in the admin console:
+
+- `Graded Exam`: candidates do not receive the answer key after submission.
+- `Practice / Knowledge Check`: candidates can review right/wrong answers after submission.
+
+Optional manager login:
+
+```bash
+export MANAGER_HASH=<sha256-hash-of-manager-password>
+```
+
+Managers can generate/access codes, view results, export data, and open analytics. Full exam configuration, deletion, resets, score repair, and exam availability remain Admin-only.
+
 ## Migration (Question Bank)
 
 Run this once in HANA to create the secure question storage table:
