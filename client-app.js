@@ -5,6 +5,7 @@ const CFG = {
 };
 
 let _adminToken = null;
+let _adminRole = 'admin';
 let _adminSystemStatus = null;
 let _adminAuditEntries = [];
 let _adminQuestionSets = [];
@@ -36,12 +37,16 @@ const S = {
   passScore: 24,
   total: 30,
   proctorOn: true,
+  examMode: 'GRADED',
+  isPractice: false,
+  showCorrectAnswers: false,
   freshStart: false,
   securityBound: false
 };
 let _blurTime = null;
 let _progressSaveTimer = null;
 let _adminRows = [];
+let _selectedCodes = new Set();
 
 function $(id) { return document.getElementById(id); }
 function render(html) { $('app').innerHTML = html; }
@@ -286,6 +291,9 @@ async function handleCodeSubmit() {
   S.passScore = data.passScore || S.passScore;
   S.total = data.total || S.total;
   S.proctorOn = data.proctorEnabled !== false;
+  S.examMode = data.examMode || 'GRADED';
+  S.isPractice = data.isPractice === true || S.examMode === 'PRACTICE';
+  S.showCorrectAnswers = data.showCorrectAnswers === true;
 
   if (data.status === 'completed' && data.result) {
     showResultsFromRecord(data.result);
@@ -318,6 +326,15 @@ function showConsent() {
   render(`<div class="screen" style="max-width:620px">
     <div class="card">
       <h2>Before You Begin</h2>
+      ${S.isPractice ? `
+      <div class="consent-box" style="background:#eef9f1;border-color:#8acb95">
+        <strong>Practice / Knowledge Check:</strong>
+        <ul>
+          <li>This attempt is for learning and review, not an official graded exam.</li>
+          <li>You will see which questions you got right or wrong after submitting.</li>
+          <li>Use the final review to focus your study by question and segment.</li>
+        </ul>
+      </div>` : ''}
       ${proctorEnabled() ? `
       <p style="margin-bottom:14px;color:#555">This exam uses automated proctoring. Please read carefully.</p>
       <div class="consent-box">
@@ -337,7 +354,7 @@ function showConsent() {
           <li>You may skip and return to questions freely</li>
           <li>All questions must be answered before submitting</li>
           <li>Multi-select questions require every correct option — partial selections score zero</li>
-          <li>Passing score: ${S.passScore}/${S.total} (${S.passPct}%)</li>
+          <li>${S.isPractice ? 'Target score' : 'Passing score'}: ${S.passScore}/${S.total} (${S.passPct}%)</li>
         </ul>
       </div>
       <div class="checkbox-row">
@@ -467,6 +484,9 @@ async function startExam() {
   S.passPct = data.passPct || S.passPct;
   S.passScore = data.passScore || S.passScore;
   S.proctorOn = data.proctorEnabled !== false;
+  S.examMode = data.examMode || S.examMode || 'GRADED';
+  S.isPractice = data.isPractice === true || S.examMode === 'PRACTICE';
+  S.showCorrectAnswers = data.showCorrectAnswers === true;
   S.submitted = false;
   S.startTime = Date.now();
   S.elapsed = 0;
@@ -538,7 +558,7 @@ async function renderQ() {
   render(`<div class="no-select" style="min-height:100vh;display:flex;flex-direction:column">
     <div class="exam-header">
       <div class="header-info">
-        <span class="header-title">SAP Academy for Cloud Delivery · Secure Exam</span>
+        <span class="header-title">SAP Academy for Cloud Delivery · ${S.isPractice ? 'Practice Knowledge Check' : 'Secure Exam'}</span>
         <span class="header-code">CODE: ${_esc(S.code)}</span>
       </div>
       <div style="display:flex;align-items:center;gap:8px">
@@ -571,11 +591,12 @@ async function renderQ() {
             ? `<button class="btn btn-primary" onclick="trySubmit()" ${unanswered > 0 ? 'disabled' : ''}>Submit Exam</button>`
             : `<button class="btn btn-primary" onclick="nextQ()">Next →</button>`}
         </div>
+        ${S.isPractice ? '<p style="text-align:center;font-size:12px;color:#1a5c1a;margin-top:8px;font-weight:700">Practice mode: you will see right/wrong feedback after submission.</p>' : ''}
         ${isLast && unanswered > 0 ? `<p style="text-align:center;font-size:12px;color:#c55a11;margin-top:8px">⚠ ${unanswered} unanswered — use the dots above to go back.</p>` : ''}
       </div>
     </div>
   </div>
-  ${proctorEnabled() ? `<div class="webcam-corner"><video id="exam-cam" autoplay muted playsinline></video><div class="webcam-label">🔴 PROCTORED</div></div>` : ''}`);
+  ${proctorEnabled() ? `<div class="webcam-corner"><video id="exam-cam" autoplay muted playsinline></video><div class="webcam-label">PROCTORED</div></div>` : ''}`);
 
   const ec = $('exam-cam');
   if (ec && S.webcamStream && proctorEnabled()) ec.srcObject = S.webcamStream;
@@ -787,6 +808,8 @@ function showResultsFromRecord(rec) {
   document.body.classList.remove('exam-bg');
   const duration = durationLabel(rec.durationSecs || 0);
   const sectionResults = Array.isArray(rec.sectionResults) ? rec.sectionResults : [];
+  const questionResults = Array.isArray(rec.questionResults) ? rec.questionResults : [];
+  const showPracticeReview = rec.showCorrectAnswers === true && questionResults.length > 0;
   const passPct = Number(rec.passPct || S.passPct || 80);
   const passScore = rec.total ? Math.ceil((Number(rec.total) * passPct) / 100) : (S.passScore || 0);
   const sectionBreakdown = sectionResults.length ? `
@@ -811,14 +834,47 @@ function showResultsFromRecord(rec) {
       </div>
       <p style="font-size:12px;color:#667;margin-top:10px;margin-bottom:0">Use the segments with the lowest scores as your main study focus before the next attempt.</p>
     </div>` : '';
-  render(`<div class="screen" style="max-width:500px">
+  const practiceReview = showPracticeReview ? `
+    <div class="divider"></div>
+    <div style="text-align:left">
+      <div style="font-size:16px;font-weight:800;color:#1F3864;margin-bottom:8px">Question Review</div>
+      <p style="font-size:12px;color:#667;margin-bottom:12px">Practice mode only: review each answer and use missed questions for follow-up study.</p>
+      <div style="display:grid;gap:12px">
+        ${questionResults.map((item, idx) => {
+          const displayOptions = Array.isArray(item.displayOptions) && item.displayOptions.length
+            ? item.displayOptions
+            : (Array.isArray(item.opts) ? item.opts : []);
+          const labels = 'ABCDEF';
+          const formatDisplay = (indexes) => {
+            if (!Array.isArray(indexes) || !indexes.length) return 'No answer selected';
+            return indexes.map((displayIdx) => {
+              const label = labels[displayIdx] || String(displayIdx + 1);
+              return `${label}. ${displayOptions[displayIdx] || `Option ${displayIdx + 1}`}`;
+            }).join('<br>');
+          };
+          return `<div style="border:1px solid ${item.correct ? '#b8dfc1' : '#f1c0c0'};border-radius:14px;padding:14px;background:${item.correct ? '#f3fbf5' : '#fff7f7'}">
+            <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;margin-bottom:8px">
+              <div style="font-weight:800;color:#1F3864">Question ${idx + 1}</div>
+              ${item.correct ? '<span class="chip chip-pass">Correct</span>' : '<span class="chip chip-fail">Wrong</span>'}
+            </div>
+            <div style="font-size:13px;font-weight:700;color:#223;line-height:1.55;margin-bottom:10px">${_esc(item.stem || 'Question')}</div>
+            ${item.sectionName ? `<div style="font-size:11px;color:#7a8ca8;text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px">${_esc(item.sectionName)}</div>` : ''}
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;font-size:12px;line-height:1.6">
+              <div><strong>Your answer</strong><br>${formatDisplay(item.givenDisplay || [])}</div>
+              <div><strong>Correct answer</strong><br>${formatDisplay(item.expectedDisplay || [])}</div>
+            </div>
+          </div>`;
+        }).join('')}
+      </div>
+    </div>` : '';
+  render(`<div class="screen" style="max-width:${showPracticeReview ? '860px' : '500px'}">
     <div class="card" style="margin-top:48px;text-align:center">
-      <h2 style="text-align:center;margin-bottom:18px">${rec.autoSubmit ? '⏰ Time Expired — Auto-Submitted' : 'Exam Submitted'}</h2>
+      <h2 style="text-align:center;margin-bottom:18px">${rec.autoSubmit ? 'Time Expired - Auto-Submitted' : (rec.isPractice ? 'Practice Submitted' : 'Exam Submitted')}</h2>
       <div class="score-circle ${rec.pass ? 'pass' : 'fail'}">
         <div class="score-num">${rec.score}</div>
         <div class="score-den">out of ${rec.total}</div>
       </div>
-      <div style="font-size:22px;font-weight:800;color:${rec.pass ? '#1a5c1a' : '#c0392b'};margin-bottom:4px">${rec.pass ? '✓ PASS' : '✗ DID NOT PASS'}</div>
+      <div style="font-size:22px;font-weight:800;color:${rec.pass ? '#1a5c1a' : '#c0392b'};margin-bottom:4px">${rec.isPractice ? (rec.pass ? 'TARGET MET' : 'KEEP PRACTICING') : (rec.pass ? 'PASS' : 'DID NOT PASS')}</div>
       <div style="font-size:17px;font-weight:700;margin-bottom:4px">${rec.pct}%</div>
       <div style="font-size:13px;color:#888;margin-bottom:22px">Pass threshold: ${passScore}/${rec.total} (${passPct}%)</div>
       <div class="divider"></div>
@@ -830,13 +886,15 @@ function showResultsFromRecord(rec) {
         ${rec.incidentCount > 0 ? `<div style="color:#c55a11"><strong>Flags logged:</strong> ${rec.incidentCount}</div>` : ''}
       </div>
       ${sectionBreakdown}
+      ${practiceReview}
       <div class="divider"></div>
-      <p style="font-size:13px;color:#999">Your result has been recorded. You may close this window.</p>
+      <p style="font-size:13px;color:#999">${rec.isPractice ? 'Your practice attempt has been saved for learning analytics.' : 'Your result has been recorded. You may close this window.'}</p>
     </div>
   </div>`);
 }
 
 function statusChip(row) {
+  if (row.status === 'completed' && row.isPractice) return '<span class="chip chip-pass">PRACTICE</span>';
   if (row.status === 'completed') return `<span class="chip ${row.pass ? 'chip-pass' : 'chip-fail'}">${row.pass ? 'PASS' : 'FAIL'}</span>`;
   if (row.status === 'active') return '<span class="chip chip-active">ACTIVE</span>';
   return '<span class="chip chip-unused">UNUSED</span>';
@@ -871,6 +929,7 @@ async function doLogin() {
     return;
   }
   _adminToken = resp.token;
+  _adminRole = resp.role || 'admin';
   showAdmin();
 }
 
@@ -1012,6 +1071,65 @@ async function deleteCode(code, status) {
   ]);
 }
 
+function updateSelectedCodeCount() {
+  const el = $('selected-code-count');
+  if (el) el.textContent = String(_selectedCodes.size);
+}
+
+function toggleCodeSelection(code, checked) {
+  if (checked) _selectedCodes.add(code);
+  else _selectedCodes.delete(code);
+  updateSelectedCodeCount();
+}
+
+function toggleAllVisibleCodes(checked) {
+  for (const row of _adminRows) {
+    if (checked) _selectedCodes.add(row.code);
+    else _selectedCodes.delete(row.code);
+  }
+  document.querySelectorAll('.code-select').forEach((el) => { el.checked = checked; });
+  updateSelectedCodeCount();
+}
+
+function selectAllVisibleCodes() {
+  toggleAllVisibleCodes(true);
+}
+
+function clearCodeSelection() {
+  _selectedCodes.clear();
+  document.querySelectorAll('.code-select').forEach((el) => { el.checked = false; });
+  updateSelectedCodeCount();
+}
+
+async function bulkDeleteCodes() {
+  const codes = [..._selectedCodes];
+  if (!codes.length) {
+    modal('ℹ️', 'No Codes Selected', 'Select one or more access codes first.', [{ label: 'OK', cls: 'btn-primary' }]);
+    return;
+  }
+  const selectedRows = _adminRows.filter((row) => _selectedCodes.has(row.code));
+  const statusSummary = ['unused', 'active', 'completed'].map((status) => `${selectedRows.filter((row) => row.status === status).length} ${status}`).join('\n');
+  modal('⚠️', 'Delete Selected Codes', `Delete ${codes.length} selected access code(s)?\n\n${statusSummary}\n\nThe codes will be removed from the normal admin view and can no longer be used. Historical result records are preserved when the database migration is installed.`, [
+    {
+      label: 'Delete Selected',
+      cls: 'btn-danger',
+      action: async () => {
+        try {
+          const resp = await apiJson('/api/admin/codes/bulk-delete', {
+            method: 'POST',
+            body: JSON.stringify({ codes })
+          }, { timeoutMs: 30000, retries: 0 });
+          _selectedCodes.clear();
+          modal('✅', 'Codes Deleted', `${resp.deletedCount || 0} access code(s) were deleted.`, [{ label: 'Refresh', cls: 'btn-primary', action: () => showAdmin() }]);
+        } catch (_e) {
+          modal('❌', 'Bulk Delete Failed', 'The selected codes could not be deleted.', [{ label: 'OK', cls: 'btn-primary' }]);
+        }
+      }
+    },
+    { label: 'Cancel', cls: 'btn-secondary' }
+  ]);
+}
+
 async function reviewResult(code) {
   render('<div class="admin-wrap"><div style="padding:60px;text-align:center;color:white;font-size:18px">Loading candidate answers...</div></div>');
   try {
@@ -1082,6 +1200,7 @@ function auditActionLabel(action) {
     case 'admin_note_saved': return 'Note saved';
     case 'admin_code_reset': return 'Code reset';
     case 'admin_code_deleted': return 'Code deleted';
+    case 'admin_codes_bulk_deleted': return 'Codes bulk deleted';
     case 'admin_codes_generated': return 'Codes generated';
     case 'admin_stale_sessions_cleared': return 'Stale sessions cleared';
     case 'admin_result_summaries_repaired': return 'Scores repaired';
@@ -1126,7 +1245,10 @@ async function showAdmin() {
   }
   _adminSystemStatus = systemStatus;
   _adminAuditEntries = Array.isArray(auditData?.entries) ? auditData.entries : [];
+  _adminRole = data.role || _adminRole || 'admin';
+  const canAdmin = _adminRole === 'admin';
   _adminRows = sortAdminRows(data.codes || []);
+  _selectedCodes = new Set([..._selectedCodes].filter((code) => _adminRows.some((row) => row.code === code)));
   _adminQuestionSets = Array.isArray(data.questionSets) ? data.questionSets : [];
   _activeQuestionSet = _adminQuestionSets.find((set) => set.isActive) || _adminQuestionSets[0] || null;
   const unused = summaryValue(_adminRows, 'unused');
@@ -1157,12 +1279,13 @@ async function showAdmin() {
           <div>Stale sessions: ${systemStatus.staleSessionCount || 0}</div>
           <div>Audit log: ${systemStatus.auditEnabled ? `${systemStatus.auditCount} entries` : 'missing'}</div>
           <div>Admin env: ${systemStatus.adminConfigured ? 'configured' : 'missing'}</div>
+          <div>Manager login: ${systemStatus.managerConfigured ? 'configured' : 'not configured'}</div>
         </div>
       </div>
       ${staleSessions.length ? `<div style="margin-top:10px;padding:10px 12px;background:rgba(255,248,230,.9);border-radius:10px;color:#8a5b00;font-size:13px">
         <strong>Stale active sessions (${systemStatus.staleSessionMinutes}+ min):</strong><br>
         ${staleSessions.map((s) => `${_esc(s.code)} · last save ${s.updatedAt ? _esc(new Date(s.updatedAt).toLocaleString()) : 'unknown'}`).join('<br>')}
-        <div style="margin-top:10px"><button class="btn btn-danger btn-sm" onclick="clearStaleSessions()">Clear Stale Sessions</button></div>
+        ${canAdmin ? '<div style="margin-top:10px"><button class="btn btn-danger btn-sm" onclick="clearStaleSessions()">Clear Stale Sessions</button></div>' : ''}
       </div>` : ''}
       ${warnings.length ? `<div style="margin-top:10px;font-size:13px;color:#7a251d">${warnings.map((w) => `• ${_esc(w)}`).join('<br>')}</div>` : ''}
     </div>` : '';
@@ -1177,17 +1300,20 @@ async function showAdmin() {
       <td style="text-align:center">${set.numQuestions ? `${set.numQuestions} of ${set.questionCount || 0}` : `All ${set.questionCount || 0}`}</td>
       <td style="text-align:center">${set.durationMinutes || 45}m</td>
       <td style="text-align:center">${set.passPct || 80}%</td>
+      <td style="text-align:center">${set.examMode === 'PRACTICE' ? '<span class="chip chip-pass">Practice</span>' : '<span class="chip chip-active">Graded</span>'}</td>
       <td style="text-align:center">${set.proctorEnabled !== false ? 'On' : 'Off'}</td>
       <td style="text-align:center;white-space:nowrap">
-        <button class="btn btn-secondary btn-sm" onclick="openQuestionSet(${set.id}, '${_esc(set.name)}')">Manage</button>
-        <button class="btn btn-secondary btn-sm" onclick="configQuestionSet(${set.id}, ${set.durationMinutes || 45}, ${set.passPct || 80}, ${set.proctorEnabled !== false}, ${set.numQuestions == null ? 'null' : set.numQuestions}, ${set.questionCount || 0})">Config</button>
-        ${!set.isActive ? `<button class="btn btn-primary btn-sm" onclick="activateQuestionSet(${set.id})">Set Default</button>` : ''}
-        ${!set.isActive ? `<button class="btn btn-danger btn-sm" onclick="deleteQuestionSet(${set.id}, '${_esc(set.name)}')">Delete</button>` : ''}
+        <button class="btn btn-secondary btn-sm" onclick="showQuestionSetAnalytics(${set.id})">Analytics</button>
+        ${canAdmin ? `<button class="btn btn-secondary btn-sm" onclick="openQuestionSet(${set.id}, '${_esc(set.name)}')">Manage</button>` : ''}
+        ${canAdmin ? `<button class="btn btn-secondary btn-sm" onclick="configQuestionSet(${set.id}, ${set.durationMinutes || 45}, ${set.passPct || 80}, ${set.proctorEnabled !== false}, ${set.numQuestions == null ? 'null' : set.numQuestions}, ${set.questionCount || 0})">Config</button>` : ''}
+        ${canAdmin && !set.isActive ? `<button class="btn btn-primary btn-sm" onclick="activateQuestionSet(${set.id})">Set Default</button>` : ''}
+        ${canAdmin && !set.isActive ? `<button class="btn btn-danger btn-sm" onclick="deleteQuestionSet(${set.id}, '${_esc(set.name)}')">Delete</button>` : ''}
       </td>
     </tr>`).join('');
 
   const rows = _adminRows.map((row) => `
     <tr>
+      <td style="text-align:center">${canAdmin ? `<input type="checkbox" class="code-select" ${_selectedCodes.has(row.code) ? 'checked' : ''} onchange="toggleCodeSelection('${row.code}', this.checked)">` : ''}</td>
       <td style="font-family:monospace;font-weight:700">${_esc(row.code)}</td>
       <td>${_esc(row.label || '')}</td>
       <td>
@@ -1208,8 +1334,8 @@ async function showAdmin() {
       <td style="text-align:center">${row.submittedAt ? new Date(row.submittedAt).toLocaleString() : '—'}</td>
       <td style="text-align:center;white-space:nowrap">
         ${row.status === 'completed' ? `<button class="btn btn-secondary btn-sm" onclick="reviewResult('${row.code}')">Review</button>` : ''}
-        <button class="btn btn-danger btn-sm" onclick="resetCode('${row.code}')">Reset</button>
-        <button class="btn btn-danger btn-sm" onclick="deleteCode('${row.code}', '${row.status}')">Delete</button>
+        ${canAdmin ? `<button class="btn btn-danger btn-sm" onclick="resetCode('${row.code}')">Reset</button>` : ''}
+        ${canAdmin ? `<button class="btn btn-danger btn-sm" onclick="deleteCode('${row.code}', '${row.status}')">Delete</button>` : ''}
       </td>
     </tr>`).join('');
 
@@ -1217,16 +1343,16 @@ async function showAdmin() {
     <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:16px">
       <div>
         <div style="font-size:22px;font-weight:800;color:white">Admin Console</div>
-        <div style="font-size:13px;color:rgba(255,255,255,.75)">${unused} unused · ${active} active · ${completed} completed · ${_adminQuestionSets.length} exam set${_adminQuestionSets.length === 1 ? '' : 's'}</div>
+        <div style="font-size:13px;color:rgba(255,255,255,.75)">${unused} unused · ${active} active · ${completed} completed · ${_adminQuestionSets.length} exam set${_adminQuestionSets.length === 1 ? '' : 's'} · Role: ${_adminRole === 'admin' ? 'Admin' : 'Manager'}</div>
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
         <button class="btn btn-primary btn-sm" onclick="generateCodes()">+ Generate Codes</button>
-        <button class="btn btn-primary btn-sm" onclick="createQuestionSet()">+ New Exam Set</button>
-        <button class="btn btn-secondary btn-sm" onclick="showUploadQuestionSet()">⬆ Upload Exam CSV</button>
-        <button class="btn btn-secondary btn-sm" onclick="toggleExamAvailability(${examOpen ? 'false' : 'true'})">${examOpen ? 'Close Exams' : 'Open Exams'}</button>
-        <button class="btn btn-secondary btn-sm" onclick="repairResultSummaries()">Repair Scores</button>
-        <button class="btn btn-secondary btn-sm" onclick="clearResultSummaries()">Clear Scores</button>
-        <button class="btn btn-secondary btn-sm" onclick="downloadExport()">⬇ Export CSV</button>
+        ${canAdmin ? '<button class="btn btn-primary btn-sm" onclick="createQuestionSet()">+ New Exam Set</button>' : ''}
+        ${canAdmin ? '<button class="btn btn-secondary btn-sm" onclick="showUploadQuestionSet()">Upload Exam CSV</button>' : ''}
+        ${canAdmin ? `<button class="btn btn-secondary btn-sm" onclick="toggleExamAvailability(${examOpen ? 'false' : 'true'})">${examOpen ? 'Close Exams' : 'Open Exams'}</button>` : ''}
+        ${canAdmin ? '<button class="btn btn-secondary btn-sm" onclick="repairResultSummaries()">Repair Scores</button>' : ''}
+        ${canAdmin ? '<button class="btn btn-secondary btn-sm" onclick="clearResultSummaries()">Clear Scores</button>' : ''}
+        <button class="btn btn-secondary btn-sm" onclick="downloadExport()">Export CSV</button>
         <button class="btn btn-secondary btn-sm" onclick="showAdmin()">↻ Refresh</button>
       </div>
     </div>
@@ -1243,10 +1369,10 @@ async function showAdmin() {
         <table class="admin-table">
           <thead>
             <tr>
-              <th>Name</th><th style="text-align:center">Questions</th><th style="text-align:center">Delivered</th><th style="text-align:center">Duration</th><th style="text-align:center">Pass</th><th style="text-align:center">Proctor</th><th style="text-align:center">Actions</th>
+              <th>Name</th><th style="text-align:center">Questions</th><th style="text-align:center">Delivered</th><th style="text-align:center">Duration</th><th style="text-align:center">Pass</th><th style="text-align:center">Mode</th><th style="text-align:center">Proctor</th><th style="text-align:center">Actions</th>
             </tr>
           </thead>
-          <tbody>${setRows || '<tr><td colspan="7" style="text-align:center;color:#888;padding:18px">No exam sets found</td></tr>'}</tbody>
+          <tbody>${setRows || '<tr><td colspan="8" style="text-align:center;color:#888;padding:18px">No exam sets found</td></tr>'}</tbody>
         </table>
       </div>
     </div>
@@ -1278,14 +1404,21 @@ async function showAdmin() {
       </div>
     </div>
     <div class="card" style="padding:0;overflow-x:auto">
-      <div style="padding:14px 16px 0;font-size:12px;color:#666">Sorted by seat number to make the roster easier to scan.</div>
+      <div style="padding:14px 16px 0;font-size:12px;color:#666;display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap">
+        <span>Sorted by seat number to make the roster easier to scan.</span>
+        ${canAdmin ? `<span style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <button class="btn btn-secondary btn-sm" onclick="selectAllVisibleCodes()">Select Visible</button>
+          <button class="btn btn-secondary btn-sm" onclick="clearCodeSelection()">Clear Selection</button>
+          <button class="btn btn-danger btn-sm" onclick="bulkDeleteCodes()">Delete Selected (<span id="selected-code-count">${_selectedCodes.size}</span>)</button>
+        </span>` : ''}
+      </div>
       <table class="admin-table">
         <thead>
           <tr>
-            <th>Code</th><th>Seat</th><th>Exam Set</th><th>Notes</th><th>Status</th><th style="text-align:center">Score</th><th style="text-align:center">Pct</th><th style="text-align:center">Duration</th><th style="text-align:center">Tabs</th><th style="text-align:center">Flags</th><th style="text-align:center">Submitted</th><th style="text-align:center">Actions</th>
+            <th style="text-align:center">${canAdmin ? '<input type="checkbox" onchange="toggleAllVisibleCodes(this.checked)">' : ''}</th><th>Code</th><th>Seat</th><th>Exam Set</th><th>Notes</th><th>Status</th><th style="text-align:center">Score</th><th style="text-align:center">Pct</th><th style="text-align:center">Duration</th><th style="text-align:center">Tabs</th><th style="text-align:center">Flags</th><th style="text-align:center">Submitted</th><th style="text-align:center">Actions</th>
           </tr>
         </thead>
-        <tbody>${rows || '<tr><td colspan="12" style="text-align:center;color:#888;padding:20px">No access codes found</td></tr>'}</tbody>
+        <tbody>${rows || '<tr><td colspan="13" style="text-align:center;color:#888;padding:20px">No access codes found</td></tr>'}</tbody>
       </table>
     </div>
   </div>`);
@@ -1305,6 +1438,96 @@ async function assignQuestionSet(code, setIdValue) {
     }
   } catch (_e) {
     modal('❌', 'Assignment Failed', 'Could not assign that exam set to the access code.', [{ label: 'OK', cls: 'btn-primary', action: () => showAdmin() }]);
+  }
+}
+
+async function showQuestionSetAnalytics(setId) {
+  S.screen = 'admin-analytics';
+  render('<div class="admin-wrap"><div style="padding:60px;text-align:center;color:white;font-size:18px">Loading analytics...</div></div>');
+  try {
+    const resp = await apiJson(`/api/admin/question-sets/${setId}/analytics`, {}, { timeoutMs: 20000, retries: 1 });
+    if (!resp || !resp.ok) throw new Error('analytics_failed');
+    const s = resp.summary || {};
+    const metric = (label, value, hint = '') => `
+      <div style="padding:16px;border:1px solid #d8e1f0;border-radius:16px;background:#f8fbff">
+        <div style="font-size:12px;color:#6c7a90;margin-bottom:5px">${_esc(label)}</div>
+        <div style="font-size:28px;font-weight:800;color:#1F3864">${value == null ? '—' : _esc(value)}</div>
+        ${hint ? `<div style="font-size:11px;color:#76869c;margin-top:4px">${_esc(hint)}</div>` : ''}
+      </div>`;
+    const questionRows = (items, emptyLabel) => items.length ? items.map((q) => `
+      <tr>
+        <td style="text-align:center">${q.questionIndex ?? '—'}</td>
+        <td>
+          <div style="font-weight:700;color:#1F3864">${_esc(String(q.stem || 'Question').slice(0, 180))}${String(q.stem || '').length > 180 ? '...' : ''}</div>
+          ${q.sectionName ? `<div style="font-size:11px;color:#7a8ca8;margin-top:4px">${_esc(q.sectionName)}</div>` : ''}
+        </td>
+        <td style="text-align:center">${q.answered}</td>
+        <td style="text-align:center">${q.correct}</td>
+        <td style="text-align:center">${q.wrong}</td>
+        <td style="text-align:center">${q.pctCorrect == null ? '—' : `${q.pctCorrect}%`}</td>
+      </tr>`).join('') : `<tr><td colspan="6" style="text-align:center;color:#888;padding:18px">${emptyLabel}</td></tr>`;
+    const sectionRows = (resp.sectionStats || []).length ? resp.sectionStats.map((section) => `
+      <tr>
+        <td>${_esc(section.name || 'Section')}</td>
+        <td style="text-align:center">${section.correct}</td>
+        <td style="text-align:center">${section.wrong}</td>
+        <td style="text-align:center">${section.total}</td>
+        <td style="text-align:center">${section.pctCorrect == null ? '—' : `${section.pctCorrect}%`}</td>
+      </tr>`).join('') : '<tr><td colspan="5" style="text-align:center;color:#888;padding:18px">No section-level answer data yet</td></tr>';
+    const attemptRows = (resp.recentAttempts || []).length ? resp.recentAttempts.map((attempt) => `
+      <tr>
+        <td style="font-family:monospace">${_esc(attempt.code || '')}</td>
+        <td>${_esc(attempt.label || '')}</td>
+        <td style="text-align:center">${attempt.examMode === 'PRACTICE' ? 'Practice' : 'Graded'}</td>
+        <td style="text-align:center">${attempt.score == null ? '—' : `${attempt.score}/${attempt.total}`}</td>
+        <td style="text-align:center">${attempt.pct == null ? '—' : `${attempt.pct}%`}</td>
+        <td style="text-align:center">${attempt.durationSecs == null ? '—' : durationLabel(attempt.durationSecs)}</td>
+        <td style="white-space:nowrap">${attempt.submittedAt ? _esc(new Date(attempt.submittedAt).toLocaleString()) : '—'}</td>
+      </tr>`).join('') : '<tr><td colspan="7" style="text-align:center;color:#888;padding:18px">No attempts yet</td></tr>';
+
+    render(`<div class="admin-wrap">
+      <div class="card" style="margin-bottom:16px">
+        <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap">
+          <div>
+            <div style="font-size:22px;font-weight:800;color:#1F3864">Analytics</div>
+            <div style="font-size:13px;color:#666;margin-top:4px">${_esc(resp.questionSet?.name || 'Exam Set')} · ${resp.questionSet?.isPractice ? 'Practice' : 'Graded'} · ${resp.questionSet?.questionCount || 0} questions</div>
+          </div>
+          <button class="btn btn-secondary btn-sm" onclick="showAdmin()">← Back to Admin</button>
+        </div>
+      </div>
+      <div class="card" style="margin-bottom:16px">
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px">
+          ${metric('Attempts', s.attempts)}
+          ${metric('Completed', s.completed)}
+          ${metric('Average Score', s.averageScore == null ? null : s.averageScore)}
+          ${metric('Average %', s.averagePct == null ? null : `${s.averagePct}%`)}
+          ${metric('Pass Rate', s.passRate == null ? null : `${s.passRate}%`)}
+          ${metric('Average Time', s.averageDurationSecs == null ? null : durationLabel(s.averageDurationSecs))}
+          ${metric('Practice Attempts', s.practiceAttempts)}
+          ${metric('Graded Attempts', s.gradedAttempts)}
+        </div>
+      </div>
+      <div class="card" style="margin-bottom:16px">
+        <div style="font-size:16px;font-weight:800;color:#1F3864;margin-bottom:10px">Performance by Section</div>
+        <div style="overflow-x:auto"><table class="admin-table"><thead><tr><th>Section</th><th style="text-align:center">Right</th><th style="text-align:center">Wrong</th><th style="text-align:center">Total</th><th style="text-align:center">Avg %</th></tr></thead><tbody>${sectionRows}</tbody></table></div>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:16px;margin-bottom:16px">
+        <div class="card">
+          <div style="font-size:16px;font-weight:800;color:#1F3864;margin-bottom:10px">Hardest Questions</div>
+          <div style="overflow-x:auto"><table class="admin-table"><thead><tr><th style="text-align:center">#</th><th>Question</th><th style="text-align:center">Answered</th><th style="text-align:center">Right</th><th style="text-align:center">Wrong</th><th style="text-align:center">Right %</th></tr></thead><tbody>${questionRows(resp.hardestQuestions || [], 'No question analytics yet')}</tbody></table></div>
+        </div>
+        <div class="card">
+          <div style="font-size:16px;font-weight:800;color:#1F3864;margin-bottom:10px">Easiest Questions</div>
+          <div style="overflow-x:auto"><table class="admin-table"><thead><tr><th style="text-align:center">#</th><th>Question</th><th style="text-align:center">Answered</th><th style="text-align:center">Right</th><th style="text-align:center">Wrong</th><th style="text-align:center">Right %</th></tr></thead><tbody>${questionRows(resp.easiestQuestions || [], 'No question analytics yet')}</tbody></table></div>
+        </div>
+      </div>
+      <div class="card">
+        <div style="font-size:16px;font-weight:800;color:#1F3864;margin-bottom:10px">Recent Attempts</div>
+        <div style="overflow-x:auto"><table class="admin-table"><thead><tr><th>Code</th><th>Seat</th><th style="text-align:center">Mode</th><th style="text-align:center">Score</th><th style="text-align:center">Pct</th><th style="text-align:center">Time</th><th>Submitted</th></tr></thead><tbody>${attemptRows}</tbody></table></div>
+      </div>
+    </div>`);
+  } catch (_e) {
+    modal('❌', 'Analytics Failed', 'Could not load analytics for this exam set.', [{ label: 'Back to Admin', cls: 'btn-primary', action: () => showAdmin() }]);
   }
 }
 
@@ -1332,6 +1555,9 @@ async function configQuestionSet(id, currentDuration, currentPassPct, currentPro
   const setMeta = _adminQuestionSets.find((set) => set.id === id) || {};
   const setName = current && current.id === id ? current.name : (setMeta.name || 'Exam Set');
   const setDescription = current && current.id === id ? (current.description || '') : (setMeta.description || '');
+  const examMode = current && current.id === id ? (current.meta?.examMode || 'GRADED') : (setMeta.examMode || 'GRADED');
+  const showCorrectAnswers = current && current.id === id ? (current.meta?.showCorrectAnswers === true) : (setMeta.showCorrectAnswers === true);
+  const countsTowardResults = current && current.id === id ? (current.meta?.countsTowardResults !== false) : (setMeta.countsTowardResults !== false);
 
   S.screen = 'admin-question-set-config';
   document.body.classList.remove('exam-bg');
@@ -1381,6 +1607,32 @@ async function configQuestionSet(id, currentDuration, currentPassPct, currentPro
         <label for="cfg-proctor-enabled" style="margin:0;font-size:14px;color:#334">Require webcam and screen sharing for this exam set</label>
       </div>
 
+      <label class="label">Exam Mode</label>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin-bottom:16px">
+        <label style="display:block;padding:14px;border:2px solid #d0d8e8;border-radius:14px;background:#fff;cursor:pointer">
+          <input type="radio" name="cfg-exam-mode" value="GRADED" ${examMode !== 'PRACTICE' ? 'checked' : ''} onchange="syncExamModeHelp()" style="width:16px;height:16px;margin-right:8px">
+          <strong style="color:#1F3864">Graded Exam</strong>
+          <div style="font-size:12px;color:#666;margin-top:6px;line-height:1.55">Official exam behavior. Candidates do not see the answer key after submission.</div>
+        </label>
+        <label style="display:block;padding:14px;border:2px solid #8acb95;border-radius:14px;background:#f3fbf5;cursor:pointer">
+          <input type="radio" name="cfg-exam-mode" value="PRACTICE" ${examMode === 'PRACTICE' ? 'checked' : ''} onchange="syncExamModeHelp()" style="width:16px;height:16px;margin-right:8px">
+          <strong style="color:#1a5c1a">Practice / Knowledge Check</strong>
+          <div style="font-size:12px;color:#466;margin-top:6px;line-height:1.55">Learning mode. Candidates can review right/wrong answers at the end.</div>
+        </label>
+      </div>
+
+      <div id="cfg-practice-options" style="display:${examMode === 'PRACTICE' ? 'block' : 'none'};padding:12px 14px;border:1px solid #b8dfc1;border-radius:12px;background:#f3fbf5;margin-bottom:18px">
+        <div class="checkbox-row" style="margin-top:0">
+          <input id="cfg-show-correct" type="checkbox" ${showCorrectAnswers || examMode === 'PRACTICE' ? 'checked' : ''}>
+          <label for="cfg-show-correct">Show correct answers and right/wrong review after practice submission</label>
+        </div>
+        <div class="checkbox-row">
+          <input id="cfg-counts-results" type="checkbox" ${countsTowardResults ? 'checked' : ''} ${examMode === 'PRACTICE' ? 'disabled' : ''}>
+          <label for="cfg-counts-results">Count attempts as official graded results</label>
+        </div>
+        <div style="font-size:12px;color:#5c735f;margin-top:8px">Practice attempts are intentionally kept separate from official graded behavior to avoid accidental confusion.</div>
+      </div>
+
       <div style="display:flex;gap:8px;flex-wrap:wrap">
         <button class="btn btn-primary" onclick="saveQuestionSetConfig(${id}, '${_esc(setName)}')">Save Configuration</button>
         <button class="btn btn-secondary" onclick="${returnAction}">Cancel</button>
@@ -1397,6 +1649,10 @@ async function saveQuestionSetConfig(id, setName) {
   const numQuestionsRaw = String($('cfg-num-questions')?.value || '').trim();
   const numQuestions = numQuestionsRaw === '' ? null : Number(numQuestionsRaw);
   const proctorEnabled = Boolean($('cfg-proctor-enabled')?.checked);
+  const modeInput = document.querySelector('input[name="cfg-exam-mode"]:checked');
+  const examMode = modeInput ? modeInput.value : 'GRADED';
+  const showCorrectAnswers = examMode === 'PRACTICE' && $('cfg-show-correct')?.checked !== false;
+  const countsTowardResults = examMode === 'PRACTICE' ? false : $('cfg-counts-results')?.checked !== false;
 
   if (!name) {
     modal('⚠️', 'Title Required', 'Please enter a title for the exam set.', [{ label: 'OK', cls: 'btn-primary' }]);
@@ -1424,7 +1680,10 @@ async function saveQuestionSetConfig(id, setName) {
         durationMinutes,
         passPct,
         numQuestions,
-        proctorEnabled
+        proctorEnabled,
+        examMode,
+        showCorrectAnswers,
+        countsTowardResults
       })
     }, { timeoutMs: 10000, retries: 0 });
 
@@ -1439,6 +1698,20 @@ async function saveQuestionSetConfig(id, setName) {
     }]);
   } catch (_e) {
     modal('❌', 'Update Failed', 'Could not update that exam set configuration.', [{ label: 'OK', cls: 'btn-primary' }]);
+  }
+}
+
+function syncExamModeHelp() {
+  const modeInput = document.querySelector('input[name="cfg-exam-mode"]:checked');
+  const examMode = modeInput ? modeInput.value : 'GRADED';
+  const box = $('cfg-practice-options');
+  const showCorrect = $('cfg-show-correct');
+  const counts = $('cfg-counts-results');
+  if (box) box.style.display = examMode === 'PRACTICE' ? 'block' : 'none';
+  if (showCorrect && examMode === 'PRACTICE') showCorrect.checked = true;
+  if (counts) {
+    counts.disabled = examMode === 'PRACTICE';
+    if (examMode === 'PRACTICE') counts.checked = false;
   }
 }
 
@@ -1701,7 +1974,7 @@ async function openQuestionSet(setId, fallbackName) {
           <div>
             <div style="font-size:22px;font-weight:800;color:#1F3864">${_esc(window.__currentQuestionSet.name)}</div>
             <div style="font-size:13px;color:#666;margin-top:4px">${_esc(window.__currentQuestionSet.description || 'No description')} ${window.__currentQuestionSet.isActive ? '· Default exam set' : ''}</div>
-            <div style="font-size:12px;color:#777;margin-top:6px">${questions.length} questions · ${sections.length} sections · ${setMeta.numQuestions ? `${setMeta.numQuestions} delivered per candidate` : 'All questions delivered'} · ${setMeta.durationMinutes || 45}m · ${setMeta.passPct || 80}% pass</div>
+            <div style="font-size:12px;color:#777;margin-top:6px">${questions.length} questions · ${sections.length} sections · ${setMeta.numQuestions ? `${setMeta.numQuestions} delivered per candidate` : 'All questions delivered'} · ${setMeta.durationMinutes || 45}m · ${setMeta.passPct || 80}% target · ${setMeta.examMode === 'PRACTICE' ? 'Practice mode' : 'Graded mode'}</div>
           </div>
           <div style="display:flex;gap:8px;flex-wrap:wrap">
             <button class="btn btn-primary btn-sm" onclick="showQuestionEditor(${setId})">+ Add Question</button>
@@ -1924,6 +2197,7 @@ window.showAdminLogin = showAdminLogin;
 window.doLogin = doLogin;
 window.showAdmin = showAdmin;
 window.assignQuestionSet = assignQuestionSet;
+window.showQuestionSetAnalytics = showQuestionSetAnalytics;
 window.createQuestionSet = createQuestionSet;
 window.configQuestionSet = configQuestionSet;
 window.saveQuestionSetConfig = saveQuestionSetConfig;
@@ -1949,6 +2223,12 @@ window.toggleExamAvailability = toggleExamAvailability;
 window.reviewResult = reviewResult;
 window.repairResultSummaries = repairResultSummaries;
 window.clearResultSummaries = clearResultSummaries;
+window.toggleCodeSelection = toggleCodeSelection;
+window.toggleAllVisibleCodes = toggleAllVisibleCodes;
+window.selectAllVisibleCodes = selectAllVisibleCodes;
+window.clearCodeSelection = clearCodeSelection;
+window.bulkDeleteCodes = bulkDeleteCodes;
+window.syncExamModeHelp = syncExamModeHelp;
 
 window.addEventListener('beforeunload', () => {
   if (S.screen === 'exam' && !S.submitted) saveProgress();

@@ -4,7 +4,13 @@ set -euo pipefail
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_NAME="itil4-evalapp"
 ROUTE_HOST="${ROUTE_HOST:-academycd-evalapp}"
-APP_REVISION="${APP_REVISION:-$(git rev-parse --short HEAD 2>/dev/null || echo dev)}"
+DEFAULT_REVISION="$(git rev-parse --short HEAD 2>/dev/null || echo dev)"
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
+    DEFAULT_REVISION="${DEFAULT_REVISION}-dirty"
+  fi
+fi
+APP_REVISION="${APP_REVISION:-$DEFAULT_REVISION}"
 APP_DEPLOYED_AT="${APP_DEPLOYED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 
 usage() {
@@ -32,6 +38,8 @@ Notes:
     HANA_ENCRYPT, HANA_SSL_VALIDATE_CERTIFICATE
   - Recommended admin auth var:
     ADMIN_HASH
+  - Optional manager auth var:
+    MANAGER_HASH
   - Optional Anthropic vars for AI proctoring:
     ANTHROPIC_API_KEY, ANTHROPIC_MODEL, ANTHROPIC_VERSION
 EOF
@@ -170,17 +178,24 @@ cf push \
   --var "hana_encrypt=$HANA_ENCRYPT" \
   --var "hana_ssl_validate_certificate=$HANA_SSL_VALIDATE_CERTIFICATE"
 
-if [[ -n "${ADMIN_HASH:-}" ]]; then
-echo "==> Configuring ADMIN_HASH for secure admin login"
-cf set-env "$APP_NAME" ADMIN_HASH "$ADMIN_HASH"
-
 echo "==> Configuring build metadata"
 cf set-env "$APP_NAME" APP_REVISION "$APP_REVISION"
 cf set-env "$APP_NAME" APP_DEPLOYED_AT "$APP_DEPLOYED_AT"
+NEED_RESTAGE="true"
+
+if [[ -n "${ADMIN_HASH:-}" ]]; then
+  echo "==> Configuring ADMIN_HASH for secure admin login"
+  cf set-env "$APP_NAME" ADMIN_HASH "$ADMIN_HASH"
+else
+  echo "==> ADMIN_HASH not set; admin login will be disabled until it is configured"
+fi
+
+if [[ -n "${MANAGER_HASH:-}" ]]; then
+  echo "==> Configuring MANAGER_HASH for limited manager login"
+  cf set-env "$APP_NAME" MANAGER_HASH "$MANAGER_HASH"
   NEED_RESTAGE="true"
 else
-  NEED_RESTAGE="false"
-  echo "==> ADMIN_HASH not set; admin login will be disabled until it is configured"
+  echo "==> MANAGER_HASH not set; manager login will stay disabled"
 fi
 
 if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then

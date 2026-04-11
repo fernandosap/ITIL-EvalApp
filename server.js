@@ -23,6 +23,7 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514';
 const ANTHROPIC_VERSION = process.env.ANTHROPIC_VERSION || '2023-06-01';
 const ADMIN_HASH = (process.env.ADMIN_HASH || '').trim().toLowerCase();
+const MANAGER_HASH = (process.env.MANAGER_HASH || '').trim().toLowerCase();
 const EXAM_NAME = process.env.EXAM_NAME || 'ITIL 4 Foundation';
 const EXAM_DURATION_SECS = Number(process.env.EXAM_DURATION_SECS || 45 * 60);
 const EXAM_PASS_PCT = Number(process.env.EXAM_PASS_PCT || 80);
@@ -119,6 +120,8 @@ function parseAnthropicText(content) {
 }
 
 let _hasNotesColumn = null;
+let _hasDeletedAtColumn = null;
+let _hasQuestionSetModeColumns = null;
 let _hasAuditLogTable = null;
 async function hasNotesColumn(conn) {
   if (_hasNotesColumn !== null) return _hasNotesColumn;
@@ -133,6 +136,36 @@ async function hasNotesColumn(conn) {
   );
   _hasNotesColumn = Number(rows?.[0]?.CNT || 0) > 0;
   return _hasNotesColumn;
+}
+
+async function hasDeletedAtColumn(conn) {
+  if (_hasDeletedAtColumn !== null) return _hasDeletedAtColumn;
+  const rows = await execQuery(
+    conn,
+    `SELECT COUNT(*) AS CNT
+       FROM SYS.TABLE_COLUMNS
+      WHERE SCHEMA_NAME = ?
+        AND TABLE_NAME = 'ACCESS_CODES'
+        AND COLUMN_NAME = 'DELETED_AT'`,
+    [String(HANA_SCHEMA || '').toUpperCase()]
+  );
+  _hasDeletedAtColumn = Number(rows?.[0]?.CNT || 0) > 0;
+  return _hasDeletedAtColumn;
+}
+
+async function hasQuestionSetModeColumns(conn) {
+  if (_hasQuestionSetModeColumns !== null) return _hasQuestionSetModeColumns;
+  const rows = await execQuery(
+    conn,
+    `SELECT COUNT(*) AS CNT
+       FROM SYS.TABLE_COLUMNS
+      WHERE SCHEMA_NAME = ?
+        AND TABLE_NAME = 'QUESTION_SETS'
+        AND COLUMN_NAME IN ('EXAM_MODE', 'SHOW_CORRECT_ANSWERS', 'COUNTS_TOWARD_RESULTS')`,
+    [String(HANA_SCHEMA || '').toUpperCase()]
+  );
+  _hasQuestionSetModeColumns = Number(rows?.[0]?.CNT || 0) === 3;
+  return _hasQuestionSetModeColumns;
 }
 
 async function hasAuditLogTable(conn) {
@@ -196,34 +229,59 @@ function sanitizeProgress(progress) {
   };
 }
 
-function createAdminToken() {
-  if (!ADMIN_HASH) throw new Error('ADMIN_HASH is not configured.');
+function tokenSecretForRole(role) {
+  return role === 'manager' ? MANAGER_HASH : ADMIN_HASH;
+}
+
+function createAdminToken(role = 'admin') {
   const expiry = Date.now() + ADMIN_TTL_MS;
   const nonce = crypto.randomBytes(16).toString('hex');
-  const payload = `${expiry}:${nonce}`;
-  const sig = crypto.createHmac('sha256', ADMIN_HASH).update(payload).digest('hex');
+  const safeRole = role === 'manager' ? 'manager' : 'admin';
+  const secret = tokenSecretForRole(safeRole);
+  if (!secret) throw new Error(`${safeRole.toUpperCase()}_HASH is not configured.`);
+  const payload = `${expiry}:${nonce}:${safeRole}`;
+  const sig = crypto.createHmac('sha256', secret).update(payload).digest('hex');
   return Buffer.from(`${payload}:${sig}`).toString('base64url');
 }
 
-function isValidAdminToken(token) {
+function getAdminTokenRole(token) {
   try {
-    if (!token) return false;
+    if (!token) return null;
     const decoded = Buffer.from(token, 'base64url').toString();
-    const [expiry, nonce, sig] = decoded.split(':');
-    if (!expiry || !nonce || !sig) return false;
-    if (Date.now() > Number(expiry)) return false;
-    const expected = crypto.createHmac('sha256', ADMIN_HASH).update(`${expiry}:${nonce}`).digest('hex');
-    if (sig.length !== expected.length) return false;
-    return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
+    const parts = decoded.split(':');
+    const expiry = parts[0];
+    const nonce = parts[1];
+    const role = parts.length === 4 ? parts[2] : 'admin';
+    const sig = parts.length === 4 ? parts[3] : parts[2];
+    if (!expiry || !nonce || !sig) return null;
+    if (Date.now() > Number(expiry)) return null;
+    const payload = parts.length === 4 ? `${expiry}:${nonce}:${role}` : `${expiry}:${nonce}`;
+    const secret = tokenSecretForRole(role === 'manager' ? 'manager' : 'admin');
+    if (!secret) return null;
+    const expected = crypto.createHmac('sha256', secret).update(payload).digest('hex');
+    if (sig.length !== expected.length) return null;
+    if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
+    return role === 'manager' ? 'manager' : 'admin';
   } catch (_e) {
-    return false;
+    return null;
   }
 }
 
 function requireAdmin(req, res, next) {
   const token = String(req.headers['x-admin-token'] || '').trim();
-  if (!isValidAdminToken(token)) return res.status(401).json({ error: 'unauthorized' });
+  const role = getAdminTokenRole(token);
+  if (!role) return res.status(401).json({ error: 'unauthorized' });
+  req.adminRole = role;
   next();
+}
+
+function requireAdminRole(role) {
+  return (req, res, next) => {
+    if (role === 'admin' && req.adminRole !== 'admin') {
+      return res.status(403).json({ error: 'admin_role_required' });
+    }
+    next();
+  };
 }
 
 async function writeAdminAudit(conn, entry) {
@@ -262,6 +320,9 @@ function createExamSessionFromSet(code, questionSet) {
     code,
     questionSetId: questionSet.id,
     questionSetName: questionSet.name,
+    examMode: questionSet.examMode,
+    showCorrectAnswers: questionSet.showCorrectAnswers === true,
+    countsTowardResults: questionSet.countsTowardResults !== false,
     passPct: Number(questionSet.passPct || 80) || 80,
     durationSecs: (Number(questionSet.durationMinutes || 45) || 45) * 60,
     proctorEnabled: questionSet.proctorEnabled !== false,
@@ -361,6 +422,7 @@ async function getExamEnabled(conn) {
 }
 
 function normalizeQuestionSetRow(row) {
+  const examMode = String(row.EXAM_MODE || 'GRADED').toUpperCase() === 'PRACTICE' ? 'PRACTICE' : 'GRADED';
   return {
     id: Number(row.QUESTION_SET_ID),
     name: String(row.NAME || 'Exam'),
@@ -369,6 +431,9 @@ function normalizeQuestionSetRow(row) {
     durationMinutes: Number(row.DURATION_MINUTES || 45),
     passPct: Number(row.PASS_PCT || 80),
     proctorEnabled: row.PROCTOR_ENABLED == null ? true : Boolean(row.PROCTOR_ENABLED),
+    examMode,
+    showCorrectAnswers: row.SHOW_CORRECT_ANSWERS == null ? examMode === 'PRACTICE' : Boolean(row.SHOW_CORRECT_ANSWERS),
+    countsTowardResults: row.COUNTS_TOWARD_RESULTS == null ? examMode !== 'PRACTICE' : Boolean(row.COUNTS_TOWARD_RESULTS),
     numQuestions: row.NUM_QUESTIONS == null ? null : Number(row.NUM_QUESTIONS),
     createdAt: row.CREATED_AT ? new Date(row.CREATED_AT).toISOString() : null,
     updatedAt: row.UPDATED_AT ? new Date(row.UPDATED_AT).toISOString() : null
@@ -377,24 +442,34 @@ function normalizeQuestionSetRow(row) {
 
 async function getQuestionSetRows(conn, options = {}) {
   const includeCounts = Boolean(options.includeCounts);
+  const hasModeColumns = await hasQuestionSetModeColumns(conn);
+  const modeSelect = hasModeColumns
+    ? 'qs.EXAM_MODE, qs.SHOW_CORRECT_ANSWERS, qs.COUNTS_TOWARD_RESULTS,'
+    : `'GRADED' AS EXAM_MODE, FALSE AS SHOW_CORRECT_ANSWERS, TRUE AS COUNTS_TOWARD_RESULTS,`;
+  const modeGroup = hasModeColumns
+    ? 'qs.EXAM_MODE, qs.SHOW_CORRECT_ANSWERS, qs.COUNTS_TOWARD_RESULTS,'
+    : '';
+  const modeSelectPlain = hasModeColumns
+    ? 'EXAM_MODE, SHOW_CORRECT_ANSWERS, COUNTS_TOWARD_RESULTS,'
+    : `'GRADED' AS EXAM_MODE, FALSE AS SHOW_CORRECT_ANSWERS, TRUE AS COUNTS_TOWARD_RESULTS,`;
   const rows = includeCounts
     ? await execQuery(
         conn,
         `SELECT qs.QUESTION_SET_ID, qs.NAME, qs.DESCRIPTION, qs.IS_ACTIVE,
-                qs.DURATION_MINUTES, qs.PASS_PCT, qs.PROCTOR_ENABLED, qs.NUM_QUESTIONS,
+                qs.DURATION_MINUTES, qs.PASS_PCT, qs.PROCTOR_ENABLED, ${modeSelect} qs.NUM_QUESTIONS,
                 qs.CREATED_AT, qs.UPDATED_AT,
                 COUNT(q.QUESTION_ID) AS QUESTION_COUNT
            FROM QUESTION_SETS qs
            LEFT JOIN QUESTION_SET_QUESTIONS q ON q.QUESTION_SET_ID = qs.QUESTION_SET_ID
           GROUP BY qs.QUESTION_SET_ID, qs.NAME, qs.DESCRIPTION, qs.IS_ACTIVE,
-                   qs.DURATION_MINUTES, qs.PASS_PCT, qs.PROCTOR_ENABLED, qs.NUM_QUESTIONS,
+                   qs.DURATION_MINUTES, qs.PASS_PCT, qs.PROCTOR_ENABLED, ${modeGroup} qs.NUM_QUESTIONS,
                    qs.CREATED_AT, qs.UPDATED_AT
           ORDER BY qs.IS_ACTIVE DESC, qs.NAME ASC, qs.QUESTION_SET_ID ASC`
       )
     : await execQuery(
         conn,
         `SELECT QUESTION_SET_ID, NAME, DESCRIPTION, IS_ACTIVE,
-                DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, NUM_QUESTIONS,
+                DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, ${modeSelectPlain} NUM_QUESTIONS,
                 CREATED_AT, UPDATED_AT
            FROM QUESTION_SETS
           ORDER BY IS_ACTIVE DESC, NAME ASC, QUESTION_SET_ID ASC`
@@ -406,10 +481,14 @@ async function getQuestionSetRows(conn, options = {}) {
 }
 
 async function getActiveQuestionSetRow(conn) {
+  const hasModeColumns = await hasQuestionSetModeColumns(conn);
+  const modeSelect = hasModeColumns
+    ? 'EXAM_MODE, SHOW_CORRECT_ANSWERS, COUNTS_TOWARD_RESULTS,'
+    : `'GRADED' AS EXAM_MODE, FALSE AS SHOW_CORRECT_ANSWERS, TRUE AS COUNTS_TOWARD_RESULTS,`;
   const rows = await execQuery(
     conn,
     `SELECT QUESTION_SET_ID, NAME, DESCRIPTION, IS_ACTIVE,
-            DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, NUM_QUESTIONS,
+            DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, ${modeSelect} NUM_QUESTIONS,
             CREATED_AT, UPDATED_AT
        FROM QUESTION_SETS
       WHERE IS_ACTIVE = TRUE
@@ -420,7 +499,7 @@ async function getActiveQuestionSetRow(conn) {
   const fallback = await execQuery(
     conn,
     `SELECT QUESTION_SET_ID, NAME, DESCRIPTION, IS_ACTIVE,
-            DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, NUM_QUESTIONS,
+            DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, ${modeSelect} NUM_QUESTIONS,
             CREATED_AT, UPDATED_AT
        FROM QUESTION_SETS
       ORDER BY QUESTION_SET_ID ASC
@@ -430,11 +509,13 @@ async function getActiveQuestionSetRow(conn) {
 }
 
 async function resolveQuestionSetIdForCode(conn, code) {
+  const hasDeletedAt = await hasDeletedAtColumn(conn);
   const assignedRows = await execQuery(
     conn,
     `SELECT QUESTION_SET_ID
        FROM ACCESS_CODES
-      WHERE ACCESS_CODE = ?`,
+      WHERE ACCESS_CODE = ?
+        ${hasDeletedAt ? 'AND DELETED_AT IS NULL' : ''}`,
     [code]
   );
   const assigned = assignedRows?.[0]?.QUESTION_SET_ID;
@@ -448,10 +529,14 @@ async function loadQuestionSet(conn, questionSetId, options = {}) {
   const cacheKey = String(questionSetId);
   if (!allowEmpty && _questionSetCache.has(cacheKey)) return _questionSetCache.get(cacheKey);
 
+  const hasModeColumns = await hasQuestionSetModeColumns(conn);
+  const modeSelect = hasModeColumns
+    ? 'EXAM_MODE, SHOW_CORRECT_ANSWERS, COUNTS_TOWARD_RESULTS,'
+    : `'GRADED' AS EXAM_MODE, FALSE AS SHOW_CORRECT_ANSWERS, TRUE AS COUNTS_TOWARD_RESULTS,`;
   const metaRows = await execQuery(
     conn,
     `SELECT QUESTION_SET_ID, NAME, DESCRIPTION, IS_ACTIVE,
-            DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, NUM_QUESTIONS,
+            DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, ${modeSelect} NUM_QUESTIONS,
             CREATED_AT, UPDATED_AT
        FROM QUESTION_SETS
       WHERE QUESTION_SET_ID = ?`,
@@ -598,17 +683,23 @@ function buildExamConfigForSet(questionSet, totalOverride = null, examEnabled = 
     passPct,
     passScore: Math.ceil(total * passPct / 100),
     total,
-    proctorEnabled: questionSet.proctorEnabled !== false
+    proctorEnabled: questionSet.proctorEnabled !== false,
+    examMode: questionSet.examMode || 'GRADED',
+    isPractice: questionSet.examMode === 'PRACTICE',
+    showCorrectAnswers: questionSet.showCorrectAnswers === true,
+    countsTowardResults: questionSet.countsTowardResults !== false
   };
 }
 
 async function getCodeRow(conn, code) {
   const hasNotes = await hasNotesColumn(conn);
+  const hasDeletedAt = await hasDeletedAtColumn(conn);
   const rows = await execQuery(
     conn,
     `SELECT ACCESS_CODE, LABEL, ${hasNotes ? 'NOTES,' : ''} STATUS, SCORE, PCT, PASS, CREATED_AT
        FROM ACCESS_CODES
-      WHERE ACCESS_CODE = ?`,
+      WHERE ACCESS_CODE = ?
+        ${hasDeletedAt ? 'AND DELETED_AT IS NULL' : ''}`,
     [code]
   );
   if (!rows.length) return null;
@@ -684,7 +775,23 @@ async function getResultRecord(conn, code) {
   return parseJsonOrNull(rows[0].RESULT_JSON);
 }
 
+function sanitizeCandidateResult(result) {
+  if (!result || typeof result !== 'object') return result;
+  const isPractice = result.examMode === 'PRACTICE' || result.isPractice === true;
+  const showCorrectAnswers = isPractice && result.showCorrectAnswers === true;
+  const safe = {
+    ...result,
+    isPractice,
+    showCorrectAnswers
+  };
+  if (!showCorrectAnswers) {
+    delete safe.questionResults;
+  }
+  return safe;
+}
+
 async function syncAccessCodeSummaryFromResult(conn, code, result) {
+  const summary = officialSummaryFields(result);
   await execQuery(
     conn,
     `UPDATE ACCESS_CODES
@@ -694,11 +801,12 @@ async function syncAccessCodeSummaryFromResult(conn, code, result) {
             PASS = ?,
             UPDATED_AT = CURRENT_UTCTIMESTAMP
       WHERE ACCESS_CODE = ?`,
-    [result?.score ?? null, result?.pct ?? null, result?.pass == null ? null : (result.pass ? 1 : 0), code]
+    [summary.score, summary.pct, summary.pass, code]
   );
 }
 
 async function saveResult(conn, code, result) {
+  const summary = officialSummaryFields(result);
   await execQuery(
     conn,
     `MERGE INTO EXAM_RESULTS T
@@ -724,10 +832,10 @@ async function saveResult(conn, code, result) {
         VALUES (S.ACCESS_CODE, S.SCORE, S.TOTAL, S.PCT, S.PASS, S.AUTO_SUBMIT, S.DURATION_SECS, S.TAB_SWITCHES, S.INCIDENT_COUNT, S.RESULT_JSON, CURRENT_UTCTIMESTAMP)`,
     [
       code,
-      result.score ?? 0,
+      summary.score,
       result.total ?? 0,
-      result.pct ?? 0,
-      result.pass ? 1 : 0,
+      summary.pct,
+      summary.pass,
       result.autoSubmit ? 1 : 0,
       result.durationSecs ?? 0,
       result.tabSwitches ?? 0,
@@ -737,7 +845,19 @@ async function saveResult(conn, code, result) {
   );
 }
 
+function officialSummaryFields(result) {
+  if (result?.countsTowardResults === false) {
+    return { score: null, pct: null, pass: null };
+  }
+  return {
+    score: result?.score ?? null,
+    pct: result?.pct ?? null,
+    pass: result?.pass == null ? null : (result.pass ? 1 : 0)
+  };
+}
+
 async function updateCodeStatus(conn, code, status, result = null) {
+  const summary = officialSummaryFields(result);
   await execQuery(
     conn,
     `UPDATE ACCESS_CODES
@@ -746,7 +866,7 @@ async function updateCodeStatus(conn, code, status, result = null) {
             PCT = ?,
             PASS = ?
       WHERE ACCESS_CODE = ?`,
-    [status, result?.score ?? null, result?.pct ?? null, result?.pass == null ? null : (result.pass ? 1 : 0), code]
+    [status, summary.score, summary.pct, summary.pass, code]
   );
 }
 
@@ -957,7 +1077,7 @@ app.post('/api/validate', async (req, res) => {
 
       const savedResult = await getResultRecord(conn, code);
       if (savedResult || codeRow.status === 'completed') {
-        return { valid: true, status: 'completed', result: savedResult || null, questionSet: { id: questionSet.id, name: questionSet.name }, ...cfg };
+        return { valid: true, status: 'completed', result: sanitizeCandidateResult(savedResult) || null, questionSet: { id: questionSet.id, name: questionSet.name }, ...cfg };
       }
 
       const progress = await getSavedSession(conn, code);
@@ -1078,7 +1198,7 @@ app.post('/api/submit', requireExamSession, async (req, res) => {
   if (code !== session.code) return res.status(403).json({ error: 'code_mismatch' });
 
   const answers = Array.isArray(req.body?.answers) ? req.body.answers : [];
-  const durationSecs = Math.max(10, Math.min(Number(req.body?.durationSecs) || 0, EXAM_DURATION_SECS + 300));
+  const durationSecs = Math.max(10, Math.min(Number(req.body?.durationSecs) || 0, Number(session.durationSecs || EXAM_DURATION_SECS) + 300));
   const tabSwitches = Number(req.body?.tabSwitches) || 0;
   const incidents = Array.isArray(req.body?.incidents) ? req.body.incidents : [];
   const autoSubmit = Boolean(req.body?.autoSubmit);
@@ -1089,6 +1209,10 @@ app.post('/api/submit', requireExamSession, async (req, res) => {
       code,
       questionSetId: session.questionSetId,
       questionSetName: session.questionSetName,
+      examMode: session.examMode || 'GRADED',
+      isPractice: session.examMode === 'PRACTICE',
+      showCorrectAnswers: session.showCorrectAnswers === true,
+      countsTowardResults: session.countsTowardResults !== false,
       score: result.score,
       total: result.total,
       pct: result.pct,
@@ -1114,7 +1238,7 @@ app.post('/api/submit', requireExamSession, async (req, res) => {
     }
 
     appLog('info', 'exam_submitted', { code, score: record.score, pct: record.pct, pass: record.pass });
-    res.json({ ok: true, result: record });
+    res.json({ ok: true, result: sanitizeCandidateResult(record) });
   } catch (err) {
     appLog('error', 'submit_failed', { code, message: err.message });
     res.status(500).json({ error: 'submit_failed', message: err.message });
@@ -1127,7 +1251,7 @@ app.get('/api/result/:code', async (req, res) => {
   try {
     const result = await withDb(async (conn) => getResultRecord(conn, code));
     if (!result) return res.status(404).json({ error: 'not_found' });
-    res.json({ result });
+    res.json({ result: sanitizeCandidateResult(result) });
   } catch (err) {
     appLog('error', 'result_fetch_failed', { code, message: err.message });
     res.status(500).json({ error: 'result_fetch_failed', message: err.message });
@@ -1135,12 +1259,15 @@ app.get('/api/result/:code', async (req, res) => {
 });
 
 app.post('/api/admin/login', (req, res) => {
-  if (!ADMIN_HASH) return res.status(503).json({ ok: false, error: 'admin_not_configured' });
+  if (!ADMIN_HASH && !MANAGER_HASH) return res.status(503).json({ ok: false, error: 'admin_not_configured' });
   const ip = getClientIp(req);
   if (!checkRateLimit(String(ip))) return res.status(429).json({ ok: false, error: 'too_many_attempts' });
 
   const hash = String(req.body?.hash || '').trim().toLowerCase();
-  if (!hash || hash !== ADMIN_HASH) {
+  const role = hash && hash === ADMIN_HASH
+    ? 'admin'
+    : (MANAGER_HASH && hash === MANAGER_HASH ? 'manager' : null);
+  if (!role) {
     void tryWriteAdminAudit({
       action: 'admin_login_failed',
       actor: 'admin',
@@ -1152,17 +1279,18 @@ app.post('/api/admin/login', (req, res) => {
 
   void tryWriteAdminAudit({
     action: 'admin_login_success',
-    actor: 'admin',
+    actor: role,
     clientIp: ip,
-    details: { ok: true }
+    details: { ok: true, role }
   });
-  return res.json({ ok: true, token: createAdminToken() });
+  return res.json({ ok: true, token: createAdminToken(role), role });
 });
 
 app.get('/api/admin/codes', requireAdmin, async (_req, res) => {
   try {
     const payload = await withDb(async (conn) => {
       const hasNotes = await hasNotesColumn(conn);
+      const hasDeletedAt = await hasDeletedAtColumn(conn);
       const [rows, questionSets, examEnabled] = await Promise.all([
         execQuery(
           conn,
@@ -1173,6 +1301,7 @@ app.get('/api/admin/codes', requireAdmin, async (_req, res) => {
              FROM ACCESS_CODES c
              LEFT JOIN QUESTION_SETS qs ON qs.QUESTION_SET_ID = c.QUESTION_SET_ID
              LEFT JOIN EXAM_RESULTS r ON r.ACCESS_CODE = c.ACCESS_CODE
+            ${hasDeletedAt ? 'WHERE c.DELETED_AT IS NULL' : ''}
             ORDER BY c.ACCESS_CODE ASC`
         ),
         getQuestionSetRows(conn, { includeCounts: true }),
@@ -1182,16 +1311,19 @@ app.get('/api/admin/codes', requireAdmin, async (_req, res) => {
     });
     const codes = payload.rows.map((r) => {
       const parsedResult = parseJsonOrNull(r.RESULT_JSON);
+      const countsTowardResults = parsedResult?.countsTowardResults !== false;
       return {
         code: r.ACCESS_CODE,
         label: r.LABEL || '',
         notes: r.NOTES || '',
         status: r.STATUS || 'unused',
-        score: r.SCORE ?? r.RESULT_SCORE ?? parsedResult?.score ?? null,
-        pct: r.PCT ?? r.RESULT_PCT ?? parsedResult?.pct ?? null,
-        pass: r.PASS === null || r.PASS === undefined
-          ? (r.RESULT_PASS === null || r.RESULT_PASS === undefined ? (parsedResult?.pass ?? null) : Boolean(r.RESULT_PASS))
-          : Boolean(r.PASS),
+        score: countsTowardResults ? (r.SCORE ?? r.RESULT_SCORE ?? parsedResult?.score ?? null) : null,
+        pct: countsTowardResults ? (r.PCT ?? r.RESULT_PCT ?? parsedResult?.pct ?? null) : null,
+        pass: countsTowardResults
+          ? (r.PASS === null || r.PASS === undefined
+              ? (r.RESULT_PASS === null || r.RESULT_PASS === undefined ? (parsedResult?.pass ?? null) : Boolean(r.RESULT_PASS))
+              : Boolean(r.PASS))
+          : null,
         durationSecs: r.DURATION_SECS,
         tabSwitches: r.TAB_SWITCHES || 0,
         incidentCount: r.INCIDENT_COUNT || 0,
@@ -1200,13 +1332,17 @@ app.get('/api/admin/codes', requireAdmin, async (_req, res) => {
         questionResults: Array.isArray(parsedResult?.questionResults) ? parsedResult.questionResults : [],
         questionSetId: r.QUESTION_SET_ID == null ? null : Number(r.QUESTION_SET_ID),
         questionSetName: r.QUESTION_SET_NAME || '',
-        questionSetActive: r.QUESTION_SET_ACTIVE == null ? false : Boolean(r.QUESTION_SET_ACTIVE)
+        questionSetActive: r.QUESTION_SET_ACTIVE == null ? false : Boolean(r.QUESTION_SET_ACTIVE),
+        examMode: parsedResult?.examMode || '',
+        isPractice: parsedResult?.examMode === 'PRACTICE' || parsedResult?.isPractice === true,
+        countsTowardResults
       };
     });
     res.json({
       codes,
       questionSets: payload.questionSets,
-      examActive: payload.examEnabled
+      examActive: payload.examEnabled,
+      role: _req.adminRole || 'admin'
     });
   } catch (err) {
     appLog('error', 'admin_codes_failed', { message: err.message });
@@ -1221,9 +1357,10 @@ app.get('/api/admin/system-status', requireAdmin, async (_req, res) => {
       const activeSet = questionSets.find((set) => set.isActive) || questionSets[0] || null;
       const activeQuestionSet = activeSet ? await loadQuestionSet(conn, activeSet.id) : null;
       const hasNotes = await hasNotesColumn(conn);
+      const hasDeletedAt = await hasDeletedAtColumn(conn);
       const auditEnabled = await hasAuditLogTable(conn);
       const examEnabled = await getExamEnabled(conn);
-      const accessCodeRows = await execQuery(conn, 'SELECT COUNT(*) AS CNT FROM ACCESS_CODES');
+      const accessCodeRows = await execQuery(conn, `SELECT COUNT(*) AS CNT FROM ACCESS_CODES ${hasDeletedAt ? 'WHERE DELETED_AT IS NULL' : ''}`);
       const resultRows = await execQuery(conn, 'SELECT COUNT(*) AS CNT FROM EXAM_RESULTS');
       const sessionRows = await execQuery(conn, 'SELECT COUNT(*) AS CNT FROM EXAM_SESSIONS');
       const questionRows = await execQuery(conn, 'SELECT COUNT(*) AS CNT FROM QUESTION_SET_QUESTIONS');
@@ -1261,6 +1398,7 @@ app.get('/api/admin/system-status', requireAdmin, async (_req, res) => {
         notesEnabled: Boolean(hasNotes),
         auditEnabled,
         adminConfigured: Boolean(ADMIN_HASH),
+        managerConfigured: Boolean(MANAGER_HASH),
         warnings: [
           ...(questionSets.length ? [] : ['No question sets found.']),
           ...(activeQuestionSet && activeQuestionSet.totalQuestions > 0 ? [] : ['Active question set has no questions.']),
@@ -1268,7 +1406,8 @@ app.get('/api/admin/system-status', requireAdmin, async (_req, res) => {
           ...(hasNotes ? [] : ['ACCESS_CODES.NOTES column is missing.']),
           ...(staleSessionRows.length ? [`${staleSessionRows.length} active session(s) look stale (${STALE_SESSION_MINUTES}+ min without a save).`] : []),
           ...(auditEnabled ? [] : ['ADMIN_AUDIT_LOG table is missing.']),
-          ...(ADMIN_HASH ? [] : ['ADMIN_HASH is not configured on the server.'])
+          ...(ADMIN_HASH ? [] : ['ADMIN_HASH is not configured on the server.']),
+          ...(MANAGER_HASH ? [] : ['MANAGER_HASH is not configured. Manager role login is disabled until it is added.'])
         ]
       };
     });
@@ -1296,6 +1435,7 @@ app.get('/api/admin/system-status', requireAdmin, async (_req, res) => {
       notesEnabled: false,
       auditEnabled: false,
       adminConfigured: Boolean(ADMIN_HASH),
+      managerConfigured: Boolean(MANAGER_HASH),
       warnings: ['Could not load system status from HANA.'],
       error: 'admin_system_status_failed'
     });
@@ -1331,7 +1471,7 @@ app.get('/api/admin/audit', requireAdmin, async (req, res) => {
   }
 });
 
-app.post('/api/admin/exam-availability', requireAdmin, async (req, res) => {
+app.post('/api/admin/exam-availability', requireAdmin, requireAdminRole('admin'), async (req, res) => {
   const enabled = req.body?.enabled !== false;
   try {
     await withDb(async (conn) => {
@@ -1380,7 +1520,154 @@ app.get('/api/admin/results/:code/review', requireAdmin, async (req, res) => {
   }
 });
 
-app.post('/api/admin/clear-stale-sessions', requireAdmin, async (req, res) => {
+function percentile(values, p) {
+  if (!values.length) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const idx = Math.min(sorted.length - 1, Math.max(0, Math.floor((p / 100) * sorted.length)));
+  return sorted[idx];
+}
+
+app.get('/api/admin/question-sets/:id/analytics', requireAdmin, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid_question_set_id' });
+
+  try {
+    const payload = await withDb(async (conn) => {
+      const questionSet = await loadQuestionSet(conn, id, { allowEmpty: true });
+      const rows = await execQuery(
+        conn,
+        `SELECT r.ACCESS_CODE, r.SCORE, r.TOTAL, r.PCT, r.PASS, r.DURATION_SECS, r.RESULT_JSON, r.SUBMITTED_AT,
+                c.LABEL, c.QUESTION_SET_ID
+           FROM EXAM_RESULTS r
+           LEFT JOIN ACCESS_CODES c ON c.ACCESS_CODE = r.ACCESS_CODE
+          ORDER BY r.SUBMITTED_AT DESC`,
+        []
+      );
+
+      const attempts = rows
+        .map((row) => {
+          const result = parseJsonOrNull(row.RESULT_JSON) || {};
+          const score = Number(row.SCORE ?? result.score);
+          const total = Number(row.TOTAL ?? result.total);
+          const pct = Number(row.PCT ?? result.pct);
+          const durationSecs = Number(row.DURATION_SECS ?? result.durationSecs);
+          return {
+            code: row.ACCESS_CODE,
+            label: row.LABEL || '',
+            questionSetId: Number(row.QUESTION_SET_ID ?? result.questionSetId ?? 0),
+            score: Number.isFinite(score) ? score : null,
+            total: Number.isFinite(total) ? total : null,
+            pct: Number.isFinite(pct) ? pct : null,
+            pass: row.PASS == null ? Boolean(result.pass) : Boolean(row.PASS),
+            durationSecs: Number.isFinite(durationSecs) ? durationSecs : null,
+            examMode: result.examMode || questionSet.examMode || 'GRADED',
+            questionResults: Array.isArray(result.questionResults) ? result.questionResults : [],
+            sectionResults: Array.isArray(result.sectionResults) ? result.sectionResults : [],
+            submittedAt: row.SUBMITTED_AT ? new Date(row.SUBMITTED_AT).toISOString() : result.submittedAt || null
+          };
+        })
+        .filter((attempt) => Number(attempt.questionSetId || 0) === id);
+
+      const completed = attempts.filter((item) => item.score != null && item.total != null && item.pct != null);
+      const pctValues = completed.map((item) => item.pct).filter(Number.isFinite);
+      const durationValues = completed.map((item) => item.durationSecs).filter(Number.isFinite);
+      const avg = (values) => values.length ? Math.round(values.reduce((sum, value) => sum + value, 0) / values.length) : null;
+
+      const questionMap = new Map();
+      const sectionMap = new Map();
+      for (const attempt of attempts) {
+        for (const qr of attempt.questionResults) {
+          const key = qr.questionId != null ? `id:${qr.questionId}` : `idx:${qr.questionIndex}`;
+          if (!questionMap.has(key)) {
+            questionMap.set(key, {
+              questionId: qr.questionId ?? null,
+              questionIndex: qr.questionIndex ?? null,
+              stem: qr.stem || 'Question',
+              sectionName: qr.sectionName || '',
+              answered: 0,
+              correct: 0,
+              wrong: 0
+            });
+          }
+          const item = questionMap.get(key);
+          item.answered += 1;
+          if (qr.correct) item.correct += 1;
+          else item.wrong += 1;
+        }
+        for (const sr of attempt.sectionResults) {
+          const key = sr.sectionId != null ? String(sr.sectionId) : sr.name || 'Section';
+          if (!sectionMap.has(key)) {
+            sectionMap.set(key, {
+              sectionId: sr.sectionId ?? null,
+              name: sr.name || 'Section',
+              correct: 0,
+              total: 0
+            });
+          }
+          const item = sectionMap.get(key);
+          item.correct += Number(sr.correct || 0);
+          item.total += Number(sr.total || 0);
+        }
+      }
+
+      const questionStats = [...questionMap.values()]
+        .map((item) => ({
+          ...item,
+          pctCorrect: item.answered ? Math.round((item.correct / item.answered) * 100) : null
+        }))
+        .filter((item) => item.answered > 0);
+
+      const sectionStats = [...sectionMap.values()]
+        .map((item) => ({
+          ...item,
+          wrong: Math.max(0, item.total - item.correct),
+          pctCorrect: item.total ? Math.round((item.correct / item.total) * 100) : null
+        }))
+        .sort((a, b) => String(a.name).localeCompare(String(b.name)));
+
+      return {
+        questionSet: {
+          id: questionSet.id,
+          name: questionSet.name,
+          examMode: questionSet.examMode,
+          isPractice: questionSet.examMode === 'PRACTICE',
+          questionCount: questionSet.totalQuestions
+        },
+        summary: {
+          attempts: attempts.length,
+          completed: completed.length,
+          gradedAttempts: attempts.filter((item) => item.examMode !== 'PRACTICE').length,
+          practiceAttempts: attempts.filter((item) => item.examMode === 'PRACTICE').length,
+          averageScore: completed.length ? Number((completed.reduce((sum, item) => sum + item.score, 0) / completed.length).toFixed(1)) : null,
+          averagePct: avg(pctValues),
+          passRate: completed.length ? Math.round((completed.filter((item) => item.pass).length / completed.length) * 100) : null,
+          averageDurationSecs: avg(durationValues),
+          medianDurationSecs: percentile(durationValues, 50)
+        },
+        hardestQuestions: [...questionStats].sort((a, b) => a.pctCorrect - b.pctCorrect).slice(0, 10),
+        easiestQuestions: [...questionStats].sort((a, b) => b.pctCorrect - a.pctCorrect).slice(0, 10),
+        sectionStats,
+        recentAttempts: attempts.slice(0, 20).map((item) => ({
+          code: item.code,
+          label: item.label,
+          score: item.score,
+          total: item.total,
+          pct: item.pct,
+          pass: item.pass,
+          durationSecs: item.durationSecs,
+          examMode: item.examMode,
+          submittedAt: item.submittedAt
+        }))
+      };
+    });
+    res.json({ ok: true, ...payload });
+  } catch (err) {
+    appLog('error', 'admin_question_set_analytics_failed', { id, message: err.message });
+    res.status(500).json({ error: 'admin_question_set_analytics_failed', message: err.message });
+  }
+});
+
+app.post('/api/admin/clear-stale-sessions', requireAdmin, requireAdminRole('admin'), async (req, res) => {
   try {
     const payload = await withDb(async (conn) => {
       const staleRows = await execQuery(
@@ -1446,7 +1733,7 @@ app.post('/api/admin/note', requireAdmin, async (req, res) => {
       await writeAdminAudit(conn, {
         action: 'admin_note_saved',
         targetCode: code,
-        actor: 'admin',
+        actor: req.adminRole || 'admin',
         clientIp: getClientIp(req),
         details: { noteLength: notes.length }
       });
@@ -1458,7 +1745,7 @@ app.post('/api/admin/note', requireAdmin, async (req, res) => {
   }
 });
 
-app.post('/api/admin/reset', requireAdmin, async (req, res) => {
+app.post('/api/admin/reset', requireAdmin, requireAdminRole('admin'), async (req, res) => {
   const code = String(req.body?.code || '').trim().toUpperCase();
   if (!/^[A-Z2-9]{6}$/.test(code)) return res.status(400).json({ error: 'invalid_code' });
 
@@ -1485,7 +1772,7 @@ app.post('/api/admin/reset', requireAdmin, async (req, res) => {
   }
 });
 
-app.delete('/api/admin/codes/:code', requireAdmin, async (req, res) => {
+app.delete('/api/admin/codes/:code', requireAdmin, requireAdminRole('admin'), async (req, res) => {
   const code = String(req.params.code || '').trim().toUpperCase();
   if (!/^[A-Z2-9]{6}$/.test(code)) return res.status(400).json({ error: 'invalid_code' });
 
@@ -1493,9 +1780,23 @@ app.delete('/api/admin/codes/:code', requireAdmin, async (req, res) => {
     await withDb(async (conn) => {
       const codeRow = await getCodeRow(conn, code);
       if (!codeRow) throw new Error('code_not_found');
+      const hasDeletedAt = await hasDeletedAtColumn(conn);
       await deleteSession(conn, code);
-      await execQuery(conn, 'DELETE FROM EXAM_RESULTS WHERE ACCESS_CODE = ?', [code]);
-      await execQuery(conn, 'DELETE FROM ACCESS_CODES WHERE ACCESS_CODE = ?', [code]);
+      if (hasDeletedAt) {
+        await execQuery(
+          conn,
+          `UPDATE ACCESS_CODES
+              SET STATUS = 'deleted',
+                  DELETED_AT = CURRENT_UTCTIMESTAMP,
+                  DELETED_BY = ?,
+                  UPDATED_AT = CURRENT_UTCTIMESTAMP
+            WHERE ACCESS_CODE = ?`,
+          [req.adminRole || 'admin', code]
+        );
+      } else {
+        await execQuery(conn, 'DELETE FROM EXAM_RESULTS WHERE ACCESS_CODE = ?', [code]);
+        await execQuery(conn, 'DELETE FROM ACCESS_CODES WHERE ACCESS_CODE = ?', [code]);
+      }
       await writeAdminAudit(conn, {
         action: 'admin_code_deleted',
         targetCode: code,
@@ -1514,6 +1815,62 @@ app.delete('/api/admin/codes/:code', requireAdmin, async (req, res) => {
   }
 });
 
+app.post('/api/admin/codes/bulk-delete', requireAdmin, requireAdminRole('admin'), async (req, res) => {
+  const codes = Array.isArray(req.body?.codes)
+    ? [...new Set(req.body.codes.map((code) => String(code || '').trim().toUpperCase()).filter((code) => /^[A-Z2-9]{6}$/.test(code)))]
+    : [];
+  if (!codes.length) return res.status(400).json({ error: 'codes_required' });
+  if (codes.length > 500) return res.status(400).json({ error: 'too_many_codes' });
+
+  try {
+    const payload = await withDb(async (conn) => {
+      const hasDeletedAt = await hasDeletedAtColumn(conn);
+      const deleted = [];
+      const notFound = [];
+      const summary = { unused: 0, active: 0, completed: 0, other: 0 };
+      for (const code of codes) {
+        const codeRow = await getCodeRow(conn, code);
+        if (!codeRow) {
+          notFound.push(code);
+          continue;
+        }
+        summary[summary[codeRow.status] == null ? 'other' : codeRow.status] += 1;
+        await deleteSession(conn, code);
+        if (hasDeletedAt) {
+          await execQuery(
+            conn,
+            `UPDATE ACCESS_CODES
+                SET STATUS = 'deleted',
+                    DELETED_AT = CURRENT_UTCTIMESTAMP,
+                    DELETED_BY = ?,
+                    UPDATED_AT = CURRENT_UTCTIMESTAMP
+              WHERE ACCESS_CODE = ?`,
+            [req.adminRole || 'admin', code]
+          );
+        } else {
+          await execQuery(conn, 'DELETE FROM EXAM_RESULTS WHERE ACCESS_CODE = ?', [code]);
+          await execQuery(conn, 'DELETE FROM ACCESS_CODES WHERE ACCESS_CODE = ?', [code]);
+        }
+        deleted.push(code);
+      }
+      await writeAdminAudit(conn, {
+        action: 'admin_codes_bulk_deleted',
+        actor: req.adminRole || 'admin',
+        clientIp: getClientIp(req),
+        details: { count: deleted.length, summary, codes: deleted.slice(0, 50), notFound: notFound.slice(0, 50) }
+      });
+      return { ok: true, deletedCount: deleted.length, deleted, notFound, summary };
+    });
+    for (const [token, value] of _examSessions.entries()) {
+      if (payload.deleted.includes(value.code)) _examSessions.delete(token);
+    }
+    res.json(payload);
+  } catch (err) {
+    appLog('error', 'admin_bulk_delete_codes_failed', { message: err.message });
+    res.status(500).json({ error: 'admin_bulk_delete_codes_failed' });
+  }
+});
+
 app.post('/api/admin/generate', requireAdmin, async (req, res) => {
   const count = Math.min(Math.max(Number(req.body?.count) || 10, 1), 200);
   const chars = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
@@ -1521,9 +1878,11 @@ app.post('/api/admin/generate', requireAdmin, async (req, res) => {
   try {
     const added = await withDb(async (conn) => {
       const hasNotes = await hasNotesColumn(conn);
+      const hasDeletedAt = await hasDeletedAtColumn(conn);
       const existingRows = await execQuery(conn, 'SELECT ACCESS_CODE FROM ACCESS_CODES');
+      const activeRows = hasDeletedAt ? await execQuery(conn, 'SELECT ACCESS_CODE FROM ACCESS_CODES WHERE DELETED_AT IS NULL') : existingRows;
       const used = new Set(existingRows.map((r) => r.ACCESS_CODE));
-      const seatBase = existingRows.length + 1;
+      const seatBase = activeRows.length + 1;
       const created = [];
 
       while (created.length < count) {
@@ -1548,7 +1907,7 @@ app.post('/api/admin/generate', requireAdmin, async (req, res) => {
       }
       await writeAdminAudit(conn, {
         action: 'admin_codes_generated',
-        actor: 'admin',
+        actor: req.adminRole || 'admin',
         clientIp: getClientIp(req),
         details: { count: created.length, firstCode: created[0] || null, lastCode: created[created.length - 1] || null }
       });
@@ -1562,7 +1921,7 @@ app.post('/api/admin/generate', requireAdmin, async (req, res) => {
   }
 });
 
-app.post('/api/admin/results/repair-summaries', requireAdmin, async (req, res) => {
+app.post('/api/admin/results/repair-summaries', requireAdmin, requireAdminRole('admin'), async (req, res) => {
   try {
     const payload = await withDb(async (conn) => {
       const rows = await execQuery(conn, 'SELECT ACCESS_CODE, RESULT_JSON FROM EXAM_RESULTS');
@@ -1571,6 +1930,10 @@ app.post('/api/admin/results/repair-summaries', requireAdmin, async (req, res) =
       for (const row of rows) {
         const result = parseJsonOrNull(row.RESULT_JSON);
         if (!result || typeof result.score !== 'number' || typeof result.pct !== 'number') {
+          skipped += 1;
+          continue;
+        }
+        if (result.countsTowardResults === false) {
           skipped += 1;
           continue;
         }
@@ -1592,7 +1955,7 @@ app.post('/api/admin/results/repair-summaries', requireAdmin, async (req, res) =
   }
 });
 
-app.post('/api/admin/results/clear-summaries', requireAdmin, async (req, res) => {
+app.post('/api/admin/results/clear-summaries', requireAdmin, requireAdminRole('admin'), async (req, res) => {
   try {
     await withDb(async (conn) => {
       await execQuery(conn, 'UPDATE ACCESS_CODES SET SCORE = NULL, PCT = NULL, PASS = NULL, UPDATED_AT = CURRENT_UTCTIMESTAMP');
@@ -1661,7 +2024,7 @@ app.get('/api/admin/question-sets', requireAdmin, async (_req, res) => {
   }
 });
 
-app.post('/api/admin/question-sets', requireAdmin, async (req, res) => {
+app.post('/api/admin/question-sets', requireAdmin, requireAdminRole('admin'), async (req, res) => {
   const name = String(req.body?.name || '').trim();
   const description = String(req.body?.description || '').trim();
   if (!name) return res.status(400).json({ error: 'name_required' });
@@ -1698,7 +2061,7 @@ app.post('/api/admin/question-sets', requireAdmin, async (req, res) => {
   }
 });
 
-app.post('/api/admin/question-sets/:id/config', requireAdmin, async (req, res) => {
+app.post('/api/admin/question-sets/:id/config', requireAdmin, requireAdminRole('admin'), async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid_question_set_id' });
   const name = String(req.body?.name || '').trim();
@@ -1706,31 +2069,53 @@ app.post('/api/admin/question-sets/:id/config', requireAdmin, async (req, res) =
   const durationMinutes = Math.max(1, Math.min(Number(req.body?.durationMinutes) || 45, 240));
   const passPct = Math.max(1, Math.min(Number(req.body?.passPct) || 80, 100));
   const proctorEnabled = req.body?.proctorEnabled !== false;
+  const examMode = String(req.body?.examMode || 'GRADED').toUpperCase() === 'PRACTICE' ? 'PRACTICE' : 'GRADED';
+  const showCorrectAnswers = examMode === 'PRACTICE' && req.body?.showCorrectAnswers !== false;
+  const countsTowardResults = examMode === 'PRACTICE' ? false : req.body?.countsTowardResults !== false;
   const numQuestionsRaw = req.body?.numQuestions;
   const numQuestions = numQuestionsRaw == null || numQuestionsRaw === '' ? null : Math.max(1, Number(numQuestionsRaw));
   if (!name) return res.status(400).json({ error: 'name_required' });
 
   try {
     await withDb(async (conn) => {
-      await execQuery(
-        conn,
-        `UPDATE QUESTION_SETS
-            SET NAME = ?,
-                DESCRIPTION = ?,
-                DURATION_MINUTES = ?,
-                PASS_PCT = ?,
-                PROCTOR_ENABLED = ?,
-                NUM_QUESTIONS = ?,
-                UPDATED_AT = CURRENT_UTCTIMESTAMP
-          WHERE QUESTION_SET_ID = ?`,
-        [name, description || null, durationMinutes, passPct, proctorEnabled ? 1 : 0, numQuestions, id]
-      );
+      if (await hasQuestionSetModeColumns(conn)) {
+        await execQuery(
+          conn,
+          `UPDATE QUESTION_SETS
+              SET NAME = ?,
+                  DESCRIPTION = ?,
+                  DURATION_MINUTES = ?,
+                  PASS_PCT = ?,
+                  PROCTOR_ENABLED = ?,
+                  EXAM_MODE = ?,
+                  SHOW_CORRECT_ANSWERS = ?,
+                  COUNTS_TOWARD_RESULTS = ?,
+                  NUM_QUESTIONS = ?,
+                  UPDATED_AT = CURRENT_UTCTIMESTAMP
+            WHERE QUESTION_SET_ID = ?`,
+          [name, description || null, durationMinutes, passPct, proctorEnabled ? 1 : 0, examMode, showCorrectAnswers ? 1 : 0, countsTowardResults ? 1 : 0, numQuestions, id]
+        );
+      } else {
+        await execQuery(
+          conn,
+          `UPDATE QUESTION_SETS
+              SET NAME = ?,
+                  DESCRIPTION = ?,
+                  DURATION_MINUTES = ?,
+                  PASS_PCT = ?,
+                  PROCTOR_ENABLED = ?,
+                  NUM_QUESTIONS = ?,
+                  UPDATED_AT = CURRENT_UTCTIMESTAMP
+            WHERE QUESTION_SET_ID = ?`,
+          [name, description || null, durationMinutes, passPct, proctorEnabled ? 1 : 0, numQuestions, id]
+        );
+      }
       clearQuestionSetCache(id);
       await writeAdminAudit(conn, {
         action: 'admin_question_set_config_updated',
         actor: 'admin',
         clientIp: getClientIp(req),
-        details: { questionSetId: id, name, durationMinutes, passPct, proctorEnabled, numQuestions }
+        details: { questionSetId: id, name, durationMinutes, passPct, proctorEnabled, examMode, showCorrectAnswers, countsTowardResults, numQuestions }
       });
     });
     res.json({ ok: true });
@@ -1739,7 +2124,7 @@ app.post('/api/admin/question-sets/:id/config', requireAdmin, async (req, res) =
   }
 });
 
-app.post('/api/admin/question-sets/:id/activate', requireAdmin, async (req, res) => {
+app.post('/api/admin/question-sets/:id/activate', requireAdmin, requireAdminRole('admin'), async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid_question_set_id' });
 
@@ -1765,7 +2150,7 @@ app.post('/api/admin/question-sets/:id/activate', requireAdmin, async (req, res)
   }
 });
 
-app.delete('/api/admin/question-sets/:id', requireAdmin, async (req, res) => {
+app.delete('/api/admin/question-sets/:id', requireAdmin, requireAdminRole('admin'), async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid_question_set_id' });
 
@@ -1804,7 +2189,14 @@ app.get('/api/admin/question-sets/:id/questions', requireAdmin, async (req, res)
           id: questionSet.id,
           name: questionSet.name,
           description: questionSet.description,
-          isActive: questionSet.isActive
+          isActive: questionSet.isActive,
+          examMode: questionSet.examMode,
+          showCorrectAnswers: questionSet.showCorrectAnswers,
+          countsTowardResults: questionSet.countsTowardResults,
+          proctorEnabled: questionSet.proctorEnabled,
+          durationMinutes: questionSet.durationMinutes,
+          passPct: questionSet.passPct,
+          numQuestions: questionSet.numQuestions
         },
         questions: questionSet.questions.map((question) => ({
           id: question.questionId,
@@ -1824,7 +2216,7 @@ app.get('/api/admin/question-sets/:id/questions', requireAdmin, async (req, res)
   }
 });
 
-app.post('/api/admin/question-sets/:setId/questions', requireAdmin, async (req, res) => {
+app.post('/api/admin/question-sets/:setId/questions', requireAdmin, requireAdminRole('admin'), async (req, res) => {
   const setId = Number(req.params.setId);
   if (!Number.isInteger(setId)) return res.status(400).json({ error: 'invalid_question_set_id' });
 
@@ -1889,7 +2281,7 @@ app.post('/api/admin/question-sets/:setId/questions', requireAdmin, async (req, 
   }
 });
 
-app.delete('/api/admin/question-sets/:setId/questions/:questionId', requireAdmin, async (req, res) => {
+app.delete('/api/admin/question-sets/:setId/questions/:questionId', requireAdmin, requireAdminRole('admin'), async (req, res) => {
   const setId = Number(req.params.setId);
   const questionId = Number(req.params.questionId);
   if (!Number.isInteger(setId) || !Number.isInteger(questionId)) return res.status(400).json({ error: 'invalid_identifier' });
@@ -1944,7 +2336,7 @@ app.get('/api/admin/question-sets/:setId/sections', requireAdmin, async (req, re
   }
 });
 
-app.post('/api/admin/question-sets/:setId/sections', requireAdmin, async (req, res) => {
+app.post('/api/admin/question-sets/:setId/sections', requireAdmin, requireAdminRole('admin'), async (req, res) => {
   const setId = Number(req.params.setId);
   if (!Number.isInteger(setId)) return res.status(400).json({ error: 'invalid_question_set_id' });
 
@@ -1989,7 +2381,7 @@ app.post('/api/admin/question-sets/:setId/sections', requireAdmin, async (req, r
   }
 });
 
-app.delete('/api/admin/question-sets/:setId/sections/:sectionId', requireAdmin, async (req, res) => {
+app.delete('/api/admin/question-sets/:setId/sections/:sectionId', requireAdmin, requireAdminRole('admin'), async (req, res) => {
   const setId = Number(req.params.setId);
   const sectionId = Number(req.params.sectionId);
   if (!Number.isInteger(setId) || !Number.isInteger(sectionId)) return res.status(400).json({ error: 'invalid_identifier' });
@@ -2012,7 +2404,7 @@ app.delete('/api/admin/question-sets/:setId/sections/:sectionId', requireAdmin, 
   }
 });
 
-app.post('/api/admin/question-sets/upload', requireAdmin, async (req, res) => {
+app.post('/api/admin/question-sets/upload', requireAdmin, requireAdminRole('admin'), async (req, res) => {
   const name = String(req.body?.name || '').trim();
   const description = String(req.body?.description || '').trim();
   const questions = Array.isArray(req.body?.questions) ? req.body.questions : [];
@@ -2076,30 +2468,36 @@ app.get('/api/admin/export.csv', requireAdmin, async (_req, res) => {
   try {
     const rows = await withDb(async (conn) => {
       const hasNotes = await hasNotesColumn(conn);
+      const hasDeletedAt = await hasDeletedAtColumn(conn);
       return execQuery(
         conn,
         `SELECT c.ACCESS_CODE, c.LABEL, ${hasNotes ? 'c.NOTES,' : `'' AS NOTES,`} c.STATUS,
                 qs.NAME AS QUESTION_SET_NAME,
-                r.SCORE, r.PCT, r.PASS, r.DURATION_SECS, r.TAB_SWITCHES, r.INCIDENT_COUNT, r.SUBMITTED_AT
+                r.SCORE, r.PCT, r.PASS, r.DURATION_SECS, r.TAB_SWITCHES, r.INCIDENT_COUNT, r.SUBMITTED_AT, r.RESULT_JSON
            FROM ACCESS_CODES c
            LEFT JOIN QUESTION_SETS qs ON qs.QUESTION_SET_ID = c.QUESTION_SET_ID
            LEFT JOIN EXAM_RESULTS r ON r.ACCESS_CODE = c.ACCESS_CODE
+          ${hasDeletedAt ? 'WHERE c.DELETED_AT IS NULL' : ''}
           ORDER BY c.ACCESS_CODE ASC`
       );
     });
 
-    const lines = ['Code,Seat,Notes,QuestionSet,Status,Score,Pct,Result,Duration,TabSwitches,Incidents,SubmittedAt'];
+    const lines = ['Code,Seat,Notes,QuestionSet,Mode,Status,Score,Pct,Result,Duration,TabSwitches,Incidents,SubmittedAt'];
     for (const r of rows) {
-      const resultLabel = r.PASS === null || r.PASS === undefined ? '' : (r.PASS ? 'PASS' : 'FAIL');
+      const parsedResult = parseJsonOrNull(r.RESULT_JSON);
+      const countsTowardResults = parsedResult?.countsTowardResults !== false;
+      const mode = parsedResult?.examMode === 'PRACTICE' ? 'Practice' : 'Graded';
+      const resultLabel = !countsTowardResults || r.PASS === null || r.PASS === undefined ? '' : (r.PASS ? 'PASS' : 'FAIL');
       const duration = r.DURATION_SECS == null ? '' : `${Math.floor(r.DURATION_SECS / 60)}m ${String(r.DURATION_SECS % 60).padStart(2, '0')}s`;
       lines.push([
         toCsvCell(r.ACCESS_CODE),
         toCsvCell(r.LABEL || ''),
         toCsvCell(r.NOTES || ''),
         toCsvCell(r.QUESTION_SET_NAME || ''),
+        toCsvCell(mode),
         toCsvCell(r.STATUS || ''),
-        toCsvCell(r.SCORE ?? ''),
-        toCsvCell(r.PCT == null ? '' : `${r.PCT}%`),
+        toCsvCell(countsTowardResults ? (r.SCORE ?? '') : ''),
+        toCsvCell(countsTowardResults ? (r.PCT == null ? '' : `${r.PCT}%`) : ''),
         toCsvCell(resultLabel),
         toCsvCell(duration),
         toCsvCell(r.TAB_SWITCHES ?? ''),
