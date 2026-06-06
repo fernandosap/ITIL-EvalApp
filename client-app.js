@@ -10,6 +10,8 @@ let _adminSystemStatus = null;
 let _adminAuditEntries = [];
 let _adminQuestionSets = [];
 let _activeQuestionSet = null;
+let _adminNotifications = [];
+let _adminOverview = null;
 const API_TIMEOUT_MS = 12000;
 const API_BASE_RETRY_MS = 600;
 const SAVE_UI = { cls: 'save-pill', text: 'Saved' };
@@ -47,6 +49,14 @@ let _blurTime = null;
 let _progressSaveTimer = null;
 let _adminRows = [];
 let _selectedCodes = new Set();
+let _uploadPreview = null;
+let _exportFilters = {
+  questionSetId: '',
+  status: '',
+  mode: '',
+  dateFrom: '',
+  dateTo: ''
+};
 
 function $(id) { return document.getElementById(id); }
 function render(html) { $('app').innerHTML = html; }
@@ -68,8 +78,73 @@ function durationLabel(totalSecs) {
   const s = totalSecs % 60;
   return `${m}m ${String(s).padStart(2, '0')}s`;
 }
+function brandLockup(title, subtitle = 'Academy assessment workspace') {
+  return `<div class="brand-hero">
+    <div class="brand-lockup">
+      <div class="brand-grid" aria-hidden="true">
+        <span class="brand-grid-mark"></span>
+        <span class="brand-grid-mark"></span>
+        <span class="brand-grid-mark"></span>
+        <span class="brand-grid-mark"></span>
+      </div>
+      <div class="brand-copy">
+        <div class="brand-eyebrow">Academy Exam App</div>
+        <div class="brand-title">${_esc(title)}</div>
+        <div class="brand-subtitle">${_esc(subtitle)}</div>
+      </div>
+    </div>
+  </div>`;
+}
+function normalizeExamTitle(value) {
+  const text = String(value || '').trim();
+  if (!text) return 'Academy Exam App';
+  if (/^ITIL\b/i.test(text)) return 'Academy Exam App';
+  if (/\bSAP\s+Basis\s+Exam\b/i.test(text)) return 'Academy Exam Platform';
+  if (/\bBasis\s+Exam\b/i.test(text)) return 'Academy Exam Platform';
+  return text;
+}
+function roleCan(permission) {
+  const role = String(_adminRole || 'admin');
+  const perms = {
+    admin: ['*'],
+    manager: ['dashboard:read', 'codes:read', 'codes:generate', 'codes:assign', 'codes:note', 'results:read', 'results:export', 'analytics:read', 'audit:read', 'notifications:read', 'sessions:read'],
+    reviewer: ['dashboard:read', 'codes:read', 'results:read', 'results:export', 'analytics:read', 'audit:read', 'audit:export', 'notifications:read', 'compliance:read'],
+    content_editor: ['dashboard:read', 'codes:read', 'analytics:read', 'notifications:read', 'content:read', 'content:write', 'content:publish', 'imports:write', 'imports:rollback', 'results:export']
+  };
+  const set = perms[role] || [];
+  return set.includes('*') || set.includes(permission);
+}
+function pendingKey(code) {
+  return `academy_exam_pending_${String(code || '').trim().toUpperCase()}`;
+}
+function readPendingState(code) {
+  try {
+    return JSON.parse(localStorage.getItem(pendingKey(code)) || 'null') || { progress: null, submit: null };
+  } catch (_e) {
+    return { progress: null, submit: null };
+  }
+}
+function writePendingState(code, state) {
+  localStorage.setItem(pendingKey(code), JSON.stringify(state || { progress: null, submit: null }));
+}
+function clearPendingState(code) {
+  localStorage.removeItem(pendingKey(code));
+}
+function queuePendingAction(code, type, payload) {
+  const state = readPendingState(code);
+  if (type === 'progress') state.progress = payload;
+  if (type === 'submit') state.submit = payload;
+  writePendingState(code, state);
+}
 function logIncident(type, detail) {
   S.incidents.push({ time: new Date().toLocaleTimeString(), type, detail });
+}
+function isOnline() {
+  return navigator.onLine !== false;
+}
+function connectivityBanner() {
+  if (isOnline()) return '';
+  return `<div class="offline-banner" role="status" aria-live="polite">Offline. Answers stay local until connection returns.</div>`;
 }
 function proctorEnabled() {
   return S.proctorOn !== false;
@@ -86,6 +161,7 @@ function setSavePill(cls, text) {
 function markSaveStart() { setSavePill('save-pill saving', 'Saving...'); }
 function markRetry(attempt) { setSavePill('save-pill retry', `Retry ${attempt}`); }
 function markSaveDone(ok) { setSavePill(ok ? 'save-pill' : 'save-pill error', ok ? 'Saved' : 'Save failed'); }
+function markOfflineSave() { setSavePill('save-pill error', 'Offline'); }
 
 async function _sha256(str) {
   const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
@@ -117,7 +193,23 @@ async function apiFetch(url, opts = {}, cfg = {}) {
       const resp = await fetch(url, { ...opts, headers, signal: controller.signal });
       clearTimeout(timer);
       if (!resp.ok) {
-        const e = new Error(`HTTP ${resp.status}`);
+        let detail = `HTTP ${resp.status}`;
+        try {
+          const ct = (resp.headers.get('content-type') || '').toLowerCase();
+          if (ct.includes('application/json')) {
+            const body = await resp.json();
+            detail = body?.message
+              || (Array.isArray(body?.errors) && body.errors.length ? body.errors[0] : null)
+              || body?.error
+              || detail;
+          } else {
+            const text = await resp.text();
+            if (text) detail = text;
+          }
+        } catch (_e) {
+          // ignore parse failure
+        }
+        const e = new Error(detail);
         e.status = resp.status;
         throw e;
       }
@@ -179,15 +271,71 @@ function serializeProgress() {
   };
 }
 
+function buildSubmitPayload(autoSubmit) {
+  return {
+    code: S.code,
+    answers: S.answers,
+    durationSecs: Math.round((S.elapsed + (S.startTime ? (Date.now() - S.startTime) : 0)) / 1000),
+    tabSwitches: S.tabSwitches,
+    incidents: S.incidents,
+    autoSubmit
+  };
+}
+
+async function replayPendingActions() {
+  if (!S.code || !S.examToken || !isOnline()) return false;
+  const state = readPendingState(S.code);
+  if (!state.progress && !state.submit) return false;
+  if (state.progress) {
+    try {
+      await apiJson('/api/progress', {
+        method: 'POST',
+        body: JSON.stringify(state.progress)
+      }, { isSave: true, timeoutMs: 9000, retries: 1 });
+      state.progress = null;
+      writePendingState(S.code, state);
+    } catch (_e) {
+      markOfflineSave();
+      return false;
+    }
+  }
+  if (state.submit) {
+    try {
+      const data = await apiJson('/api/submit', {
+        method: 'POST',
+        body: JSON.stringify(state.submit)
+      }, { timeoutMs: 15000, retries: 1 });
+      if (data && data.ok && data.result) {
+        clearPendingState(S.code);
+        showResultsFromRecord(data.result);
+        return true;
+      }
+    } catch (_e) {
+      markOfflineSave();
+      return false;
+    }
+  }
+  return false;
+}
+
 async function saveProgress() {
   if (S.screen !== 'exam' || S.submitted || !S.code || !S.examToken) return;
+  const payload = { code: S.code, ...serializeProgress() };
+  if (!isOnline()) {
+    queuePendingAction(S.code, 'progress', payload);
+    markOfflineSave();
+    return;
+  }
   try {
     await apiJson('/api/progress', {
       method: 'POST',
-      body: JSON.stringify({ code: S.code, ...serializeProgress() })
+      body: JSON.stringify(payload)
     }, { isSave: true, timeoutMs: 9000, retries: 1 });
+    const state = readPendingState(S.code);
+    state.progress = null;
+    writePendingState(S.code, state);
   } catch (_e) {
-    // save pill already reflects issue
+    queuePendingAction(S.code, 'progress', payload);
   }
 }
 
@@ -209,18 +357,35 @@ async function showCodeEntry() {
   S.examToken = null;
   document.body.classList.remove('exam-bg');
   const status = await fetchStatus();
-  const examName = status?.examName || 'ITIL 4 Foundation';
-  const examActive = status?.examActive !== false;
+  const statusLoaded = Boolean(status && !status.error);
+  const examName = normalizeExamTitle(status?.examName || 'Academy Exam App');
+  const examActive = statusLoaded && status?.examActive !== false;
 
-  const logoBlock = `<div style="text-align:center;margin:40px 0 28px">
-    <div style="display:inline-block;background:#1F3864;border-radius:12px;padding:18px 36px;box-shadow:0 6px 28px rgba(0,0,0,0.35)">
-      <div style="font-size:11px;letter-spacing:3px;color:rgba(255,255,255,0.75);text-transform:uppercase;margin-bottom:8px">SAP Academy for Cloud Delivery</div>
-      <div style="font-size:28px;font-weight:800;color:white;letter-spacing:1px">${_esc(examName)}</div>
-    </div>
-  </div>`;
+  const logoBlock = brandLockup(
+    examName,
+    !statusLoaded
+      ? 'Service connection unavailable'
+      : examActive
+        ? 'Secure exam delivery and practice flow'
+        : 'Exam access temporarily paused'
+  );
+
+  if (!statusLoaded) {
+    render(`<div class="screen" style="max-width:480px">${logoBlock}
+      ${connectivityBanner()}
+      <div class="glass-card" style="text-align:center">
+        <div style="font-size:48px;margin-bottom:12px">⚠️</div>
+        <h2 style="margin-bottom:8px">Service Unavailable</h2>
+        <p style="color:#666;font-size:14px;margin-bottom:8px">The exam service could not be reached or is not fully configured.</p>
+        <p style="color:#999;font-size:13px">Please try again shortly or contact your proctor or administrator.</p>
+      </div>
+    </div>`);
+    return;
+  }
 
   if (!examActive) {
     render(`<div class="screen" style="max-width:480px">${logoBlock}
+      ${connectivityBanner()}
       <div class="glass-card" style="text-align:center">
         <div style="font-size:48px;margin-bottom:12px">🔒</div>
         <h2 style="margin-bottom:8px">Exam Closed</h2>
@@ -233,6 +398,7 @@ async function showCodeEntry() {
 
   render(`<div class="screen" style="max-width:480px">
     ${logoBlock}
+    ${connectivityBanner()}
     <div class="glass-card">
       <h2>Enter Your Access Code</h2>
       <p style="color:#666;font-size:14px;margin-bottom:20px">Enter the 6-character code provided to you by your proctor. The code is case-insensitive.</p>
@@ -296,6 +462,7 @@ async function handleCodeSubmit() {
   S.showCorrectAnswers = data.showCorrectAnswers === true;
 
   if (data.status === 'completed' && data.result) {
+    clearPendingState(raw);
     showResultsFromRecord(data.result);
     return;
   }
@@ -511,6 +678,7 @@ async function startExam() {
   setupSecurity();
   startTimer();
   startProctor();
+  if (await replayPendingActions()) return;
   await renderQ();
 }
 
@@ -552,20 +720,30 @@ async function renderQ() {
     if (i === S.currentQ) cls += ' current';
     else if (a.length > 0) cls += ' answered';
     else if (vis) cls += ' skipped';
-    return `<div class="${cls}" onclick="goToQ(${i})" title="Q${i + 1}"></div>`;
+    return `<button type="button" class="${cls}" onclick="goToQ(${i})" title="Question ${i + 1}" aria-label="Go to question ${i + 1}" ${i === S.currentQ ? 'aria-current="step"' : ''}>${i + 1}</button>`;
   }).join('');
 
-  render(`<div class="no-select" style="min-height:100vh;display:flex;flex-direction:column">
+  render(`<div class="no-select exam-shell" style="min-height:100vh;display:flex;flex-direction:column">
     <div class="exam-header">
+      <div class="header-brand">
+        <div class="brand-chip">
+          <span class="brand-chip-mark" aria-hidden="true"><i></i></span>
+          <span class="brand-chip-text">
+            <span class="brand-chip-name">Academy Exam App</span>
+            <span class="brand-chip-sub">${S.isPractice ? 'Practice Knowledge Check' : 'Secure Exam Session'}</span>
+          </span>
+        </div>
+      </div>
       <div class="header-info">
-        <span class="header-title">SAP Academy for Cloud Delivery · ${S.isPractice ? 'Practice Knowledge Check' : 'Secure Exam'}</span>
+        <span class="header-title">Academy assessment flow</span>
         <span class="header-code">CODE: ${_esc(S.code)}</span>
       </div>
       <div style="display:flex;align-items:center;gap:8px">
-        <div id="save-pill" class="${SAVE_UI.cls}">${_esc(SAVE_UI.text)}</div>
-        <div id="timer" class="timer">--:--</div>
+        <div id="save-pill" class="${SAVE_UI.cls}" role="status" aria-live="polite">${_esc(SAVE_UI.text)}</div>
+        <div id="timer" class="timer" role="status" aria-live="polite" aria-label="Time remaining">--:--</div>
       </div>
     </div>
+    ${connectivityBanner()}
     <div style="background:white;padding:8px 20px;border-bottom:1px solid #e0e6f0">
       <div style="display:flex;justify-content:space-between;font-size:12px;color:#777;margin-bottom:5px">
         <span><strong>Q${S.currentQ + 1}</strong> of ${S.total} · <span style="color:${answered === S.total ? '#1a5c1a' : '#c55a11'}">${answered}/${S.total} answered</span></span>
@@ -573,7 +751,7 @@ async function renderQ() {
       </div>
       <div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>
       <div class="nav-dots">${dots}</div>
-      <div style="font-size:10px;color:#bbb;text-align:center;margin-top:3px">Tap any dot to jump · answered / skipped / not visited</div>
+      <div class="nav-help">Tap any bubble to jump · answered / skipped / not visited · ←/→ moves · 1-9 jumps</div>
     </div>
     <div style="flex:1;overflow-y:auto;padding:18px 16px 80px">
       <div style="max-width:720px;margin:0 auto">
@@ -749,6 +927,8 @@ document.addEventListener('selectstart', (e) => {
 });
 document.addEventListener('keydown', (e) => {
   if (S.screen !== 'exam') return;
+  const activeTag = String(document.activeElement?.tagName || '').toUpperCase();
+  const inTextField = activeTag === 'INPUT' || activeTag === 'TEXTAREA' || document.activeElement?.isContentEditable;
   if (e.key === 'F12' || (e.ctrlKey && 'uUiIjJ'.includes(e.key))) {
     e.preventDefault();
     logIncident('shortcut', `Blocked shortcut: ${e.key}`);
@@ -766,6 +946,26 @@ document.addEventListener('keydown', (e) => {
     logIncident('screenshot_attempt', label);
     queueProgressSave();
     modal('🚨', 'Screenshot Detected', `A screenshot attempt (${label}) has been detected and logged against your access code. Please do not capture exam content.`, [{ label: 'I understand', cls: 'btn-danger' }]);
+    return;
+  }
+  if (!inTextField && !e.metaKey && !e.ctrlKey && !e.altKey) {
+    if (e.key === 'ArrowLeft') {
+      e.preventDefault();
+      prevQ();
+      return;
+    }
+    if (e.key === 'ArrowRight') {
+      e.preventDefault();
+      nextQ();
+      return;
+    }
+    if (/^[1-9]$/.test(e.key)) {
+      const target = Number(e.key) - 1;
+      if (target < S.total) {
+        e.preventDefault();
+        goToQ(target);
+      }
+    }
   }
 });
 
@@ -778,29 +978,59 @@ async function submitExam(autoSubmit) {
   if (S.webcamStream) S.webcamStream.getTracks().forEach((t) => t.stop());
   if (S.screenStream) S.screenStream.getTracks().forEach((t) => t.stop());
 
-  const durationSecs = Math.round((S.elapsed + (Date.now() - S.startTime)) / 1000);
+  const payload = buildSubmitPayload(autoSubmit);
   let data;
+  if (!isOnline()) {
+    queuePendingAction(S.code, 'submit', payload);
+    showPendingSubmission();
+    return;
+  }
   try {
     data = await apiJson('/api/submit', {
       method: 'POST',
-      body: JSON.stringify({
-        code: S.code,
-        answers: S.answers,
-        durationSecs,
-        tabSwitches: S.tabSwitches,
-        incidents: S.incidents,
-        autoSubmit
-      })
+      body: JSON.stringify(payload)
     }, { timeoutMs: 15000, retries: 0 });
   } catch (_e) {
     data = null;
   }
 
   if (!data || !data.ok || !data.result) {
-    modal('❌', 'Submit Failed', 'The exam could not be submitted. Please contact your proctor immediately with your access code.', [{ label: 'OK', cls: 'btn-danger' }]);
+    queuePendingAction(S.code, 'submit', payload);
+    showPendingSubmission();
     return;
   }
+  clearPendingState(S.code);
   showResultsFromRecord(data.result);
+}
+
+function showPendingSubmission() {
+  S.screen = 'submit-pending';
+  document.body.classList.remove('exam-bg');
+  render(`<div class="screen" style="max-width:540px">
+    <div class="card" style="margin-top:56px;text-align:center">
+      <div style="font-size:42px;margin-bottom:10px">⏳</div>
+      <h2 style="margin-bottom:10px">Submission Queued</h2>
+      <p style="color:#555;font-size:14px;line-height:1.7">Your browser could not reach the server, so the final submission was saved locally on this device. Keep this tab or reopen with the same code once your connection returns.</p>
+      <p style="color:#8a5b00;font-size:13px;margin:12px 0 18px">Access code: <strong style="font-family:monospace">${_esc(S.code)}</strong></p>
+      <button class="btn btn-primary btn-full" onclick="retryPendingSubmission()">Retry Submission</button>
+      <button class="btn btn-secondary btn-full" onclick="showCodeEntry()">Return to Start</button>
+    </div>
+  </div>`);
+}
+
+async function retryPendingSubmission() {
+  if (!isOnline()) {
+    modal('⚠️', 'Still Offline', 'Reconnect to the internet first, then retry submission.', [{ label: 'OK', cls: 'btn-primary' }]);
+    return;
+  }
+  if (!S.examToken) {
+    showCodeEntry();
+    return;
+  }
+  const done = await replayPendingActions();
+  if (!done) {
+    modal('❌', 'Retry Failed', 'Submission is still pending. Keep this tab and try again shortly.', [{ label: 'OK', cls: 'btn-primary' }]);
+  }
 }
 
 function showResultsFromRecord(rec) {
@@ -812,6 +1042,11 @@ function showResultsFromRecord(rec) {
   const showPracticeReview = rec.showCorrectAnswers === true && questionResults.length > 0;
   const passPct = Number(rec.passPct || S.passPct || 80);
   const passScore = rec.total ? Math.ceil((Number(rec.total) * passPct) / 100) : (S.passScore || 0);
+  const studyFocus = sectionResults
+    .slice()
+    .sort((a, b) => Number(a.pct || 0) - Number(b.pct || 0))
+    .slice(0, 3)
+    .map((section) => `${section.name || 'Segment'} (${Number(section.pct || 0)}%)`);
   const sectionBreakdown = sectionResults.length ? `
     <div class="divider"></div>
     <div style="text-align:left">
@@ -888,9 +1123,41 @@ function showResultsFromRecord(rec) {
       ${sectionBreakdown}
       ${practiceReview}
       <div class="divider"></div>
+      ${studyFocus.length ? `<div style="text-align:left;margin-bottom:16px">
+        <div style="font-size:16px;font-weight:800;color:#1F3864;margin-bottom:8px">Study Focus</div>
+        <div style="font-size:13px;color:#555;line-height:1.9">${studyFocus.map((item) => `• ${_esc(item)}`).join('<br>')}</div>
+      </div>` : ''}
+      <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-bottom:12px">
+        <button class="btn btn-secondary btn-sm" onclick="downloadResultSummary('json')">Download JSON Summary</button>
+        <button class="btn btn-secondary btn-sm" onclick="downloadResultSummary('html')">Download Study Report</button>
+      </div>
       <p style="font-size:13px;color:#999">${rec.isPractice ? 'Your practice attempt has been saved for learning analytics.' : 'Your result has been recorded. You may close this window.'}</p>
     </div>
   </div>`);
+  window.__lastResult = rec;
+}
+
+function downloadResultSummary(kind) {
+  const rec = window.__lastResult;
+  if (!rec) return;
+  const fileSafeCode = String(rec.code || 'result').replace(/[^A-Z0-9_-]/gi, '_');
+  let blob;
+  let fileName;
+  if (kind === 'html') {
+    const sections = Array.isArray(rec.sectionResults) ? rec.sectionResults : [];
+    const html = `<!doctype html><html><head><meta charset="utf-8"><title>Academy Exam Summary ${_esc(rec.code || '')}</title></head><body><h1>Academy Exam Summary</h1><p><strong>Code:</strong> ${_esc(rec.code || '')}</p><p><strong>Score:</strong> ${_esc(rec.score)} / ${_esc(rec.total)} (${_esc(rec.pct)}%)</p><p><strong>Submitted:</strong> ${_esc(rec.submittedAt || '')}</p><h2>Section Results</h2><ul>${sections.map((section) => `<li>${_esc(section.name || 'Segment')}: ${_esc(section.correct)} / ${_esc(section.total)} (${_esc(section.pct)}%)</li>`).join('')}</ul></body></html>`;
+    blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+    fileName = `academy_exam_summary_${fileSafeCode}.html`;
+  } else {
+    blob = new Blob([JSON.stringify(rec, null, 2)], { type: 'application/json;charset=utf-8' });
+    fileName = `academy_exam_summary_${fileSafeCode}.json`;
+  }
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = fileName;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 function statusChip(row) {
@@ -1168,10 +1435,11 @@ async function reviewResult(code) {
         <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap">
           <div>
             <div style="font-size:22px;font-weight:800;color:#1F3864">Answer Review</div>
-            <div style="font-size:13px;color:#666;margin-top:4px">${_esc(resp.label || code)} · ${_esc(result.questionSetName || 'Exam')}</div>
+            <div style="font-size:13px;color:#666;margin-top:4px">${_esc(resp.label || code)} · ${_esc(normalizeExamTitle(result.questionSetName || 'Exam'))}</div>
             <div style="font-size:12px;color:#777;margin-top:6px">${result.score ?? '—'} / ${result.total ?? '—'} · ${result.pct == null ? '—' : `${result.pct}%`} · ${result.pass ? 'Passed' : 'Did not pass'}</div>
           </div>
           <div style="display:flex;gap:8px;flex-wrap:wrap">
+            ${roleCan('compliance:read') ? `<button class="btn btn-secondary btn-sm" onclick="downloadSignedResultSummary('${code}')">Signed Summary</button>` : ''}
             <button class="btn btn-secondary btn-sm" onclick="showAdmin()">← Back to Admin</button>
           </div>
         </div>
@@ -1196,6 +1464,8 @@ function auditActionLabel(action) {
   switch (action) {
     case 'admin_login_success': return 'Login success';
     case 'admin_login_failed': return 'Login failed';
+    case 'admin_logout': return 'Logout';
+    case 'admin_sessions_revoked': return 'All admin sessions revoked';
     case 'admin_exam_availability_updated': return 'Exam availability changed';
     case 'admin_note_saved': return 'Note saved';
     case 'admin_code_reset': return 'Code reset';
@@ -1228,16 +1498,22 @@ async function showAdmin() {
   let data;
   let systemStatus;
   let auditData;
+  let notificationData;
+  let overviewData;
   try {
-    [data, systemStatus, auditData] = await Promise.all([
+    [data, systemStatus, auditData, notificationData, overviewData] = await Promise.all([
       apiJson('/api/admin/codes', {}, { timeoutMs: 12000, retries: 1 }),
       apiJson('/api/admin/system-status', {}, { timeoutMs: 12000, retries: 1 }),
-      apiJson('/api/admin/audit?limit=12', {}, { timeoutMs: 12000, retries: 1 })
+      apiJson('/api/admin/audit?limit=12', {}, { timeoutMs: 12000, retries: 1 }),
+      apiJson('/api/admin/notifications', {}, { timeoutMs: 12000, retries: 1 }),
+      apiJson('/api/admin/analytics/overview?days=30', {}, { timeoutMs: 16000, retries: 1 })
     ]);
   } catch (_e) {
     data = null;
     systemStatus = null;
     auditData = null;
+    notificationData = null;
+    overviewData = null;
   }
   if (!data || data.error) {
     modal('❌', 'Error', 'Could not load admin data from the server.', [{ label: 'OK', cls: 'btn-primary' }]);
@@ -1245,8 +1521,17 @@ async function showAdmin() {
   }
   _adminSystemStatus = systemStatus;
   _adminAuditEntries = Array.isArray(auditData?.entries) ? auditData.entries : [];
+  _adminNotifications = Array.isArray(notificationData?.notifications) ? notificationData.notifications : [];
+  _adminOverview = overviewData && overviewData.ok ? overviewData : null;
   _adminRole = data.role || _adminRole || 'admin';
-  const canAdmin = _adminRole === 'admin';
+  const canAdmin = roleCan('*');
+  const canContentRead = roleCan('content:read');
+  const canContentWrite = roleCan('content:write');
+  const canContentPublish = roleCan('content:publish');
+  const canAnalytics = roleCan('analytics:read');
+  const canResultsRead = roleCan('results:read');
+  const canAuditExport = roleCan('audit:export');
+  const canCompliance = roleCan('compliance:read');
   _adminRows = sortAdminRows(data.codes || []);
   _selectedCodes = new Set([..._selectedCodes].filter((code) => _adminRows.some((row) => row.code === code)));
   _adminQuestionSets = Array.isArray(data.questionSets) ? data.questionSets : [];
@@ -1257,6 +1542,37 @@ async function showAdmin() {
   const warnings = Array.isArray(systemStatus?.warnings) ? systemStatus.warnings : [];
   const staleSessions = Array.isArray(systemStatus?.staleSessions) ? systemStatus.staleSessions : [];
   const examOpen = systemStatus?.examEnabled !== false;
+  const metricTiles = _adminOverview ? `
+    <div class="card" style="margin-bottom:16px">
+      <div style="display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
+        <div style="font-size:16px;font-weight:800;color:#1F3864">30-Day Analytics</div>
+        <div style="font-size:12px;color:#666">${_adminOverview.summary?.attempts || 0} attempts</div>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:14px">
+        <div class="metric-card"><div class="metric-label">Avg %</div><div class="metric-value">${_adminOverview.summary?.averagePct ?? '—'}</div></div>
+        <div class="metric-card"><div class="metric-label">Pass Rate</div><div class="metric-value">${_adminOverview.summary?.passRate == null ? '—' : `${_adminOverview.summary.passRate}%`}</div></div>
+        <div class="metric-card"><div class="metric-label">Avg Duration</div><div class="metric-value">${_adminOverview.summary?.averageDurationSecs ? durationLabel(_adminOverview.summary.averageDurationSecs) : '—'}</div></div>
+        <div class="metric-card"><div class="metric-label">Question Sets</div><div class="metric-value">${Array.isArray(_adminOverview.byQuestionSet) ? _adminOverview.byQuestionSet.length : 0}</div></div>
+      </div>
+      <div style="display:grid;grid-template-columns:1.2fr .8fr;gap:14px">
+        <div style="overflow-x:auto">
+          <table class="admin-table"><thead><tr><th>Day</th><th style="text-align:center">Attempts</th><th style="text-align:center">Avg %</th><th style="text-align:center">Pass Rate</th></tr></thead><tbody>${(_adminOverview.trend || []).length ? _adminOverview.trend.slice(-10).map((row) => `<tr><td>${_esc(row.day)}</td><td style="text-align:center">${row.attempts}</td><td style="text-align:center">${row.averagePct ?? '—'}</td><td style="text-align:center">${row.passRate == null ? '—' : `${row.passRate}%`}</td></tr>`).join('') : '<tr><td colspan="4" style="text-align:center;color:#888;padding:16px">No trend data</td></tr>'}</tbody></table>
+        </div>
+        <div style="overflow-x:auto">
+          <table class="admin-table"><thead><tr><th>Weakest Section</th><th style="text-align:center">Avg %</th></tr></thead><tbody>${(_adminOverview.weakestSections || []).length ? _adminOverview.weakestSections.slice(0, 8).map((row) => `<tr><td>${_esc(row.questionSetName || '')} · ${_esc(row.name || 'Section')}</td><td style="text-align:center">${row.averagePct ?? '—'}</td></tr>`).join('') : '<tr><td colspan="2" style="text-align:center;color:#888;padding:16px">No section data</td></tr>'}</tbody></table>
+        </div>
+      </div>
+    </div>` : '';
+  const notificationsCard = `
+    <div class="card" style="margin-bottom:16px">
+      <div style="display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+        <div style="font-size:16px;font-weight:800;color:#1F3864">Notifications</div>
+        <div style="font-size:12px;color:#666">${_adminNotifications.length} active</div>
+      </div>
+      <div style="display:grid;gap:8px">
+        ${_adminNotifications.length ? _adminNotifications.map((item) => `<div style="padding:10px 12px;border-radius:12px;border:1px solid ${item.level === 'high' ? '#f1c0c0' : '#e7d6a2'};background:${item.level === 'high' ? '#fff7f7' : '#fffaf0'}"><div style="font-size:13px;font-weight:700;color:${item.level === 'high' ? '#9f2d22' : '#8a5b00'}">${_esc(item.message || '')}</div>${item.detail ? `<div style="font-size:11px;color:#666;margin-top:4px">${_esc(item.detail)}</div>` : ''}</div>`).join('') : '<div style="font-size:12px;color:#666">No active alerts.</div>'}
+      </div>
+    </div>`;
   const systemBanner = systemStatus ? `
     <div class="card" style="margin-bottom:16px;background:${systemStatus.ok ? 'rgba(238,247,242,.98)' : 'rgba(255,245,245,.98)'};border-left:6px solid ${systemStatus.ok ? '#2e7d32' : '#c0392b'}">
       <div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:flex-start">
@@ -1280,6 +1596,9 @@ async function showAdmin() {
           <div>Audit log: ${systemStatus.auditEnabled ? `${systemStatus.auditCount} entries` : 'missing'}</div>
           <div>Admin env: ${systemStatus.adminConfigured ? 'configured' : 'missing'}</div>
           <div>Manager login: ${systemStatus.managerConfigured ? 'configured' : 'not configured'}</div>
+          <div>Reviewer login: ${systemStatus.reviewerConfigured ? 'configured' : 'not configured'}</div>
+          <div>Content editor: ${systemStatus.contentEditorConfigured ? 'configured' : 'not configured'}</div>
+          <div>Admin session reset: ${systemStatus.adminSessionRevokedAt ? _esc(new Date(systemStatus.adminSessionRevokedAt).toLocaleString()) : 'never'}</div>
         </div>
       </div>
       ${staleSessions.length ? `<div style="margin-top:10px;padding:10px 12px;background:rgba(255,248,230,.9);border-radius:10px;color:#8a5b00;font-size:13px">
@@ -1297,17 +1616,24 @@ async function showAdmin() {
         ${set.description ? `<div style="font-size:12px;color:#777;margin-top:3px">${_esc(set.description)}</div>` : ''}
       </td>
       <td style="text-align:center">${set.questionCount || 0}</td>
+      <td style="text-align:center">v${set.versionNumber || 1}</td>
+      <td style="text-align:center">${_esc(set.lifecycleStatus || 'PUBLISHED')}</td>
       <td style="text-align:center">${set.numQuestions ? `${set.numQuestions} of ${set.questionCount || 0}` : `All ${set.questionCount || 0}`}</td>
       <td style="text-align:center">${set.durationMinutes || 45}m</td>
       <td style="text-align:center">${set.passPct || 80}%</td>
       <td style="text-align:center">${set.examMode === 'PRACTICE' ? '<span class="chip chip-pass">Practice</span>' : '<span class="chip chip-active">Graded</span>'}</td>
       <td style="text-align:center">${set.proctorEnabled !== false ? 'On' : 'Off'}</td>
       <td style="text-align:center;white-space:nowrap">
-        <button class="btn btn-secondary btn-sm" onclick="showQuestionSetAnalytics(${set.id})">Analytics</button>
-        ${canAdmin ? `<button class="btn btn-secondary btn-sm" onclick="openQuestionSet(${set.id}, '${_esc(set.name)}')">Manage</button>` : ''}
-        ${canAdmin ? `<button class="btn btn-secondary btn-sm" onclick="configQuestionSet(${set.id}, ${set.durationMinutes || 45}, ${set.passPct || 80}, ${set.proctorEnabled !== false}, ${set.numQuestions == null ? 'null' : set.numQuestions}, ${set.questionCount || 0})">Config</button>` : ''}
-        ${canAdmin && !set.isActive ? `<button class="btn btn-primary btn-sm" onclick="activateQuestionSet(${set.id})">Set Default</button>` : ''}
-        ${canAdmin && !set.isActive ? `<button class="btn btn-danger btn-sm" onclick="deleteQuestionSet(${set.id}, '${_esc(set.name)}')">Delete</button>` : ''}
+        ${canAnalytics ? `<button class="btn btn-secondary btn-sm" onclick="showQuestionSetAnalytics(${set.id})">Analytics</button>` : ''}
+        ${canContentRead ? `<button class="btn btn-secondary btn-sm" onclick="openQuestionSet(${set.id}, '${_esc(set.name)}')">Manage</button>` : ''}
+        ${roleCan('results:export') ? `<button class="btn btn-secondary btn-sm" onclick="exportQuestionSet(${set.id})">Export</button>` : ''}
+        ${canContentWrite ? `<button class="btn btn-secondary btn-sm" onclick="cloneQuestionSet(${set.id}, '${_esc(set.name)}')">Clone</button>` : ''}
+        ${canContentWrite ? `<button class="btn btn-secondary btn-sm" onclick="configQuestionSet(${set.id}, ${set.durationMinutes || 45}, ${set.passPct || 80}, ${set.proctorEnabled !== false}, ${set.numQuestions == null ? 'null' : set.numQuestions}, ${set.questionCount || 0})">Config</button>` : ''}
+        ${canContentPublish && !set.isActive ? `<button class="btn btn-primary btn-sm" onclick="activateQuestionSet(${set.id})">Set Default</button>` : ''}
+        ${canContentPublish && String(set.lifecycleStatus || '') !== 'PUBLISHED' ? `<button class="btn btn-secondary btn-sm" onclick="publishQuestionSet(${set.id})">Publish</button>` : ''}
+        ${canContentPublish && !set.isActive && String(set.lifecycleStatus || '') !== 'ARCHIVED' ? `<button class="btn btn-secondary btn-sm" onclick="archiveQuestionSet(${set.id})">Archive</button>` : ''}
+        ${roleCan('imports:rollback') && set.importSource === 'csv_upload' && !set.isActive ? `<button class="btn btn-danger btn-sm" onclick="rollbackImportedSet(${set.id})">Rollback</button>` : ''}
+        ${canContentPublish && !set.isActive ? `<button class="btn btn-danger btn-sm" onclick="deleteQuestionSet(${set.id}, '${_esc(set.name)}')">Delete</button>` : ''}
       </td>
     </tr>`).join('');
 
@@ -1322,7 +1648,7 @@ async function showAdmin() {
               <option value="" ${row.questionSetId == null ? 'selected' : ''}>${_activeQuestionSet ? `${_esc(_activeQuestionSet.name)} (default)` : 'Default active set'}</option>
               ${_adminQuestionSets.map((set) => `<option value="${set.id}" ${row.questionSetId === set.id ? 'selected' : ''}>${_esc(set.name)}${set.isActive ? ' ⭐' : ''}</option>`).join('')}
             </select>`
-          : `<span style="font-size:12px;color:#555">${_esc(row.questionSetName || _activeQuestionSet?.name || 'Default active set')}</span>`}
+          : `<span style="font-size:12px;color:#555">${_esc(normalizeExamTitle(row.questionSetName || _activeQuestionSet?.name || 'Default active set'))}</span>`}
       </td>
       <td><input type="text" value="${_esc(row.notes || '')}" style="margin:0;width:220px;font-size:12px;padding:6px 8px" onblur="saveNote('${row.code}', this.value); this.style.borderColor='#d0d8e8'"></td>
       <td>${statusChip(row)}</td>
@@ -1343,36 +1669,41 @@ async function showAdmin() {
     <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:16px">
       <div>
         <div style="font-size:22px;font-weight:800;color:white">Admin Console</div>
-        <div style="font-size:13px;color:rgba(255,255,255,.75)">${unused} unused · ${active} active · ${completed} completed · ${_adminQuestionSets.length} exam set${_adminQuestionSets.length === 1 ? '' : 's'} · Role: ${_adminRole === 'admin' ? 'Admin' : 'Manager'}</div>
+        <div style="font-size:13px;color:rgba(255,255,255,.75)">${unused} unused · ${active} active · ${completed} completed · ${_adminQuestionSets.length} exam set${_adminQuestionSets.length === 1 ? '' : 's'} · Role: ${_adminRole === 'admin' ? 'Admin' : _adminRole === 'manager' ? 'Manager' : _adminRole === 'reviewer' ? 'Reviewer' : 'Content Editor'}</div>
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
         <button class="btn btn-primary btn-sm" onclick="generateCodes()">+ Generate Codes</button>
-        ${canAdmin ? '<button class="btn btn-primary btn-sm" onclick="createQuestionSet()">+ New Exam Set</button>' : ''}
-        ${canAdmin ? '<button class="btn btn-secondary btn-sm" onclick="showUploadQuestionSet()">Upload Exam CSV</button>' : ''}
+        ${canContentWrite ? '<button class="btn btn-primary btn-sm" onclick="createQuestionSet()">+ New Exam Set</button>' : ''}
+        ${roleCan('imports:write') ? '<button class="btn btn-secondary btn-sm" onclick="showUploadQuestionSet()">Upload Exam CSV</button>' : ''}
         ${canAdmin ? `<button class="btn btn-secondary btn-sm" onclick="toggleExamAvailability(${examOpen ? 'false' : 'true'})">${examOpen ? 'Close Exams' : 'Open Exams'}</button>` : ''}
+        ${canAdmin ? '<button class="btn btn-secondary btn-sm" onclick="revokeAdminSessions()">Revoke Sessions</button>' : ''}
         ${canAdmin ? '<button class="btn btn-secondary btn-sm" onclick="repairResultSummaries()">Repair Scores</button>' : ''}
         ${canAdmin ? '<button class="btn btn-secondary btn-sm" onclick="clearResultSummaries()">Clear Scores</button>' : ''}
         <button class="btn btn-secondary btn-sm" onclick="downloadExport()">Export CSV</button>
+        ${canAuditExport ? '<button class="btn btn-secondary btn-sm" onclick="downloadAuditExport()">Export Audit JSON</button>' : ''}
+        <button class="btn btn-secondary btn-sm" onclick="logoutAdmin()">Logout</button>
         <button class="btn btn-secondary btn-sm" onclick="showAdmin()">↻ Refresh</button>
       </div>
     </div>
     ${systemBanner}
+    ${notificationsCard}
+    ${metricTiles}
     <div class="card" style="margin-bottom:16px">
       <div style="display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
         <div>
           <div style="font-size:16px;font-weight:800;color:#1F3864">Exam Sets</div>
-          <div style="font-size:12px;color:#666">${_activeQuestionSet ? `Default exam: ${_activeQuestionSet.name}` : 'No default exam set configured yet'}</div>
-        </div>
-        <div style="font-size:12px;color:#666">Manage exams, upload new banks, and assign a set per code.</div>
+        <div style="font-size:12px;color:#666">${_activeQuestionSet ? `Default exam: ${_activeQuestionSet.name}` : 'No default exam set configured yet'}</div>
+      </div>
+      <div style="font-size:12px;color:#666">Manage exams, upload new banks, and assign a set per code.</div>
       </div>
       <div style="overflow-x:auto">
         <table class="admin-table">
           <thead>
             <tr>
-              <th>Name</th><th style="text-align:center">Questions</th><th style="text-align:center">Delivered</th><th style="text-align:center">Duration</th><th style="text-align:center">Pass</th><th style="text-align:center">Mode</th><th style="text-align:center">Proctor</th><th style="text-align:center">Actions</th>
+              <th>Name</th><th style="text-align:center">Questions</th><th style="text-align:center">Version</th><th style="text-align:center">Status</th><th style="text-align:center">Delivered</th><th style="text-align:center">Duration</th><th style="text-align:center">Pass</th><th style="text-align:center">Mode</th><th style="text-align:center">Proctor</th><th style="text-align:center">Actions</th>
             </tr>
           </thead>
-          <tbody>${setRows || '<tr><td colspan="8" style="text-align:center;color:#888;padding:18px">No exam sets found</td></tr>'}</tbody>
+          <tbody>${setRows || '<tr><td colspan="10" style="text-align:center;color:#888;padding:18px">No exam sets found</td></tr>'}</tbody>
         </table>
       </div>
     </div>
@@ -1412,6 +1743,25 @@ async function showAdmin() {
           <button class="btn btn-danger btn-sm" onclick="bulkDeleteCodes()">Delete Selected (<span id="selected-code-count">${_selectedCodes.size}</span>)</button>
         </span>` : ''}
       </div>
+      <div style="padding:12px 16px 10px;display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px">
+        <select style="margin:0;font-size:12px;padding:8px 10px" onchange="setExportFilter('questionSetId', this.value)">
+          <option value="">All exam sets</option>
+          ${_adminQuestionSets.map((set) => `<option value="${set.id}" ${String(_exportFilters.questionSetId) === String(set.id) ? 'selected' : ''}>${_esc(set.name)}</option>`).join('')}
+        </select>
+        <select style="margin:0;font-size:12px;padding:8px 10px" onchange="setExportFilter('status', this.value)">
+          <option value="" ${!_exportFilters.status ? 'selected' : ''}>All statuses</option>
+          <option value="unused" ${_exportFilters.status === 'unused' ? 'selected' : ''}>Unused</option>
+          <option value="active" ${_exportFilters.status === 'active' ? 'selected' : ''}>Active</option>
+          <option value="completed" ${_exportFilters.status === 'completed' ? 'selected' : ''}>Completed</option>
+        </select>
+        <select style="margin:0;font-size:12px;padding:8px 10px" onchange="setExportFilter('mode', this.value)">
+          <option value="" ${!_exportFilters.mode ? 'selected' : ''}>All modes</option>
+          <option value="GRADED" ${_exportFilters.mode === 'GRADED' ? 'selected' : ''}>Graded only</option>
+          <option value="PRACTICE" ${_exportFilters.mode === 'PRACTICE' ? 'selected' : ''}>Practice only</option>
+        </select>
+        <input type="date" value="${_esc(_exportFilters.dateFrom || '')}" style="margin:0;font-size:12px;padding:8px 10px" onchange="setExportFilter('dateFrom', this.value)">
+        <input type="date" value="${_esc(_exportFilters.dateTo || '')}" style="margin:0;font-size:12px;padding:8px 10px" onchange="setExportFilter('dateTo', this.value)">
+      </div>
       <table class="admin-table">
         <thead>
           <tr>
@@ -1434,7 +1784,7 @@ async function assignQuestionSet(code, setIdValue) {
     if (row) {
       row.questionSetId = setIdValue === '' ? null : Number(setIdValue);
       const set = _adminQuestionSets.find((item) => item.id === row.questionSetId);
-      row.questionSetName = set ? set.name : '';
+      row.questionSetName = set ? normalizeExamTitle(set.name) : '';
     }
   } catch (_e) {
     modal('❌', 'Assignment Failed', 'Could not assign that exam set to the access code.', [{ label: 'OK', cls: 'btn-primary', action: () => showAdmin() }]);
@@ -1807,16 +2157,19 @@ function showUploadQuestionSet() {
       </div>
 
       <label class="label">Exam Name</label>
-      <input id="upload-name" type="text" placeholder="e.g. ITIL 4 Practice Exam A">
+      <input id="upload-name" type="text" placeholder="e.g. Academy Practice Exam A">
       <div style="font-size:12px;color:#666;margin-top:-6px;margin-bottom:12px">This is the name admins will see when assigning the exam to candidates.</div>
       <label class="label">Description</label>
       <input id="upload-desc" type="text" placeholder="Optional">
       <div style="font-size:12px;color:#666;margin-top:-6px;margin-bottom:12px">Optional notes like cohort, language, version, or intended audience.</div>
       <label class="label">CSV File</label>
-      <input id="upload-file" type="file" accept=".csv" style="width:100%">
+      <input id="upload-file" type="file" accept=".csv" style="width:100%" onchange="previewUploadedQuestionSet()">
       <div style="font-size:12px;color:#666;margin:10px 0 18px;line-height:1.7">
         Upload the CSV exported from your spreadsheet. The template already contains the correct headers, sample rows, and formatting examples.<br>
         Tip: if Excel asks how to save, choose <strong>CSV UTF-8</strong> when available.
+      </div>
+      <div id="upload-preview" style="margin:0 0 18px;padding:14px;border:1px solid #d8e1f0;border-radius:14px;background:#fff">
+        <div style="font-size:12px;color:#777">Select a CSV to preview row count, warnings, and import readiness.</div>
       </div>
       <button class="btn btn-primary btn-full" onclick="submitUploadedQuestionSet()">Upload Exam Set</button>
     </div>
@@ -1892,6 +2245,90 @@ function parseQuestionCsv(text) {
   });
 }
 
+function analyzeQuestionUpload(questions) {
+  const errors = [];
+  const warnings = [];
+  const qNums = new Set();
+  const stems = new Set();
+  const duplicates = [];
+  const section = {
+    count: questions.length,
+    multiCount: 0,
+    maxOptions: 0
+  };
+  for (let i = 0; i < questions.length; i += 1) {
+    const q = questions[i];
+    const rowLabel = `Row ${i + 2}`;
+    if (!Number.isInteger(q.qNum) || q.qNum < 1) errors.push(`${rowLabel}: invalid q_num`);
+    if (!q.stem) errors.push(`${rowLabel}: missing stem`);
+    if (!Array.isArray(q.opts) || q.opts.length < 2) errors.push(`${rowLabel}: need at least 2 options`);
+    if (!Array.isArray(q.correctIndices) || !q.correctIndices.length) errors.push(`${rowLabel}: missing correct_indices`);
+    if (!q.multi && q.correctIndices.length !== 1) errors.push(`${rowLabel}: single-select needs exactly 1 correct index`);
+    if (q.correctIndices.some((idx) => idx >= q.opts.length)) errors.push(`${rowLabel}: correct index out of range`);
+    if (qNums.has(q.qNum)) duplicates.push(`Question number ${q.qNum}`);
+    else qNums.add(q.qNum);
+    const stemKey = String(q.stem || '').trim().toLowerCase();
+    if (stemKey) {
+      if (stems.has(stemKey)) warnings.push(`${rowLabel}: duplicate stem detected`);
+      else stems.add(stemKey);
+    }
+    if (new Set(q.opts.map((opt) => String(opt).trim().toLowerCase())).size !== q.opts.length) {
+      warnings.push(`${rowLabel}: duplicate option text`);
+    }
+    if (q.multi) section.multiCount += 1;
+    section.maxOptions = Math.max(section.maxOptions, q.opts.length);
+  }
+  duplicates.forEach((item) => warnings.push(item));
+  return {
+    ok: errors.length === 0,
+    errors,
+    warnings,
+    summary: section
+  };
+}
+
+async function previewUploadedQuestionSet() {
+  const file = $('upload-file')?.files?.[0];
+  _uploadPreview = null;
+  const host = $('upload-preview');
+  if (!host) return;
+  if (!file) {
+    host.innerHTML = '<div style="font-size:12px;color:#777">Select a CSV to preview row count, warnings, and import readiness.</div>';
+    return;
+  }
+  try {
+    const text = await file.text();
+    const questions = parseQuestionCsv(text);
+    const analysis = analyzeQuestionUpload(questions);
+    let serverPreview = null;
+    if (roleCan('imports:write')) {
+      try {
+        serverPreview = await apiJson('/api/admin/question-sets/upload/preview', {
+          method: 'POST',
+          body: JSON.stringify({ questions })
+        }, { timeoutMs: 15000, retries: 0 });
+      } catch (_e) {
+        serverPreview = null;
+      }
+    }
+    _uploadPreview = { questions, analysis, serverPreview };
+    host.innerHTML = `
+      <div style="font-size:13px;color:#1F3864;font-weight:800;margin-bottom:8px">Preview</div>
+      <div style="font-size:12px;color:#445;line-height:1.8">
+        Rows: <strong>${analysis.summary.count}</strong><br>
+        Multi-select: <strong>${analysis.summary.multiCount}</strong><br>
+        Max options: <strong>${analysis.summary.maxOptions}</strong><br>
+        Status: <strong style="color:${analysis.ok ? '#1a5c1a' : '#c0392b'}">${analysis.ok ? 'Ready to upload' : 'Fix issues first'}</strong>
+      </div>
+      ${serverPreview?.duplicatesAgainstDatabase?.length ? `<div style="margin-top:10px;font-size:12px;color:#8a5b00">Possible duplicates already in database:<br>${serverPreview.duplicatesAgainstDatabase.slice(0, 5).map((item) => `• ${_esc(String(item).slice(0, 120))}`).join('<br>')}</div>` : ''}
+      ${analysis.errors.length ? `<div style="margin-top:10px;font-size:12px;color:#9f2d22">${analysis.errors.slice(0, 8).map((item) => `• ${_esc(item)}`).join('<br>')}</div>` : ''}
+      ${(analysis.warnings.length || serverPreview?.warnings?.length) ? `<div style="margin-top:10px;font-size:12px;color:#8a5b00">${[...analysis.warnings, ...(serverPreview?.warnings || [])].slice(0, 8).map((item) => `• ${_esc(item)}`).join('<br>')}</div>` : ''}
+    `;
+  } catch (err) {
+    host.innerHTML = `<div style="font-size:12px;color:#9f2d22">Preview failed: ${_esc(err.message || 'Could not parse CSV')}</div>`;
+  }
+}
+
 async function submitUploadedQuestionSet() {
   const name = String($('upload-name')?.value || '').trim();
   const description = String($('upload-desc')?.value || '').trim();
@@ -1905,15 +2342,18 @@ async function submitUploadedQuestionSet() {
     return;
   }
   try {
-    const text = await file.text();
-    const questions = parseQuestionCsv(text);
+    if (!_uploadPreview) await previewUploadedQuestionSet();
+    const questions = _uploadPreview?.questions || [];
+    const analysis = _uploadPreview?.analysis || analyzeQuestionUpload(questions);
     if (!questions.length) throw new Error('The CSV does not contain any questions.');
+    if (!analysis.ok) throw new Error(analysis.errors[0] || 'CSV validation failed.');
     const resp = await apiJson('/api/admin/question-sets/upload', {
       method: 'POST',
       body: JSON.stringify({ name, description, questions })
     }, { timeoutMs: 20000, retries: 0 });
     if (!resp || !resp.ok) throw new Error('upload_failed');
-    modal('✅', 'Upload Complete', `${resp.count} questions were imported into "${name}".`, [{ label: 'Manage Exam Set', cls: 'btn-primary', action: () => openQuestionSet(resp.questionSetId, name) }]);
+    const note = analysis.warnings.length ? `\n\nWarnings noted: ${analysis.warnings.slice(0, 3).join(' · ')}` : '';
+    modal('✅', 'Upload Complete', `${resp.count} questions were imported into "${name}".${note}`, [{ label: 'Manage Exam Set', cls: 'btn-primary', action: () => openQuestionSet(resp.questionSetId, name) }]);
   } catch (err) {
     modal('❌', 'Upload Failed', err.message || 'Could not import that CSV file.', [{ label: 'OK', cls: 'btn-primary' }]);
   }
@@ -2167,19 +2607,175 @@ async function generateCodes() {
   }
 }
 
-async function downloadExport() {
+function setExportFilter(key, value) {
+  _exportFilters[key] = String(value || '');
+}
+
+async function exportQuestionSet(id) {
   try {
-    const resp = await apiFetch('/api/admin/export.csv', {}, { timeoutMs: 12000, retries: 1 });
+    const resp = await apiFetch(`/api/admin/question-sets/${id}/export.json`, {}, { timeoutMs: 12000, retries: 1 });
     const blob = await resp.blob();
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'ITIL4_Exam_Results.csv';
+    a.download = `exam_set_${id}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch (_e) {
+    modal('❌', 'Export Failed', 'Could not export that exam set.', [{ label: 'OK', cls: 'btn-primary' }]);
+  }
+}
+
+function cloneQuestionSet(id, name) {
+  const nextName = window.prompt('Name for cloned exam set:', `${name} Copy`);
+  if (!nextName) return;
+  apiJson(`/api/admin/question-sets/${id}/clone`, {
+    method: 'POST',
+    body: JSON.stringify({ name: nextName })
+  }, { timeoutMs: 20000, retries: 0 }).then(() => showAdmin()).catch(() => {
+    modal('❌', 'Clone Failed', 'Could not clone that exam set.', [{ label: 'OK', cls: 'btn-primary' }]);
+  });
+}
+
+function publishQuestionSet(id) {
+  modal('⚠️', 'Publish Exam Version', 'Publish this version for its exam family? Older versions in the same family will be marked archived.', [
+    { label: 'Publish', cls: 'btn-primary', action: async () => {
+      try {
+        await apiJson(`/api/admin/question-sets/${id}/publish`, { method: 'POST', body: JSON.stringify({}) }, { timeoutMs: 12000, retries: 0 });
+        showAdmin();
+      } catch (_e) {
+        modal('❌', 'Publish Failed', 'Could not publish that exam version.', [{ label: 'OK', cls: 'btn-primary' }]);
+      }
+    }},
+    { label: 'Cancel', cls: 'btn-secondary' }
+  ]);
+}
+
+function archiveQuestionSet(id) {
+  modal('⚠️', 'Archive Exam Version', 'Archive this version? It will stay available for reporting but should not be used for new candidates.', [
+    { label: 'Archive', cls: 'btn-danger', action: async () => {
+      try {
+        await apiJson(`/api/admin/question-sets/${id}/archive`, { method: 'POST', body: JSON.stringify({}) }, { timeoutMs: 12000, retries: 0 });
+        showAdmin();
+      } catch (_e) {
+        modal('❌', 'Archive Failed', 'Could not archive that exam version.', [{ label: 'OK', cls: 'btn-primary' }]);
+      }
+    }},
+    { label: 'Cancel', cls: 'btn-secondary' }
+  ]);
+}
+
+function rollbackImportedSet(id) {
+  modal('⚠️', 'Rollback Imported Exam', 'Delete this imported exam set and all its questions? This only works when no results reference it.', [
+    { label: 'Rollback', cls: 'btn-danger', action: async () => {
+      try {
+        await apiJson(`/api/admin/question-sets/${id}/rollback-import`, { method: 'POST', body: JSON.stringify({}) }, { timeoutMs: 12000, retries: 0 });
+        showAdmin();
+      } catch (err) {
+        modal('❌', 'Rollback Failed', err.message || 'Could not roll back that import.', [{ label: 'OK', cls: 'btn-primary' }]);
+      }
+    }},
+    { label: 'Cancel', cls: 'btn-secondary' }
+  ]);
+}
+
+async function downloadAuditExport() {
+  try {
+    const resp = await apiFetch('/api/admin/audit/export.json?limit=1000', {}, { timeoutMs: 12000, retries: 1 });
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'academy_exam_audit_export.json';
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch (_e) {
+    modal('❌', 'Audit Export Failed', 'Could not download the signed audit export.', [{ label: 'OK', cls: 'btn-primary' }]);
+  }
+}
+
+async function downloadSignedResultSummary(code) {
+  try {
+    const resp = await apiFetch(`/api/admin/results/${encodeURIComponent(code)}/signed-summary`, {}, { timeoutMs: 12000, retries: 1 });
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `signed_result_${code}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch (_e) {
+    modal('❌', 'Signed Summary Failed', 'Could not download the signed result summary.', [{ label: 'OK', cls: 'btn-primary' }]);
+  }
+}
+
+function logoutAdmin() {
+  modal('↩️', 'Logout', 'End this admin session on this browser?', [
+    { label: 'Logout', cls: 'btn-primary', action: async () => {
+      try {
+        await apiJson('/api/admin/logout', { method: 'POST', body: JSON.stringify({}) }, { timeoutMs: 8000, retries: 0 });
+      } catch (_e) {
+        // local token clear still happens
+      }
+      _adminToken = null;
+      _adminRole = 'admin';
+      showAdminLogin();
+    }},
+    { label: 'Cancel', cls: 'btn-secondary' }
+  ]);
+}
+
+function revokeAdminSessions() {
+  modal('⚠️', 'Revoke All Sessions', 'Force every existing admin or manager token to expire now? Your current browser will also need a fresh login.', [
+    { label: 'Revoke All', cls: 'btn-danger', action: async () => {
+      try {
+        await apiJson('/api/admin/sessions/revoke-all', { method: 'POST', body: JSON.stringify({}) }, { timeoutMs: 10000, retries: 0 });
+        _adminToken = null;
+        _adminRole = 'admin';
+        modal('✅', 'Sessions Revoked', 'All admin sessions were invalidated. Sign in again to continue.', [{ label: 'Go to Login', cls: 'btn-primary', action: showAdminLogin }]);
+      } catch (_e) {
+        modal('❌', 'Revoke Failed', 'Could not revoke admin sessions.', [{ label: 'OK', cls: 'btn-primary' }]);
+      }
+    }},
+    { label: 'Cancel', cls: 'btn-secondary' }
+  ]);
+}
+
+async function downloadExport() {
+  try {
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(_exportFilters)) {
+      if (value != null && String(value).trim() !== '') params.set(key, String(value).trim());
+    }
+    const suffix = params.toString() ? `?${params}` : '';
+    const resp = await apiFetch(`/api/admin/export.csv${suffix}`, {}, { timeoutMs: 12000, retries: 1 });
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'Academy_Exam_App_Results.csv';
     a.click();
     URL.revokeObjectURL(url);
   } catch (_e) {
     modal('❌', 'Export Failed', 'Could not download the CSV export.', [{ label: 'OK', cls: 'btn-primary' }]);
   }
+}
+
+function refreshConnectivityState() {
+  if (S.screen === 'exam') {
+    if (!isOnline()) markOfflineSave();
+    else if (SAVE_UI.text === 'Offline') {
+      markSaveDone(true);
+      void replayPendingActions();
+    }
+    renderQ();
+    return;
+  }
+  if (S.screen === 'submit-pending' && isOnline()) {
+    void retryPendingSubmission();
+    return;
+  }
+  if (S.screen === 'code') showCodeEntry();
 }
 
 window.handleCodeSubmit = handleCodeSubmit;
@@ -2216,6 +2812,16 @@ window.saveNote = saveNote;
 window.resetCode = resetCode;
 window.deleteCode = deleteCode;
 window.generateCodes = generateCodes;
+window.setExportFilter = setExportFilter;
+window.exportQuestionSet = exportQuestionSet;
+window.cloneQuestionSet = cloneQuestionSet;
+window.publishQuestionSet = publishQuestionSet;
+window.archiveQuestionSet = archiveQuestionSet;
+window.rollbackImportedSet = rollbackImportedSet;
+window.downloadAuditExport = downloadAuditExport;
+window.downloadSignedResultSummary = downloadSignedResultSummary;
+window.logoutAdmin = logoutAdmin;
+window.revokeAdminSessions = revokeAdminSessions;
 window.downloadExport = downloadExport;
 window.flagsFor = flagsFor;
 window.clearStaleSessions = clearStaleSessions;
@@ -2229,10 +2835,19 @@ window.selectAllVisibleCodes = selectAllVisibleCodes;
 window.clearCodeSelection = clearCodeSelection;
 window.bulkDeleteCodes = bulkDeleteCodes;
 window.syncExamModeHelp = syncExamModeHelp;
+window.previewUploadedQuestionSet = previewUploadedQuestionSet;
+window.retryPendingSubmission = retryPendingSubmission;
+window.downloadResultSummary = downloadResultSummary;
 
-window.addEventListener('beforeunload', () => {
-  if (S.screen === 'exam' && !S.submitted) saveProgress();
+window.addEventListener('beforeunload', (e) => {
+  if (S.screen === 'exam' && !S.submitted) {
+    saveProgress();
+    e.preventDefault();
+    e.returnValue = '';
+  }
 });
+window.addEventListener('offline', refreshConnectivityState);
+window.addEventListener('online', refreshConnectivityState);
 
 document.addEventListener('DOMContentLoaded', async () => {
   if (new URLSearchParams(window.location.search).get('admin') === '1') showAdminLogin();

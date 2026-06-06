@@ -8,7 +8,31 @@ const express = require('express');
 const hana = require('@sap/hana-client');
 const { version: APP_VERSION } = require('./package.json');
 
+function loadDotEnv(filePath) {
+  if (!fs.existsSync(filePath)) return;
+  const lines = fs.readFileSync(filePath, 'utf8').split(/\r?\n/);
+  for (const rawLine of lines) {
+    const line = String(rawLine || '').trim();
+    if (!line || line.startsWith('#')) continue;
+    const eqIdx = line.indexOf('=');
+    if (eqIdx <= 0) continue;
+    const key = line.slice(0, eqIdx).trim();
+    if (!key || process.env[key] != null) continue;
+    let value = line.slice(eqIdx + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"'))
+      || (value.startsWith('\'') && value.endsWith('\''))
+    ) {
+      value = value.slice(1, -1);
+    }
+    process.env[key] = value;
+  }
+}
+
+loadDotEnv(path.join(__dirname, '.env'));
+
 const app = express();
+app.set('trust proxy', 1);
 const PORT = process.env.PORT || 3000;
 
 const HANA_HOST = process.env.HANA_HOST;
@@ -24,7 +48,9 @@ const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514
 const ANTHROPIC_VERSION = process.env.ANTHROPIC_VERSION || '2023-06-01';
 const ADMIN_HASH = (process.env.ADMIN_HASH || '').trim().toLowerCase();
 const MANAGER_HASH = (process.env.MANAGER_HASH || '').trim().toLowerCase();
-const EXAM_NAME = process.env.EXAM_NAME || 'ITIL 4 Foundation';
+const REVIEWER_HASH = (process.env.REVIEWER_HASH || '').trim().toLowerCase();
+const CONTENT_EDITOR_HASH = (process.env.CONTENT_EDITOR_HASH || '').trim().toLowerCase();
+const EXAM_NAME = process.env.EXAM_NAME || 'Academy Exam App';
 const EXAM_DURATION_SECS = Number(process.env.EXAM_DURATION_SECS || 45 * 60);
 const EXAM_PASS_PCT = Number(process.env.EXAM_PASS_PCT || 80);
 const EXAM_ACTIVE = String(process.env.EXAM_ACTIVE || 'true').toLowerCase() !== 'false';
@@ -33,21 +59,67 @@ const APP_REVISION = process.env.APP_REVISION || 'dev';
 const APP_DEPLOYED_AT = process.env.APP_DEPLOYED_AT || new Date().toISOString();
 const STALE_SESSION_MINUTES = Math.max(5, Number(process.env.STALE_SESSION_MINUTES || 30));
 const APP_SETTING_EXAMS_ENABLED = 'EXAMS_ENABLED';
+const APP_SETTING_ADMIN_TOKEN_NOT_BEFORE = 'ADMIN_TOKEN_NOT_BEFORE';
+const AUTO_CLEAR_STALE_SESSIONS = String(process.env.AUTO_CLEAR_STALE_SESSIONS || 'true').toLowerCase() !== 'false';
+const STALE_SESSION_SWEEP_MINUTES = Math.max(5, Number(process.env.STALE_SESSION_SWEEP_MINUTES || 10));
+const STARTUP_STRICT = String(process.env.STARTUP_STRICT || 'false').toLowerCase() === 'true';
 
 const HAS_DB_CONFIG = Boolean(HANA_HOST && HANA_USER && HANA_PASSWORD && HANA_SCHEMA);
 const INDEX_PATH = path.join(__dirname, 'index.html');
 const CLIENT_APP_PATH = path.join(__dirname, 'client-app.js');
+const FAVICON_PATH = path.join(__dirname, 'favicon.svg');
 
 const EXAM_TTL_MS = 90 * 60 * 1000;
 const ADMIN_TTL_MS = 8 * 60 * 60 * 1000;
-const _examSessions = new Map();
-const _validateAttempts = new Map();
+const _rateLimitBuckets = new Map();
 const VALIDATE_MAX = 10;
 const VALIDATE_WINDOW = 10 * 60 * 1000;
+const ADMIN_LOGIN_MAX = 8;
+const ADMIN_LOGIN_WINDOW = 15 * 60 * 1000;
+const PROCTOR_MAX = 90;
+const PROCTOR_WINDOW = 60 * 1000;
 const _questionSetCache = new Map();
+const _runtimeState = {
+  adminTokenNotBefore: 0,
+  adminTokenNotBeforeFetchedAt: 0,
+  staleSessionSweepTimer: null
+};
+const _metrics = {
+  startedAt: Date.now(),
+  requestsTotal: 0,
+  requestsByRoute: new Map(),
+  requestsByStatus: new Map(),
+  slowRequests: 0,
+  dbQueries: 0,
+  dbSlowQueries: 0,
+  dbErrors: 0,
+  loginFailures: 0
+};
+const SLOW_QUERY_MS = Math.max(100, Number(process.env.SLOW_QUERY_MS || 400));
+const SLOW_REQUEST_MS = Math.max(100, Number(process.env.SLOW_REQUEST_MS || 1200));
 
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: false }));
+app.use((req, res, next) => {
+  const requestId = req.headers['x-request-id']
+    ? String(req.headers['x-request-id']).trim().slice(0, 120)
+    : crypto.randomUUID();
+  req.requestId = requestId;
+  res.setHeader('X-Request-Id', requestId);
+  const startedAt = Date.now();
+  _metrics.requestsTotal += 1;
+  res.on('finish', () => {
+    const routeKey = `${req.method} ${req.route?.path || req.path || 'unknown'}`;
+    _metrics.requestsByRoute.set(routeKey, Number(_metrics.requestsByRoute.get(routeKey) || 0) + 1);
+    _metrics.requestsByStatus.set(String(res.statusCode), Number(_metrics.requestsByStatus.get(String(res.statusCode)) || 0) + 1);
+    const durationMs = Date.now() - startedAt;
+    if (durationMs >= SLOW_REQUEST_MS) {
+      _metrics.slowRequests += 1;
+      appLog('warn', 'slow_request', { requestId, method: req.method, path: req.originalUrl, status: res.statusCode, durationMs });
+    }
+  });
+  next();
+});
 
 function dbConnect() {
   if (!HAS_DB_CONFIG) throw new Error('HANA env vars are missing.');
@@ -64,9 +136,18 @@ function dbConnect() {
 
 function execQuery(conn, sql, params = []) {
   return new Promise((resolve, reject) => {
+    const startedAt = Date.now();
     conn.exec(sql, params, (err, rows) => {
-      if (err) reject(err);
-      else resolve(rows || []);
+      const durationMs = Date.now() - startedAt;
+      _metrics.dbQueries += 1;
+      if (durationMs >= SLOW_QUERY_MS) {
+        _metrics.dbSlowQueries += 1;
+        appLog('warn', 'slow_query', { durationMs, sql: String(sql).slice(0, 220) });
+      }
+      if (err) {
+        _metrics.dbErrors += 1;
+        reject(err);
+      } else resolve(rows || []);
     });
   });
 }
@@ -105,6 +186,50 @@ function appLog(level, event, meta = {}) {
   console.log(JSON.stringify({ ts: new Date().toISOString(), level, event, ...meta }));
 }
 
+function getSigningSecret() {
+  return crypto
+    .createHash('sha256')
+    .update([
+      HANA_PASSWORD || '',
+      ADMIN_HASH || '',
+      MANAGER_HASH || '',
+      REVIEWER_HASH || '',
+      CONTENT_EDITOR_HASH || '',
+      APP_REVISION || ''
+    ].join('|'))
+    .digest('hex');
+}
+
+function signPayload(payload) {
+  const json = JSON.stringify(payload);
+  return crypto.createHmac('sha256', getSigningSecret()).update(json).digest('hex');
+}
+
+function buildSignedEnvelope(payload) {
+  return {
+    payload,
+    signature: signPayload(payload),
+    algorithm: 'HMAC-SHA256'
+  };
+}
+
+function getMetricsSnapshot() {
+  return {
+    uptimeSecs: Math.round((Date.now() - _metrics.startedAt) / 1000),
+    requestsTotal: _metrics.requestsTotal,
+    slowRequests: _metrics.slowRequests,
+    dbQueries: _metrics.dbQueries,
+    dbSlowQueries: _metrics.dbSlowQueries,
+    dbErrors: _metrics.dbErrors,
+    loginFailures: _metrics.loginFailures,
+    requestsByStatus: Object.fromEntries(_metrics.requestsByStatus.entries()),
+    topRoutes: [..._metrics.requestsByRoute.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 12)
+      .map(([route, count]) => ({ route, count }))
+  };
+}
+
 function toCsvCell(v) {
   if (v === null || v === undefined) return '';
   return `"${String(v).replace(/"/g, '""')}"`;
@@ -123,6 +248,7 @@ let _hasNotesColumn = null;
 let _hasDeletedAtColumn = null;
 let _hasQuestionSetModeColumns = null;
 let _hasAuditLogTable = null;
+let _hasQuestionSetVersionColumns = null;
 async function hasNotesColumn(conn) {
   if (_hasNotesColumn !== null) return _hasNotesColumn;
   const rows = await execQuery(
@@ -182,14 +308,101 @@ async function hasAuditLogTable(conn) {
   return _hasAuditLogTable;
 }
 
+async function hasQuestionSetVersionColumns(conn) {
+  if (_hasQuestionSetVersionColumns !== null) return _hasQuestionSetVersionColumns;
+  const rows = await execQuery(
+    conn,
+    `SELECT COUNT(*) AS CNT
+       FROM SYS.TABLE_COLUMNS
+      WHERE SCHEMA_NAME = ?
+        AND TABLE_NAME = 'QUESTION_SETS'
+        AND COLUMN_NAME IN ('VERSION_GROUP_ID', 'VERSION_NUMBER', 'LIFECYCLE_STATUS', 'PARENT_QUESTION_SET_ID', 'IMPORT_SOURCE')`,
+    [String(HANA_SCHEMA || '').toUpperCase()]
+  );
+  _hasQuestionSetVersionColumns = Number(rows?.[0]?.CNT || 0) === 5;
+  return _hasQuestionSetVersionColumns;
+}
+
 function sha256(str) {
   return crypto.createHash('sha256').update(String(str)).digest('hex');
 }
 
+function isSha256Hex(value) {
+  return /^[a-f0-9]{64}$/i.test(String(value || '').trim());
+}
+
+function startupErrors() {
+  const errors = [];
+  if (!HAS_DB_CONFIG) errors.push('HANA connection env vars are incomplete.');
+  if (ADMIN_HASH && !isSha256Hex(ADMIN_HASH)) errors.push('ADMIN_HASH is not a 64-char SHA-256 hex string.');
+  if (MANAGER_HASH && !isSha256Hex(MANAGER_HASH)) errors.push('MANAGER_HASH is not a 64-char SHA-256 hex string.');
+  if (REVIEWER_HASH && !isSha256Hex(REVIEWER_HASH)) errors.push('REVIEWER_HASH is not a 64-char SHA-256 hex string.');
+  if (CONTENT_EDITOR_HASH && !isSha256Hex(CONTENT_EDITOR_HASH)) errors.push('CONTENT_EDITOR_HASH is not a 64-char SHA-256 hex string.');
+  return errors;
+}
+
+function startupWarnings() {
+  const warnings = [];
+  if (HANA_ENCRYPT && HANA_SSL_VALIDATE_CERTIFICATE === false) {
+    warnings.push('HANA TLS certificate validation is disabled.');
+  }
+  if (!ADMIN_HASH) warnings.push('ADMIN_HASH is not configured. Admin login is disabled.');
+  if (!MANAGER_HASH) warnings.push('MANAGER_HASH is not configured. Manager login is disabled.');
+  if (!REVIEWER_HASH) warnings.push('REVIEWER_HASH is not configured. Reviewer login is disabled.');
+  if (!CONTENT_EDITOR_HASH) warnings.push('CONTENT_EDITOR_HASH is not configured. Content editor login is disabled.');
+  if (STALE_SESSION_MINUTES < 5) warnings.push('STALE_SESSION_MINUTES is below 5.');
+  return warnings;
+}
+
+function startupSummary() {
+  return {
+    ok: startupErrors().length === 0,
+    errors: startupErrors(),
+    warnings: startupWarnings(),
+    env: {
+      hasDbConfig: HAS_DB_CONFIG,
+      hanaHostConfigured: Boolean(HANA_HOST),
+      hanaSchema: HANA_SCHEMA,
+      hanaEncrypt: HANA_ENCRYPT,
+      hanaSslValidateCertificate: HANA_SSL_VALIDATE_CERTIFICATE,
+      adminConfigured: Boolean(ADMIN_HASH),
+      managerConfigured: Boolean(MANAGER_HASH),
+      reviewerConfigured: Boolean(REVIEWER_HASH),
+      contentEditorConfigured: Boolean(CONTENT_EDITOR_HASH),
+      anthropicConfigured: Boolean(ANTHROPIC_API_KEY),
+      autoClearStaleSessions: AUTO_CLEAR_STALE_SESSIONS,
+      staleSessionSweepMinutes: STALE_SESSION_SWEEP_MINUTES
+    }
+  };
+}
+
+function normalizeExamTitle(value) {
+  const text = String(value || '').trim();
+  if (!text) return 'Academy Exam App';
+  if (/^ITIL\b/i.test(text)) return 'Academy Exam App';
+  if (/\bSAP\s+Basis\s+Exam\b/i.test(text)) return 'Academy Exam Platform';
+  if (/\bBasis\s+Exam\b/i.test(text)) return 'Academy Exam Platform';
+  return text;
+}
+
 function getClientIp(req) {
+  if (req.ip) return String(req.ip);
   const xfwd = req.headers['x-forwarded-for'];
   if (typeof xfwd === 'string' && xfwd.trim()) return xfwd.split(',')[0].trim();
   return req.socket?.remoteAddress || 'unknown';
+}
+
+function getExamTokenSecret() {
+  return crypto
+    .createHash('sha256')
+    .update([
+      HANA_PASSWORD || '',
+      HANA_SCHEMA || '',
+      ADMIN_HASH || '',
+      MANAGER_HASH || '',
+      EXAM_NAME || ''
+    ].join('|'))
+    .digest('hex');
 }
 
 function makePRNG(seed) {
@@ -217,6 +430,32 @@ function buildOrdering(questions, code) {
   return { qOrder, optOrders };
 }
 
+function createExamToken(code, nonce, expiry) {
+  const payload = `${String(code).trim().toUpperCase()}:${Number(expiry)}:${String(nonce)}`;
+  const sig = crypto.createHmac('sha256', getExamTokenSecret()).update(payload).digest('hex');
+  return Buffer.from(`${payload}:${sig}`).toString('base64url');
+}
+
+function parseExamToken(token) {
+  try {
+    if (!token) return null;
+    const decoded = Buffer.from(token, 'base64url').toString();
+    const parts = decoded.split(':');
+    if (parts.length !== 4) return null;
+    const [code, expiryRaw, nonce, sig] = parts;
+    const expiry = Number(expiryRaw);
+    if (!/^[A-Z2-9]{6}$/.test(String(code || '').trim().toUpperCase())) return null;
+    if (!Number.isFinite(expiry) || expiry <= Date.now()) return null;
+    const payload = `${String(code).trim().toUpperCase()}:${expiry}:${String(nonce)}`;
+    const expected = crypto.createHmac('sha256', getExamTokenSecret()).update(payload).digest('hex');
+    if (sig.length !== expected.length) return null;
+    if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
+    return { code: String(code).trim().toUpperCase(), expiry, nonce: String(nonce) };
+  } catch (_e) {
+    return null;
+  }
+}
+
 function sanitizeProgress(progress) {
   if (!progress || typeof progress !== 'object') return null;
   return {
@@ -230,55 +469,145 @@ function sanitizeProgress(progress) {
 }
 
 function tokenSecretForRole(role) {
-  return role === 'manager' ? MANAGER_HASH : ADMIN_HASH;
+  if (role === 'manager') return MANAGER_HASH;
+  if (role === 'reviewer') return REVIEWER_HASH;
+  if (role === 'content_editor') return CONTENT_EDITOR_HASH;
+  return ADMIN_HASH;
 }
 
 function createAdminToken(role = 'admin') {
+  const issuedAt = Date.now();
   const expiry = Date.now() + ADMIN_TTL_MS;
   const nonce = crypto.randomBytes(16).toString('hex');
-  const safeRole = role === 'manager' ? 'manager' : 'admin';
+  const safeRole = ['admin', 'manager', 'reviewer', 'content_editor'].includes(role) ? role : 'admin';
   const secret = tokenSecretForRole(safeRole);
   if (!secret) throw new Error(`${safeRole.toUpperCase()}_HASH is not configured.`);
-  const payload = `${expiry}:${nonce}:${safeRole}`;
+  const payload = `${expiry}:${nonce}:${safeRole}:${issuedAt}`;
   const sig = crypto.createHmac('sha256', secret).update(payload).digest('hex');
   return Buffer.from(`${payload}:${sig}`).toString('base64url');
 }
 
-function getAdminTokenRole(token) {
+function parseAdminToken(token) {
   try {
     if (!token) return null;
     const decoded = Buffer.from(token, 'base64url').toString();
     const parts = decoded.split(':');
     const expiry = parts[0];
     const nonce = parts[1];
-    const role = parts.length === 4 ? parts[2] : 'admin';
-    const sig = parts.length === 4 ? parts[3] : parts[2];
+    const role = parts.length >= 4 ? parts[2] : 'admin';
+    const issuedAt = parts.length === 5 ? Number(parts[3]) : 0;
+    const sig = parts.length === 5 ? parts[4] : (parts.length === 4 ? parts[3] : parts[2]);
     if (!expiry || !nonce || !sig) return null;
     if (Date.now() > Number(expiry)) return null;
-    const payload = parts.length === 4 ? `${expiry}:${nonce}:${role}` : `${expiry}:${nonce}`;
-    const secret = tokenSecretForRole(role === 'manager' ? 'manager' : 'admin');
+    const payload = parts.length === 5 ? `${expiry}:${nonce}:${role}:${issuedAt}` : (parts.length === 4 ? `${expiry}:${nonce}:${role}` : `${expiry}:${nonce}`);
+    const safeRole = ['admin', 'manager', 'reviewer', 'content_editor'].includes(role) ? role : 'admin';
+    const secret = tokenSecretForRole(safeRole);
     if (!secret) return null;
     const expected = crypto.createHmac('sha256', secret).update(payload).digest('hex');
     if (sig.length !== expected.length) return null;
     if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
-    return role === 'manager' ? 'manager' : 'admin';
+    return {
+      role: safeRole,
+      expiry: Number(expiry),
+      issuedAt: Number.isFinite(issuedAt) ? issuedAt : 0
+    };
   } catch (_e) {
     return null;
   }
 }
 
-function requireAdmin(req, res, next) {
+async function getAdminTokenNotBefore(conn) {
+  if (!HAS_DB_CONFIG) return 0;
+  const now = Date.now();
+  if (_runtimeState.adminTokenNotBeforeFetchedAt && (now - _runtimeState.adminTokenNotBeforeFetchedAt) < 30_000) {
+    return _runtimeState.adminTokenNotBefore;
+  }
+  let value = 0;
+  if (await hasAppSettingsTable(conn)) {
+    value = Number(await getAppSetting(conn, APP_SETTING_ADMIN_TOKEN_NOT_BEFORE, '0')) || 0;
+  }
+  _runtimeState.adminTokenNotBefore = value;
+  _runtimeState.adminTokenNotBeforeFetchedAt = now;
+  return value;
+}
+
+async function requireAdmin(req, res, next) {
   const token = String(req.headers['x-admin-token'] || '').trim();
-  const role = getAdminTokenRole(token);
-  if (!role) return res.status(401).json({ error: 'unauthorized' });
-  req.adminRole = role;
-  next();
+  const parsed = parseAdminToken(token);
+  if (!parsed) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const revokedBefore = HAS_DB_CONFIG
+      ? await withDb(async (conn) => getAdminTokenNotBefore(conn))
+      : 0;
+    if (parsed.issuedAt && revokedBefore && parsed.issuedAt < revokedBefore) {
+      return res.status(401).json({ error: 'session_revoked' });
+    }
+    req.adminRole = parsed.role;
+    next();
+  } catch (err) {
+    appLog('error', 'admin_auth_failed', { requestId: req.requestId, message: err.message });
+    res.status(500).json({ error: 'admin_auth_failed' });
+  }
 }
 
 function requireAdminRole(role) {
   return (req, res, next) => {
     if (role === 'admin' && req.adminRole !== 'admin') {
       return res.status(403).json({ error: 'admin_role_required' });
+    }
+    next();
+  };
+}
+
+const ROLE_PERMISSIONS = {
+  admin: new Set(['*']),
+  manager: new Set([
+    'dashboard:read',
+    'codes:read',
+    'codes:generate',
+    'codes:assign',
+    'codes:note',
+    'results:read',
+    'results:export',
+    'analytics:read',
+    'audit:read',
+    'notifications:read',
+    'sessions:read'
+  ]),
+  reviewer: new Set([
+    'dashboard:read',
+    'codes:read',
+    'results:read',
+    'results:export',
+    'analytics:read',
+    'audit:read',
+    'audit:export',
+    'notifications:read',
+    'compliance:read'
+  ]),
+  content_editor: new Set([
+    'dashboard:read',
+    'codes:read',
+    'analytics:read',
+    'notifications:read',
+    'content:read',
+    'content:write',
+    'content:publish',
+    'imports:write',
+    'imports:rollback',
+    'results:export'
+  ])
+};
+
+function hasPermission(role, permission) {
+  const set = ROLE_PERMISSIONS[role] || new Set();
+  return set.has('*') || set.has(permission);
+}
+
+function requirePermission(permission) {
+  return (req, res, next) => {
+    if (!hasPermission(req.adminRole, permission)) {
+      return res.status(403).json({ error: 'forbidden', permission });
     }
     next();
   };
@@ -311,15 +640,14 @@ async function tryWriteAdminAudit(entry) {
   }
 }
 
-function createExamSessionFromSet(code, questionSet) {
+function createPersistedExamSessionFromSet(code, questionSet) {
   const selectedQuestions = pickQuestionsForSession(questionSet, code);
   const { qOrder, optOrders } = buildOrdering(selectedQuestions, code);
   const answerKey = selectedQuestions.map((question) => question.answer.slice());
-  const token = crypto.randomBytes(32).toString('hex');
-  _examSessions.set(token, {
+  return {
     code,
     questionSetId: questionSet.id,
-    questionSetName: questionSet.name,
+    questionSetName: normalizeExamTitle(questionSet.name),
     examMode: questionSet.examMode,
     showCorrectAnswers: questionSet.showCorrectAnswers === true,
     countsTowardResults: questionSet.countsTowardResults !== false,
@@ -331,46 +659,46 @@ function createExamSessionFromSet(code, questionSet) {
     total: selectedQuestions.length,
     qOrder,
     optOrders,
-    createdAt: Date.now(),
-    expires: Date.now() + EXAM_TTL_MS
-  });
-  return { token, qOrder, optOrders };
+    createdAt: Date.now()
+  };
 }
 
-function getExamSession(token) {
-  const session = token ? _examSessions.get(token) : null;
-  if (!session) return null;
-  if (session.expires < Date.now()) {
-    _examSessions.delete(token);
-    return null;
+function checkRateLimit(bucket, key, max, windowMs) {
+  const now = Date.now();
+  const bucketKey = `${bucket}:${key}`;
+  let entry = _rateLimitBuckets.get(bucketKey);
+  if (!entry || entry.resetAt < now) {
+    entry = { count: 0, resetAt: now + windowMs };
+    _rateLimitBuckets.set(bucketKey, entry);
   }
-  session.expires = Date.now() + EXAM_TTL_MS;
-  return session;
+  entry.count += 1;
+  if (_rateLimitBuckets.size > 5000) {
+    for (const [storedKey, value] of _rateLimitBuckets.entries()) {
+      if (value.resetAt < now) _rateLimitBuckets.delete(storedKey);
+    }
+  }
+  return entry.count <= max;
 }
 
 function requireExamSession(req, res, next) {
-  const token = String(req.headers['x-exam-token'] || '').trim();
-  const session = getExamSession(token);
-  if (!session) return res.status(401).json({ error: 'invalid_exam_session' });
-  req.examSession = session;
-  next();
-}
-
-function checkRateLimit(ip) {
-  const now = Date.now();
-  let entry = _validateAttempts.get(ip);
-  if (!entry || entry.resetAt < now) {
-    entry = { count: 0, resetAt: now + VALIDATE_WINDOW };
-    _validateAttempts.set(ip, entry);
-  }
-  entry.count += 1;
-  if (entry.count > VALIDATE_MAX) return false;
-  if (_validateAttempts.size > 1000) {
-    for (const [key, value] of _validateAttempts.entries()) {
-      if (value.resetAt < now) _validateAttempts.delete(key);
-    }
-  }
-  return true;
+  const parsedToken = parseExamToken(String(req.headers['x-exam-token'] || '').trim());
+  if (!parsedToken) return res.status(401).json({ error: 'invalid_exam_session' });
+  withDb(async (conn) => {
+    const stored = await getSavedSession(conn, parsedToken.code);
+    if (!stored || !stored.resumeSupported || !stored.session) return null;
+    if (stored.session.tokenNonce !== parsedToken.nonce) return null;
+    if (Number(stored.session.tokenExpiry || 0) !== parsedToken.expiry) return null;
+    if (Number(stored.session.tokenExpiry || 0) <= Date.now()) return null;
+    return stored;
+  }).then((stored) => {
+    if (!stored) return res.status(401).json({ error: 'invalid_exam_session' });
+    req.examSession = stored.session;
+    req.examProgress = stored.progress;
+    next();
+  }).catch((err) => {
+    appLog('error', 'exam_session_lookup_failed', { message: err.message });
+    res.status(500).json({ error: 'exam_session_lookup_failed' });
+  });
 }
 
 function clearQuestionSetCache(questionSetId = null) {
@@ -425,7 +753,7 @@ function normalizeQuestionSetRow(row) {
   const examMode = String(row.EXAM_MODE || 'GRADED').toUpperCase() === 'PRACTICE' ? 'PRACTICE' : 'GRADED';
   return {
     id: Number(row.QUESTION_SET_ID),
-    name: String(row.NAME || 'Exam'),
+    name: normalizeExamTitle(row.NAME || 'Exam'),
     description: row.DESCRIPTION || '',
     isActive: Boolean(row.IS_ACTIVE),
     durationMinutes: Number(row.DURATION_MINUTES || 45),
@@ -435,6 +763,11 @@ function normalizeQuestionSetRow(row) {
     showCorrectAnswers: row.SHOW_CORRECT_ANSWERS == null ? examMode === 'PRACTICE' : Boolean(row.SHOW_CORRECT_ANSWERS),
     countsTowardResults: row.COUNTS_TOWARD_RESULTS == null ? examMode !== 'PRACTICE' : Boolean(row.COUNTS_TOWARD_RESULTS),
     numQuestions: row.NUM_QUESTIONS == null ? null : Number(row.NUM_QUESTIONS),
+    versionGroupId: row.VERSION_GROUP_ID == null ? Number(row.QUESTION_SET_ID) : Number(row.VERSION_GROUP_ID),
+    versionNumber: row.VERSION_NUMBER == null ? 1 : Number(row.VERSION_NUMBER),
+    lifecycleStatus: String(row.LIFECYCLE_STATUS || 'PUBLISHED').toUpperCase(),
+    parentQuestionSetId: row.PARENT_QUESTION_SET_ID == null ? null : Number(row.PARENT_QUESTION_SET_ID),
+    importSource: row.IMPORT_SOURCE || '',
     createdAt: row.CREATED_AT ? new Date(row.CREATED_AT).toISOString() : null,
     updatedAt: row.UPDATED_AT ? new Date(row.UPDATED_AT).toISOString() : null
   };
@@ -443,6 +776,7 @@ function normalizeQuestionSetRow(row) {
 async function getQuestionSetRows(conn, options = {}) {
   const includeCounts = Boolean(options.includeCounts);
   const hasModeColumns = await hasQuestionSetModeColumns(conn);
+  const hasVersionColumns = await hasQuestionSetVersionColumns(conn);
   const modeSelect = hasModeColumns
     ? 'qs.EXAM_MODE, qs.SHOW_CORRECT_ANSWERS, qs.COUNTS_TOWARD_RESULTS,'
     : `'GRADED' AS EXAM_MODE, FALSE AS SHOW_CORRECT_ANSWERS, TRUE AS COUNTS_TOWARD_RESULTS,`;
@@ -452,27 +786,39 @@ async function getQuestionSetRows(conn, options = {}) {
   const modeSelectPlain = hasModeColumns
     ? 'EXAM_MODE, SHOW_CORRECT_ANSWERS, COUNTS_TOWARD_RESULTS,'
     : `'GRADED' AS EXAM_MODE, FALSE AS SHOW_CORRECT_ANSWERS, TRUE AS COUNTS_TOWARD_RESULTS,`;
+  const versionSelect = hasVersionColumns
+    ? 'qs.VERSION_GROUP_ID, qs.VERSION_NUMBER, qs.LIFECYCLE_STATUS, qs.PARENT_QUESTION_SET_ID, qs.IMPORT_SOURCE,'
+    : 'qs.QUESTION_SET_ID AS VERSION_GROUP_ID, 1 AS VERSION_NUMBER, \'PUBLISHED\' AS LIFECYCLE_STATUS, NULL AS PARENT_QUESTION_SET_ID, NULL AS IMPORT_SOURCE,';
+  const versionGroup = hasVersionColumns
+    ? 'qs.VERSION_GROUP_ID, qs.VERSION_NUMBER, qs.LIFECYCLE_STATUS, qs.PARENT_QUESTION_SET_ID, qs.IMPORT_SOURCE,'
+    : '';
+  const versionSelectPlain = hasVersionColumns
+    ? 'VERSION_GROUP_ID, VERSION_NUMBER, LIFECYCLE_STATUS, PARENT_QUESTION_SET_ID, IMPORT_SOURCE,'
+    : 'QUESTION_SET_ID AS VERSION_GROUP_ID, 1 AS VERSION_NUMBER, \'PUBLISHED\' AS LIFECYCLE_STATUS, NULL AS PARENT_QUESTION_SET_ID, NULL AS IMPORT_SOURCE,';
+  const orderBy = hasVersionColumns
+    ? 'VERSION_GROUP_ID ASC, VERSION_NUMBER DESC, NAME ASC, QUESTION_SET_ID ASC'
+    : 'IS_ACTIVE DESC, NAME ASC, QUESTION_SET_ID ASC';
   const rows = includeCounts
     ? await execQuery(
         conn,
         `SELECT qs.QUESTION_SET_ID, qs.NAME, qs.DESCRIPTION, qs.IS_ACTIVE,
-                qs.DURATION_MINUTES, qs.PASS_PCT, qs.PROCTOR_ENABLED, ${modeSelect} qs.NUM_QUESTIONS,
+                qs.DURATION_MINUTES, qs.PASS_PCT, qs.PROCTOR_ENABLED, ${modeSelect}${versionSelect} qs.NUM_QUESTIONS,
                 qs.CREATED_AT, qs.UPDATED_AT,
                 COUNT(q.QUESTION_ID) AS QUESTION_COUNT
            FROM QUESTION_SETS qs
            LEFT JOIN QUESTION_SET_QUESTIONS q ON q.QUESTION_SET_ID = qs.QUESTION_SET_ID
           GROUP BY qs.QUESTION_SET_ID, qs.NAME, qs.DESCRIPTION, qs.IS_ACTIVE,
-                   qs.DURATION_MINUTES, qs.PASS_PCT, qs.PROCTOR_ENABLED, ${modeGroup} qs.NUM_QUESTIONS,
+                   qs.DURATION_MINUTES, qs.PASS_PCT, qs.PROCTOR_ENABLED, ${modeGroup}${versionGroup} qs.NUM_QUESTIONS,
                    qs.CREATED_AT, qs.UPDATED_AT
-          ORDER BY qs.IS_ACTIVE DESC, qs.NAME ASC, qs.QUESTION_SET_ID ASC`
+          ORDER BY ${hasVersionColumns ? 'qs.VERSION_GROUP_ID ASC, qs.VERSION_NUMBER DESC,' : 'qs.IS_ACTIVE DESC,'} qs.NAME ASC, qs.QUESTION_SET_ID ASC`
       )
     : await execQuery(
         conn,
         `SELECT QUESTION_SET_ID, NAME, DESCRIPTION, IS_ACTIVE,
-                DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, ${modeSelectPlain} NUM_QUESTIONS,
+                DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, ${modeSelectPlain}${versionSelectPlain} NUM_QUESTIONS,
                 CREATED_AT, UPDATED_AT
            FROM QUESTION_SETS
-          ORDER BY IS_ACTIVE DESC, NAME ASC, QUESTION_SET_ID ASC`
+          ORDER BY ${orderBy}`
       );
   return rows.map((row) => ({
     ...normalizeQuestionSetRow(row),
@@ -482,13 +828,17 @@ async function getQuestionSetRows(conn, options = {}) {
 
 async function getActiveQuestionSetRow(conn) {
   const hasModeColumns = await hasQuestionSetModeColumns(conn);
+  const hasVersionColumns = await hasQuestionSetVersionColumns(conn);
   const modeSelect = hasModeColumns
     ? 'EXAM_MODE, SHOW_CORRECT_ANSWERS, COUNTS_TOWARD_RESULTS,'
     : `'GRADED' AS EXAM_MODE, FALSE AS SHOW_CORRECT_ANSWERS, TRUE AS COUNTS_TOWARD_RESULTS,`;
+  const versionSelect = hasVersionColumns
+    ? 'VERSION_GROUP_ID, VERSION_NUMBER, LIFECYCLE_STATUS, PARENT_QUESTION_SET_ID, IMPORT_SOURCE,'
+    : 'QUESTION_SET_ID AS VERSION_GROUP_ID, 1 AS VERSION_NUMBER, \'PUBLISHED\' AS LIFECYCLE_STATUS, NULL AS PARENT_QUESTION_SET_ID, NULL AS IMPORT_SOURCE,';
   const rows = await execQuery(
     conn,
     `SELECT QUESTION_SET_ID, NAME, DESCRIPTION, IS_ACTIVE,
-            DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, ${modeSelect} NUM_QUESTIONS,
+            DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, ${modeSelect}${versionSelect} NUM_QUESTIONS,
             CREATED_AT, UPDATED_AT
        FROM QUESTION_SETS
       WHERE IS_ACTIVE = TRUE
@@ -499,7 +849,7 @@ async function getActiveQuestionSetRow(conn) {
   const fallback = await execQuery(
     conn,
     `SELECT QUESTION_SET_ID, NAME, DESCRIPTION, IS_ACTIVE,
-            DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, ${modeSelect} NUM_QUESTIONS,
+            DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, ${modeSelect}${versionSelect} NUM_QUESTIONS,
             CREATED_AT, UPDATED_AT
        FROM QUESTION_SETS
       ORDER BY QUESTION_SET_ID ASC
@@ -530,13 +880,17 @@ async function loadQuestionSet(conn, questionSetId, options = {}) {
   if (!allowEmpty && _questionSetCache.has(cacheKey)) return _questionSetCache.get(cacheKey);
 
   const hasModeColumns = await hasQuestionSetModeColumns(conn);
+  const hasVersionColumns = await hasQuestionSetVersionColumns(conn);
   const modeSelect = hasModeColumns
     ? 'EXAM_MODE, SHOW_CORRECT_ANSWERS, COUNTS_TOWARD_RESULTS,'
     : `'GRADED' AS EXAM_MODE, FALSE AS SHOW_CORRECT_ANSWERS, TRUE AS COUNTS_TOWARD_RESULTS,`;
+  const versionSelect = hasVersionColumns
+    ? 'VERSION_GROUP_ID, VERSION_NUMBER, LIFECYCLE_STATUS, PARENT_QUESTION_SET_ID, IMPORT_SOURCE,'
+    : 'QUESTION_SET_ID AS VERSION_GROUP_ID, 1 AS VERSION_NUMBER, \'PUBLISHED\' AS LIFECYCLE_STATUS, NULL AS PARENT_QUESTION_SET_ID, NULL AS IMPORT_SOURCE,';
   const metaRows = await execQuery(
     conn,
     `SELECT QUESTION_SET_ID, NAME, DESCRIPTION, IS_ACTIVE,
-            DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, ${modeSelect} NUM_QUESTIONS,
+            DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, ${modeSelect}${versionSelect} NUM_QUESTIONS,
             CREATED_AT, UPDATED_AT
        FROM QUESTION_SETS
       WHERE QUESTION_SET_ID = ?`,
@@ -618,6 +972,99 @@ async function loadResolvedQuestionSet(conn, code) {
   return loadQuestionSet(conn, questionSetId);
 }
 
+async function cloneQuestionSetWithChildren(conn, sourceId, overrides = {}) {
+  const source = await loadQuestionSet(conn, sourceId, { allowEmpty: true });
+  const hasVersionColumns = await hasQuestionSetVersionColumns(conn);
+  const nextVersion = hasVersionColumns
+    ? Number((await execQuery(
+        conn,
+        'SELECT COALESCE(MAX(VERSION_NUMBER), 0) AS MAX_VERSION FROM QUESTION_SETS WHERE VERSION_GROUP_ID = ?',
+        [source.versionGroupId || source.id]
+      ))?.[0]?.MAX_VERSION || 0) + 1
+    : 1;
+
+  const baseName = String(overrides.name || `${source.name} v${nextVersion}`).trim();
+  const baseDescription = overrides.description != null ? String(overrides.description) : source.description;
+  if (hasVersionColumns) {
+    await execQuery(
+      conn,
+      `INSERT INTO QUESTION_SETS
+        (NAME, DESCRIPTION, IS_ACTIVE, DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, EXAM_MODE, SHOW_CORRECT_ANSWERS, COUNTS_TOWARD_RESULTS, NUM_QUESTIONS, VERSION_GROUP_ID, VERSION_NUMBER, LIFECYCLE_STATUS, PARENT_QUESTION_SET_ID, IMPORT_SOURCE, CREATED_AT, UPDATED_AT)
+       VALUES (?, ?, FALSE, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_UTCTIMESTAMP, CURRENT_UTCTIMESTAMP)`,
+      [
+        baseName,
+        baseDescription || null,
+        source.durationMinutes || 45,
+        source.passPct || 80,
+        source.proctorEnabled !== false ? 1 : 0,
+        source.examMode || 'GRADED',
+        source.showCorrectAnswers === true ? 1 : 0,
+        source.countsTowardResults !== false ? 1 : 0,
+        source.numQuestions,
+        source.versionGroupId || source.id,
+        nextVersion,
+        String(overrides.lifecycleStatus || 'DRAFT').toUpperCase(),
+        source.id,
+        overrides.importSource || source.importSource || null
+      ]
+    );
+  } else {
+    await execQuery(
+      conn,
+      `INSERT INTO QUESTION_SETS
+        (NAME, DESCRIPTION, IS_ACTIVE, DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, EXAM_MODE, SHOW_CORRECT_ANSWERS, COUNTS_TOWARD_RESULTS, NUM_QUESTIONS, CREATED_AT, UPDATED_AT)
+       VALUES (?, ?, FALSE, ?, ?, ?, ?, ?, ?, ?, CURRENT_UTCTIMESTAMP, CURRENT_UTCTIMESTAMP)`,
+      [
+        baseName,
+        baseDescription || null,
+        source.durationMinutes || 45,
+        source.passPct || 80,
+        source.proctorEnabled !== false ? 1 : 0,
+        source.examMode || 'GRADED',
+        source.showCorrectAnswers === true ? 1 : 0,
+        source.countsTowardResults !== false ? 1 : 0,
+        source.numQuestions
+      ]
+    );
+  }
+  const createdRow = await execQuery(conn, 'SELECT MAX(QUESTION_SET_ID) AS QUESTION_SET_ID FROM QUESTION_SETS');
+  const newSetId = Number(createdRow?.[0]?.QUESTION_SET_ID);
+
+  const sectionIdMap = new Map();
+  for (const section of source.sections || []) {
+    await execQuery(
+      conn,
+      `INSERT INTO QUESTION_SECTIONS
+        (QUESTION_SET_ID, NAME, DESCRIPTION, DISPLAY_ORDER, DRAW_COUNT, CREATED_AT, UPDATED_AT)
+       VALUES (?, ?, ?, ?, ?, CURRENT_UTCTIMESTAMP, CURRENT_UTCTIMESTAMP)`,
+      [newSetId, section.name, section.description || null, section.displayOrder || 0, section.drawCount]
+    );
+    const sectionRow = await execQuery(conn, 'SELECT MAX(SECTION_ID) AS SECTION_ID FROM QUESTION_SECTIONS');
+    sectionIdMap.set(section.id, Number(sectionRow?.[0]?.SECTION_ID));
+  }
+
+  for (const question of source.questions || []) {
+    await execQuery(
+      conn,
+      `INSERT INTO QUESTION_SET_QUESTIONS
+        (QUESTION_SET_ID, SECTION_ID, QUESTION_INDEX, STEM, NOTE, OPTS_JSON, ANSWER_JSON, MULTI, CREATED_AT, UPDATED_AT)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_UTCTIMESTAMP, CURRENT_UTCTIMESTAMP)`,
+      [
+        newSetId,
+        question.sectionId == null ? null : (sectionIdMap.get(question.sectionId) || null),
+        question.questionIndex,
+        question.stem,
+        question.note || null,
+        JSON.stringify(question.opts || []),
+        JSON.stringify(question.answer || []),
+        question.multi ? 1 : 0
+      ]
+    );
+  }
+  clearQuestionSetCache();
+  return loadQuestionSet(conn, newSetId, { allowEmpty: true });
+}
+
 function pickQuestionsForSession(questionSet, code) {
   const allQuestions = Array.isArray(questionSet?.questions) ? [...questionSet.questions] : [];
   if (!allQuestions.length) throw new Error('Question set is empty.');
@@ -676,7 +1123,7 @@ function buildExamConfigForSet(questionSet, totalOverride = null, examEnabled = 
   const durationSecs = (Number(questionSet.durationMinutes || 45) || 45) * 60;
   const passPct = Number(questionSet.passPct || 80) || 80;
   return {
-    examName: questionSet.name || EXAM_NAME,
+    examName: normalizeExamTitle(questionSet.name || EXAM_NAME),
     examDescription: questionSet.description || '',
     examActive: examEnabled,
     durationSecs,
@@ -726,21 +1173,47 @@ async function getSavedSession(conn, code) {
   );
   if (!rows.length) return null;
   const parsed = parseJsonOrNull(rows[0].SESSION_JSON);
-  const progress = sanitizeProgress(parsed);
+  if (!parsed || typeof parsed !== 'object') return null;
+
+  const rawProgress = parsed.progress && typeof parsed.progress === 'object'
+    ? parsed.progress
+    : parsed;
+  const progress = sanitizeProgress(rawProgress);
   if (!progress) return null;
   progress.elapsedMs = Number(rows[0].ELAPSED_MS || progress.elapsedMs || 0);
   progress.tabSwitches = Number(rows[0].TAB_SWITCHES || progress.tabSwitches || 0);
-  return progress;
+
+  const session = parsed.session && typeof parsed.session === 'object'
+    ? parsed.session
+    : null;
+  const resumeSupported = Boolean(
+    session &&
+    Array.isArray(session.questions) &&
+    Array.isArray(session.qOrder) &&
+    Array.isArray(session.optOrders) &&
+    Array.isArray(session.answerKey) &&
+    session.tokenNonce &&
+    Number(session.tokenExpiry || 0) > 0
+  );
+
+  return {
+    progress,
+    session: resumeSupported ? session : null,
+    resumeSupported
+  };
 }
 
-async function saveSession(conn, code, progress) {
+async function saveSession(conn, code, progress, session = null) {
   const payload = {
-    answers: progress.answers || [],
-    visited: progress.visited || [],
-    currentQ: progress.currentQ || 0,
-    incidents: progress.incidents || [],
-    tabSwitches: progress.tabSwitches || 0,
-    elapsedMs: progress.elapsedMs || 0
+    progress: {
+      answers: progress.answers || [],
+      visited: progress.visited || [],
+      currentQ: progress.currentQ || 0,
+      incidents: progress.incidents || [],
+      tabSwitches: progress.tabSwitches || 0,
+      elapsedMs: progress.elapsedMs || 0
+    },
+    session: session || null
   };
   await execQuery(
     conn,
@@ -755,12 +1228,179 @@ async function saveSession(conn, code, progress) {
       WHEN NOT MATCHED THEN INSERT
         (ACCESS_CODE, SESSION_JSON, ELAPSED_MS, TAB_SWITCHES, UPDATED_AT)
         VALUES (S.ACCESS_CODE, S.SESSION_JSON, S.ELAPSED_MS, S.TAB_SWITCHES, CURRENT_UTCTIMESTAMP)`,
-    [code, JSON.stringify(payload), payload.elapsedMs, payload.tabSwitches]
+    [code, JSON.stringify(payload), payload.progress.elapsedMs, payload.progress.tabSwitches]
   );
 }
 
 async function deleteSession(conn, code) {
   await execQuery(conn, 'DELETE FROM EXAM_SESSIONS WHERE ACCESS_CODE = ?', [code]);
+}
+
+async function clearStaleSessionsWithConn(conn) {
+  const staleRows = await execQuery(
+    conn,
+    `SELECT ACCESS_CODE
+       FROM EXAM_SESSIONS
+      WHERE UPDATED_AT < ADD_SECONDS(CURRENT_UTCTIMESTAMP, ?)
+      ORDER BY UPDATED_AT ASC`,
+    [-1 * STALE_SESSION_MINUTES * 60]
+  );
+
+  const cleared = [];
+  for (const row of staleRows) {
+    const code = String(row.ACCESS_CODE || '').trim().toUpperCase();
+    if (!code) continue;
+    await deleteSession(conn, code);
+    await execQuery(
+      conn,
+      `UPDATE ACCESS_CODES
+          SET STATUS = 'unused',
+              UPDATED_AT = CURRENT_UTCTIMESTAMP
+        WHERE ACCESS_CODE = ?
+          AND STATUS = 'active'
+          AND NOT EXISTS (
+            SELECT 1 FROM EXAM_RESULTS r WHERE r.ACCESS_CODE = ACCESS_CODES.ACCESS_CODE
+          )`,
+      [code]
+    );
+    cleared.push(code);
+  }
+  return cleared;
+}
+
+function normalizeQuestionUploadEntry(entry) {
+  const qNum = Number(entry?.qNum);
+  const stem = String(entry?.stem || '').trim();
+  const note = String(entry?.note || '').trim();
+  const opts = Array.isArray(entry?.opts)
+    ? entry.opts.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
+  const correctIndices = Array.isArray(entry?.correctIndices)
+    ? entry.correctIndices.map((item) => Number(item)).filter((n) => Number.isInteger(n) && n >= 0)
+    : [];
+  const multi = Boolean(entry?.multi);
+  return { qNum, stem, note, opts, correctIndices, multi };
+}
+
+function validateQuestionUploadEntries(questions) {
+  const normalized = Array.isArray(questions) ? questions.map(normalizeQuestionUploadEntry) : [];
+  const errors = [];
+  const warnings = [];
+  const qNums = new Map();
+  const stems = new Map();
+  const optionSignatures = new Map();
+
+  if (!normalized.length) errors.push('At least one question is required.');
+  if (normalized.length > 500) errors.push('Question set upload limit is 500 questions per file.');
+
+  normalized.forEach((entry, idx) => {
+    const label = `Row ${idx + 2}`;
+    if (!Number.isInteger(entry.qNum) || entry.qNum < 1) errors.push(`${label}: q_num must be a positive integer.`);
+    if (!entry.stem) errors.push(`${label}: stem is required.`);
+    if (entry.stem.length > 2000) errors.push(`${label}: stem exceeds 2000 characters.`);
+    if (entry.note.length > 1000) warnings.push(`${label}: note is longer than 1000 characters.`);
+    if (entry.opts.length < 2) errors.push(`${label}: at least two options are required.`);
+    if (entry.opts.length > 6) errors.push(`${label}: maximum six options are supported.`);
+    if (!entry.correctIndices.length) errors.push(`${label}: correct_indices is required.`);
+    if (!entry.multi && entry.correctIndices.length !== 1) errors.push(`${label}: single-select questions need exactly one correct index.`);
+    if (entry.correctIndices.some((correctIdx) => correctIdx >= entry.opts.length)) {
+      errors.push(`${label}: correct index is out of range for the option list.`);
+    }
+    if (new Set(entry.opts.map((opt) => opt.toLowerCase())).size !== entry.opts.length) {
+      warnings.push(`${label}: duplicate option text detected.`);
+    }
+
+    const qNumKey = String(entry.qNum);
+    if (qNums.has(qNumKey)) errors.push(`${label}: q_num ${entry.qNum} duplicates another row.`);
+    else qNums.set(qNumKey, true);
+
+    const stemKey = entry.stem.toLowerCase();
+    if (stemKey) {
+      if (stems.has(stemKey)) warnings.push(`${label}: duplicate question stem detected.`);
+      else stems.set(stemKey, true);
+    }
+
+    const optionKey = entry.opts.map((opt) => opt.toLowerCase()).join('|');
+    if (optionKey) {
+      if (optionSignatures.has(optionKey)) warnings.push(`${label}: same option set appears in another question.`);
+      else optionSignatures.set(optionKey, true);
+    }
+  });
+
+  return {
+    ok: errors.length === 0,
+    errors,
+    warnings,
+    normalized
+  };
+}
+
+function parseDateFilter(value, endOfDay = false) {
+  const text = String(value || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return null;
+  return `${text}T${endOfDay ? '23:59:59.999' : '00:00:00.000'}Z`;
+}
+
+async function buildAdminNotifications(conn) {
+  const notifications = [];
+  const questionSets = await getQuestionSetRows(conn, { includeCounts: true });
+  const activeSet = questionSets.find((set) => set.isActive) || null;
+  if (!activeSet) {
+    notifications.push({ level: 'high', kind: 'config', message: 'No active exam set configured.' });
+  } else if ((activeSet.questionCount || 0) === 0) {
+    notifications.push({ level: 'high', kind: 'config', message: `Active exam "${activeSet.name}" has no questions.` });
+  }
+  const staleRows = await execQuery(
+    conn,
+    `SELECT ACCESS_CODE, UPDATED_AT
+       FROM EXAM_SESSIONS
+      WHERE UPDATED_AT < ADD_SECONDS(CURRENT_UTCTIMESTAMP, ?)
+      ORDER BY UPDATED_AT ASC
+      LIMIT 10`,
+    [-1 * STALE_SESSION_MINUTES * 60]
+  );
+  staleRows.forEach((row) => {
+    notifications.push({
+      level: 'medium',
+      kind: 'session',
+      message: `Stale active session: ${row.ACCESS_CODE}`,
+      detail: row.UPDATED_AT ? new Date(row.UPDATED_AT).toISOString() : null
+    });
+  });
+  const flaggedRows = await execQuery(
+    conn,
+    `SELECT ACCESS_CODE, INCIDENT_COUNT, SUBMITTED_AT
+       FROM EXAM_RESULTS
+      WHERE INCIDENT_COUNT > 0
+      ORDER BY SUBMITTED_AT DESC
+      LIMIT 10`
+  );
+  flaggedRows.forEach((row) => {
+    notifications.push({
+      level: Number(row.INCIDENT_COUNT || 0) >= 3 ? 'high' : 'medium',
+      kind: 'proctor',
+      message: `Exam ${row.ACCESS_CODE} has ${row.INCIDENT_COUNT} flagged incident(s).`,
+      detail: row.SUBMITTED_AT ? new Date(row.SUBMITTED_AT).toISOString() : null
+    });
+  });
+  if (await hasAuditLogTable(conn)) {
+    const failedLogins = await execQuery(
+      conn,
+      `SELECT COUNT(*) AS CNT
+         FROM ADMIN_AUDIT_LOG
+        WHERE ACTION = 'admin_login_failed'
+          AND CREATED_AT >= ADD_SECONDS(CURRENT_UTCTIMESTAMP, -3600)`
+    );
+    const count = Number(failedLogins?.[0]?.CNT || 0);
+    if (count >= 3) {
+      notifications.push({
+        level: 'high',
+        kind: 'security',
+        message: `${count} failed admin login attempts in the last hour.`
+      });
+    }
+  }
+  return notifications.slice(0, 20);
 }
 
 async function getResultRecord(conn, code) {
@@ -943,9 +1583,17 @@ function gradeExamFromSession(session, answers) {
   return { score, total, pct, pass, questionResults, sectionResults };
 }
 
-app.post('/api/proctor/check', async (req, res) => {
+app.post('/api/proctor/check', requireExamSession, async (req, res) => {
+  if (req.examSession?.proctorEnabled === false) {
+    return res.json({ enabled: false, flag: false, reason: null });
+  }
+  const ip = getClientIp(req);
+  if (!checkRateLimit('proctor_check', `${ip}:${req.examSession.code}`, PROCTOR_MAX, PROCTOR_WINDOW)) {
+    return res.status(429).json({ error: 'too_many_attempts' });
+  }
   const imageB64 = req.body && typeof req.body.imageB64 === 'string' ? req.body.imageB64 : '';
   if (!imageB64) return res.status(400).json({ error: 'missing_image' });
+  if (imageB64.length > 2_000_000) return res.status(413).json({ error: 'image_too_large' });
   if (!ANTHROPIC_API_KEY) return res.json({ enabled: false, flag: false, reason: null });
 
   try {
@@ -1005,7 +1653,14 @@ app.post('/api/proctor/check', async (req, res) => {
 });
 
 app.get('/api/health', async (_req, res) => {
-  if (!HAS_DB_CONFIG) return res.status(500).json({ ok: false, message: 'Missing HANA env vars.' });
+  if (!HAS_DB_CONFIG) {
+    return res.status(500).json({
+      ok: false,
+      message: 'Missing HANA env vars.',
+      requestId: _req.requestId,
+      startup: startupSummary()
+    });
+  }
   try {
     const status = await withDb(async (conn) => {
       await execQuery(conn, 'SELECT 1 AS OK FROM DUMMY');
@@ -1014,28 +1669,33 @@ app.get('/api/health', async (_req, res) => {
       const questionSet = await loadQuestionSet(conn, activeSet.id);
       const setRows = await execQuery(conn, 'SELECT COUNT(*) AS CNT FROM QUESTION_SETS');
       const examEnabled = await getExamEnabled(conn);
+      const adminTokenNotBefore = await getAdminTokenNotBefore(conn);
       return {
         activeSet,
         questionSet,
         setCount: Number(setRows?.[0]?.CNT || 0),
-        examEnabled
+        examEnabled,
+        adminTokenNotBefore
       };
     });
     res.json({
       ok: true,
+      requestId: _req.requestId,
       db: 'connected',
       schema: HANA_SCHEMA,
       totalQuestions: status.questionSet.totalQuestions,
       totalQuestionSets: status.setCount,
       examActive: status.examEnabled,
+      startup: startupSummary(),
+      adminSessionRevokedAt: status.adminTokenNotBefore ? new Date(status.adminTokenNotBefore).toISOString() : null,
       activeQuestionSet: {
         id: status.activeSet.id,
         name: status.activeSet.name
       }
     });
   } catch (err) {
-    appLog('error', 'health_failed', { message: err.message });
-    res.status(500).json({ ok: false, message: err.message });
+    appLog('error', 'health_failed', { requestId: _req.requestId, message: err.message });
+    res.status(500).json({ ok: false, message: err.message, requestId: _req.requestId, startup: startupSummary() });
   }
 });
 
@@ -1060,8 +1720,10 @@ app.get('/api/bootstrap', (_req, res) => {
 });
 
 app.post('/api/validate', async (req, res) => {
-  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
-  if (!checkRateLimit(String(ip))) return res.status(429).json({ valid: false, reason: 'too_many_attempts' });
+  const ip = getClientIp(req);
+  if (!checkRateLimit('candidate_validate', String(ip), VALIDATE_MAX, VALIDATE_WINDOW)) {
+    return res.status(429).json({ valid: false, reason: 'too_many_attempts' });
+  }
 
   const code = String(req.body?.code || '').trim().toUpperCase();
   if (!/^[A-Z2-9]{6}$/.test(code)) return res.json({ valid: false, reason: 'invalid_format' });
@@ -1080,9 +1742,15 @@ app.post('/api/validate', async (req, res) => {
         return { valid: true, status: 'completed', result: sanitizeCandidateResult(savedResult) || null, questionSet: { id: questionSet.id, name: questionSet.name }, ...cfg };
       }
 
-      const progress = await getSavedSession(conn, code);
-      if (progress || codeRow.status === 'active') {
-        return { valid: true, status: 'active', progress: progress || null, questionSet: { id: questionSet.id, name: questionSet.name }, ...cfg };
+      const storedSession = await getSavedSession(conn, code);
+      if ((storedSession && storedSession.progress) || codeRow.status === 'active') {
+        return {
+          valid: true,
+          status: 'active',
+          progress: storedSession?.resumeSupported ? storedSession.progress : null,
+          questionSet: { id: questionSet.id, name: questionSet.name },
+          ...cfg
+        };
       }
 
       return { valid: true, status: 'unused', questionSet: { id: questionSet.id, name: questionSet.name }, ...cfg };
@@ -1117,15 +1785,35 @@ app.post('/api/session/start', async (req, res) => {
       }
 
       if (fresh) await deleteSession(conn, code);
-      const progress = fresh ? null : await getSavedSession(conn, code);
-      const { token } = createExamSessionFromSet(code, questionSet);
+      const storedSession = fresh ? null : await getSavedSession(conn, code);
+      const progress = storedSession?.resumeSupported ? storedSession.progress : null;
+      const tokenNonce = crypto.randomBytes(16).toString('hex');
+      const tokenExpiry = Date.now() + Math.max(
+        EXAM_TTL_MS,
+        ((Number(questionSet.durationMinutes || 45) || 45) * 60 * 1000) + (30 * 60 * 1000)
+      );
+      const sessionState = storedSession?.resumeSupported
+        && storedSession.session
+        && Number(storedSession.session.questionSetId) === Number(questionSet.id)
+        ? {
+            ...storedSession.session,
+            questionSetName: normalizeExamTitle(questionSet.name),
+            tokenNonce,
+            tokenExpiry
+          }
+        : {
+            ...createPersistedExamSessionFromSet(code, questionSet),
+            tokenNonce,
+            tokenExpiry
+          };
+      await saveSession(conn, code, progress || sanitizeProgress({}), sessionState);
       await updateCodeStatus(conn, code, 'active');
 
       return {
         status: 200,
         body: {
           ok: true,
-          examToken: token,
+          examToken: createExamToken(code, tokenNonce, tokenExpiry),
           progress,
           questionSet: { id: questionSet.id, name: questionSet.name },
           ...sessionConfig
@@ -1182,7 +1870,7 @@ app.post('/api/progress', requireExamSession, async (req, res) => {
 
   try {
     await withDb(async (conn) => {
-      await saveSession(conn, code, progress);
+      await saveSession(conn, code, progress, session);
       await updateCodeStatus(conn, code, 'active');
     });
     res.json({ ok: true });
@@ -1233,10 +1921,6 @@ app.post('/api/submit', requireExamSession, async (req, res) => {
       await deleteSession(conn, code);
     });
 
-    for (const [token, value] of _examSessions.entries()) {
-      if (value.code === code) _examSessions.delete(token);
-    }
-
     appLog('info', 'exam_submitted', { code, score: record.score, pct: record.pct, pass: record.pass });
     res.json({ ok: true, result: sanitizeCandidateResult(record) });
   } catch (err) {
@@ -1245,7 +1929,7 @@ app.post('/api/submit', requireExamSession, async (req, res) => {
   }
 });
 
-app.get('/api/result/:code', async (req, res) => {
+app.get('/api/result/:code', requireAdmin, async (req, res) => {
   const code = String(req.params.code || '').trim().toUpperCase();
   if (!/^[A-Z2-9]{6}$/.test(code)) return res.status(400).json({ error: 'invalid_code' });
   try {
@@ -1258,22 +1942,73 @@ app.get('/api/result/:code', async (req, res) => {
   }
 });
 
+app.get('/api/admin/results/:code/signed-summary', requireAdmin, requirePermission('compliance:read'), async (req, res) => {
+  const code = String(req.params.code || '').trim().toUpperCase();
+  if (!/^[A-Z2-9]{6}$/.test(code)) return res.status(400).json({ error: 'invalid_code' });
+  try {
+    const envelope = await withDb(async (conn) => {
+      const result = await getResultRecord(conn, code);
+      if (!result) throw new Error('not_found');
+      const payload = {
+        generatedAt: new Date().toISOString(),
+        code,
+        questionSetId: result.questionSetId ?? null,
+        questionSetName: normalizeExamTitle(result.questionSetName || ''),
+        examMode: result.examMode || 'GRADED',
+        score: result.score ?? null,
+        total: result.total ?? null,
+        pct: result.pct ?? null,
+        pass: result.pass ?? null,
+        submittedAt: result.submittedAt || null,
+        durationSecs: result.durationSecs ?? null,
+        incidentCount: result.incidentCount ?? (Array.isArray(result.incidents) ? result.incidents.length : 0)
+      };
+      return buildSignedEnvelope(payload);
+    });
+    res.json({ ok: true, ...envelope });
+  } catch (err) {
+    const status = err.message === 'not_found' ? 404 : 500;
+    res.status(status).json({ error: err.message });
+  }
+});
+
+app.post('/api/admin/results/verify-signature', requireAdmin, requirePermission('compliance:read'), (req, res) => {
+  const payload = req.body?.payload;
+  const signature = String(req.body?.signature || '');
+  if (!payload || !signature) return res.status(400).json({ error: 'payload_and_signature_required' });
+  const expected = signPayload(payload);
+  res.json({ ok: true, valid: expected === signature, expected });
+});
+
 app.post('/api/admin/login', (req, res) => {
   if (!ADMIN_HASH && !MANAGER_HASH) return res.status(503).json({ ok: false, error: 'admin_not_configured' });
   const ip = getClientIp(req);
-  if (!checkRateLimit(String(ip))) return res.status(429).json({ ok: false, error: 'too_many_attempts' });
+  if (!checkRateLimit('admin_login', String(ip), ADMIN_LOGIN_MAX, ADMIN_LOGIN_WINDOW)) {
+    appLog('warn', 'admin_login_rate_limited', { requestId: req.requestId, clientIp: ip });
+    return res.status(429).json({ ok: false, error: 'too_many_attempts' });
+  }
 
   const hash = String(req.body?.hash || '').trim().toLowerCase();
   const role = hash && hash === ADMIN_HASH
     ? 'admin'
-    : (MANAGER_HASH && hash === MANAGER_HASH ? 'manager' : null);
+    : (MANAGER_HASH && hash === MANAGER_HASH
+      ? 'manager'
+      : (REVIEWER_HASH && hash === REVIEWER_HASH
+        ? 'reviewer'
+        : (CONTENT_EDITOR_HASH && hash === CONTENT_EDITOR_HASH ? 'content_editor' : null)));
   if (!role) {
+    _metrics.loginFailures += 1;
+    const bucketState = _rateLimitBuckets.get(`admin_login:${String(ip)}`);
+    const attempts = Number(bucketState?.count || 0);
     void tryWriteAdminAudit({
       action: 'admin_login_failed',
       actor: 'admin',
       clientIp: ip,
-      details: { reason: 'invalid_credentials' }
+      details: { reason: 'invalid_credentials', attempts }
     });
+    if (attempts >= Math.max(3, ADMIN_LOGIN_MAX - 2)) {
+      appLog('warn', 'admin_login_bruteforce_suspected', { requestId: req.requestId, clientIp: ip, attempts });
+    }
     return setTimeout(() => res.status(401).json({ ok: false, error: 'invalid_credentials' }), 350);
   }
 
@@ -1286,7 +2021,38 @@ app.post('/api/admin/login', (req, res) => {
   return res.json({ ok: true, token: createAdminToken(role), role });
 });
 
-app.get('/api/admin/codes', requireAdmin, async (_req, res) => {
+app.post('/api/admin/logout', requireAdmin, async (req, res) => {
+  void tryWriteAdminAudit({
+    action: 'admin_logout',
+    actor: req.adminRole || 'admin',
+    clientIp: getClientIp(req),
+    details: { ok: true }
+  });
+  res.json({ ok: true });
+});
+
+app.post('/api/admin/sessions/revoke-all', requireAdmin, requireAdminRole('admin'), async (req, res) => {
+  try {
+    const revokedAt = Date.now();
+    await withDb(async (conn) => {
+      await setAppSetting(conn, APP_SETTING_ADMIN_TOKEN_NOT_BEFORE, String(revokedAt));
+      _runtimeState.adminTokenNotBefore = revokedAt;
+      _runtimeState.adminTokenNotBeforeFetchedAt = Date.now();
+      await writeAdminAudit(conn, {
+        action: 'admin_sessions_revoked',
+        actor: 'admin',
+        clientIp: getClientIp(req),
+        details: { revokedAt }
+      });
+    });
+    res.json({ ok: true, revokedAt });
+  } catch (err) {
+    appLog('error', 'admin_revoke_sessions_failed', { requestId: req.requestId, message: err.message });
+    res.status(500).json({ error: 'admin_revoke_sessions_failed' });
+  }
+});
+
+app.get('/api/admin/codes', requireAdmin, requirePermission('codes:read'), async (_req, res) => {
   try {
     const payload = await withDb(async (conn) => {
       const hasNotes = await hasNotesColumn(conn);
@@ -1331,7 +2097,7 @@ app.get('/api/admin/codes', requireAdmin, async (_req, res) => {
         incidents: parsedResult?.incidents || [],
         questionResults: Array.isArray(parsedResult?.questionResults) ? parsedResult.questionResults : [],
         questionSetId: r.QUESTION_SET_ID == null ? null : Number(r.QUESTION_SET_ID),
-        questionSetName: r.QUESTION_SET_NAME || '',
+        questionSetName: normalizeExamTitle(r.QUESTION_SET_NAME || ''),
         questionSetActive: r.QUESTION_SET_ACTIVE == null ? false : Boolean(r.QUESTION_SET_ACTIVE),
         examMode: parsedResult?.examMode || '',
         isPractice: parsedResult?.examMode === 'PRACTICE' || parsedResult?.isPractice === true,
@@ -1350,7 +2116,7 @@ app.get('/api/admin/codes', requireAdmin, async (_req, res) => {
   }
 });
 
-app.get('/api/admin/system-status', requireAdmin, async (_req, res) => {
+app.get('/api/admin/system-status', requireAdmin, requirePermission('dashboard:read'), async (_req, res) => {
   try {
     const status = await withDb(async (conn) => {
       const questionSets = await getQuestionSetRows(conn, { includeCounts: true });
@@ -1374,6 +2140,7 @@ app.get('/api/admin/system-status', requireAdmin, async (_req, res) => {
         [-1 * STALE_SESSION_MINUTES * 60]
       );
       const auditRows = auditEnabled ? await execQuery(conn, 'SELECT COUNT(*) AS CNT FROM ADMIN_AUDIT_LOG') : [{ CNT: 0 }];
+      const adminTokenNotBefore = await getAdminTokenNotBefore(conn);
       return {
         ok: Boolean(activeQuestionSet && activeQuestionSet.totalQuestions > 0),
         schema: HANA_SCHEMA,
@@ -1395,11 +2162,18 @@ app.get('/api/admin/system-status', requireAdmin, async (_req, res) => {
         appVersion: APP_VERSION,
         appRevision: APP_REVISION,
         deployedAt: APP_DEPLOYED_AT,
+        startupErrors: startupErrors(),
+        startupWarnings: startupWarnings(),
+        adminSessionRevokedAt: adminTokenNotBefore ? new Date(adminTokenNotBefore).toISOString() : null,
         notesEnabled: Boolean(hasNotes),
         auditEnabled,
         adminConfigured: Boolean(ADMIN_HASH),
         managerConfigured: Boolean(MANAGER_HASH),
+        reviewerConfigured: Boolean(REVIEWER_HASH),
+        contentEditorConfigured: Boolean(CONTENT_EDITOR_HASH),
+        metrics: getMetricsSnapshot(),
         warnings: [
+          ...startupWarnings(),
           ...(questionSets.length ? [] : ['No question sets found.']),
           ...(activeQuestionSet && activeQuestionSet.totalQuestions > 0 ? [] : ['Active question set has no questions.']),
           ...(examEnabled ? [] : ['Exam access is currently disabled. Candidates cannot enter codes.']),
@@ -1432,17 +2206,23 @@ app.get('/api/admin/system-status', requireAdmin, async (_req, res) => {
       appVersion: APP_VERSION,
       appRevision: APP_REVISION,
       deployedAt: APP_DEPLOYED_AT,
+      startupErrors: startupErrors(),
+      startupWarnings: startupWarnings(),
+      adminSessionRevokedAt: _runtimeState.adminTokenNotBefore ? new Date(_runtimeState.adminTokenNotBefore).toISOString() : null,
       notesEnabled: false,
       auditEnabled: false,
       adminConfigured: Boolean(ADMIN_HASH),
       managerConfigured: Boolean(MANAGER_HASH),
-      warnings: ['Could not load system status from HANA.'],
+      reviewerConfigured: Boolean(REVIEWER_HASH),
+      contentEditorConfigured: Boolean(CONTENT_EDITOR_HASH),
+      metrics: getMetricsSnapshot(),
+      warnings: [...startupWarnings(), 'Could not load system status from HANA.'],
       error: 'admin_system_status_failed'
     });
   }
 });
 
-app.get('/api/admin/audit', requireAdmin, async (req, res) => {
+app.get('/api/admin/audit', requireAdmin, requirePermission('audit:read'), async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query?.limit) || 20, 1), 100);
   try {
     const entries = await withDb(async (conn) => {
@@ -1471,6 +2251,54 @@ app.get('/api/admin/audit', requireAdmin, async (req, res) => {
   }
 });
 
+app.get('/api/admin/metrics', requireAdmin, requirePermission('dashboard:read'), (_req, res) => {
+  res.json({ ok: true, metrics: getMetricsSnapshot() });
+});
+
+app.get('/api/admin/notifications', requireAdmin, requirePermission('notifications:read'), async (_req, res) => {
+  try {
+    const notifications = await withDb(async (conn) => buildAdminNotifications(conn));
+    res.json({ ok: true, notifications });
+  } catch (err) {
+    appLog('error', 'admin_notifications_failed', { requestId: _req.requestId, message: err.message });
+    res.status(500).json({ error: 'admin_notifications_failed' });
+  }
+});
+
+app.get('/api/admin/audit/export.json', requireAdmin, requirePermission('audit:export'), async (req, res) => {
+  const limit = Math.min(Math.max(Number(req.query?.limit) || 500, 1), 5000);
+  try {
+    const envelope = await withDb(async (conn) => {
+      if (!(await hasAuditLogTable(conn))) return buildSignedEnvelope({ entries: [], generatedAt: new Date().toISOString(), limit });
+      const rows = await execQuery(
+        conn,
+        `SELECT AUDIT_ID, ACTION, TARGET_CODE, DETAILS_JSON, ACTOR, CLIENT_IP, CREATED_AT
+           FROM ADMIN_AUDIT_LOG
+          ORDER BY CREATED_AT DESC
+          LIMIT ${limit}`
+      );
+      const payload = {
+        generatedAt: new Date().toISOString(),
+        limit,
+        entries: rows.map((row) => ({
+          id: row.AUDIT_ID,
+          action: row.ACTION,
+          targetCode: row.TARGET_CODE || '',
+          actor: row.ACTOR || '',
+          clientIp: row.CLIENT_IP || '',
+          createdAt: row.CREATED_AT ? new Date(row.CREATED_AT).toISOString() : null,
+          details: parseJsonOrNull(row.DETAILS_JSON) || null
+        }))
+      };
+      return buildSignedEnvelope(payload);
+    });
+    res.json({ ok: true, ...envelope });
+  } catch (err) {
+    appLog('error', 'admin_audit_export_failed', { requestId: req.requestId, message: err.message });
+    res.status(500).json({ error: 'admin_audit_export_failed' });
+  }
+});
+
 app.post('/api/admin/exam-availability', requireAdmin, requireAdminRole('admin'), async (req, res) => {
   const enabled = req.body?.enabled !== false;
   try {
@@ -1490,7 +2318,7 @@ app.post('/api/admin/exam-availability', requireAdmin, requireAdminRole('admin')
   }
 });
 
-app.get('/api/admin/results/:code/review', requireAdmin, async (req, res) => {
+app.get('/api/admin/results/:code/review', requireAdmin, requirePermission('results:read'), async (req, res) => {
   const code = String(req.params.code || '').trim().toUpperCase();
   if (!/^[A-Z2-9]{6}$/.test(code)) return res.status(400).json({ error: 'invalid_code' });
   try {
@@ -1667,37 +2495,101 @@ app.get('/api/admin/question-sets/:id/analytics', requireAdmin, async (req, res)
   }
 });
 
+app.get('/api/admin/analytics/overview', requireAdmin, requirePermission('analytics:read'), async (req, res) => {
+  const days = Math.min(Math.max(Number(req.query?.days) || 30, 7), 180);
+  try {
+    const payload = await withDb(async (conn) => {
+      const rows = await execQuery(
+        conn,
+        `SELECT r.ACCESS_CODE, r.SCORE, r.TOTAL, r.PCT, r.PASS, r.DURATION_SECS, r.RESULT_JSON, r.SUBMITTED_AT,
+                c.LABEL, c.QUESTION_SET_ID, qs.NAME AS QUESTION_SET_NAME
+           FROM EXAM_RESULTS r
+           LEFT JOIN ACCESS_CODES c ON c.ACCESS_CODE = r.ACCESS_CODE
+           LEFT JOIN QUESTION_SETS qs ON qs.QUESTION_SET_ID = c.QUESTION_SET_ID
+          WHERE r.SUBMITTED_AT >= ADD_DAYS(CURRENT_UTCTIMESTAMP, ?)
+          ORDER BY r.SUBMITTED_AT DESC`,
+        [-1 * days]
+      );
+      const attempts = rows.map((row) => {
+        const result = parseJsonOrNull(row.RESULT_JSON) || {};
+        return {
+          code: row.ACCESS_CODE,
+          questionSetId: Number(row.QUESTION_SET_ID ?? result.questionSetId ?? 0),
+          questionSetName: normalizeExamTitle(row.QUESTION_SET_NAME || result.questionSetName || 'Exam'),
+          pct: Number(row.PCT ?? result.pct ?? 0),
+          score: Number(row.SCORE ?? result.score ?? 0),
+          total: Number(row.TOTAL ?? result.total ?? 0),
+          pass: row.PASS == null ? Boolean(result.pass) : Boolean(row.PASS),
+          durationSecs: Number(row.DURATION_SECS ?? result.durationSecs ?? 0),
+          examMode: result.examMode || 'GRADED',
+          sectionResults: Array.isArray(result.sectionResults) ? result.sectionResults : [],
+          submittedAt: row.SUBMITTED_AT ? new Date(row.SUBMITTED_AT).toISOString() : null
+        };
+      });
+      const byDay = new Map();
+      const bySet = new Map();
+      const weakSections = new Map();
+      for (const attempt of attempts) {
+        const day = String(attempt.submittedAt || '').slice(0, 10);
+        if (day) {
+          const item = byDay.get(day) || { day, attempts: 0, passCount: 0, avgPctTotal: 0 };
+          item.attempts += 1;
+          item.avgPctTotal += Number(attempt.pct || 0);
+          if (attempt.pass) item.passCount += 1;
+          byDay.set(day, item);
+        }
+        const setKey = String(attempt.questionSetId || 0);
+        const setItem = bySet.get(setKey) || { questionSetId: attempt.questionSetId, name: attempt.questionSetName, attempts: 0, avgPctTotal: 0, passCount: 0 };
+        setItem.attempts += 1;
+        setItem.avgPctTotal += Number(attempt.pct || 0);
+        if (attempt.pass) setItem.passCount += 1;
+        bySet.set(setKey, setItem);
+        for (const section of attempt.sectionResults) {
+          const key = `${attempt.questionSetId}:${section.sectionId ?? section.name}`;
+          const sectionItem = weakSections.get(key) || { questionSetId: attempt.questionSetId, questionSetName: attempt.questionSetName, sectionId: section.sectionId ?? null, name: section.name || 'Section', totalPct: 0, attempts: 0 };
+          sectionItem.totalPct += Number(section.pct || 0);
+          sectionItem.attempts += 1;
+          weakSections.set(key, sectionItem);
+        }
+      }
+      return {
+        days,
+        summary: {
+          attempts: attempts.length,
+          passRate: attempts.length ? Math.round((attempts.filter((item) => item.pass).length / attempts.length) * 100) : null,
+          averagePct: attempts.length ? Math.round(attempts.reduce((sum, item) => sum + Number(item.pct || 0), 0) / attempts.length) : null,
+          averageDurationSecs: attempts.length ? Math.round(attempts.reduce((sum, item) => sum + Number(item.durationSecs || 0), 0) / attempts.length) : null
+        },
+        trend: [...byDay.values()].sort((a, b) => String(a.day).localeCompare(String(b.day))).map((item) => ({
+          day: item.day,
+          attempts: item.attempts,
+          averagePct: item.attempts ? Math.round(item.avgPctTotal / item.attempts) : null,
+          passRate: item.attempts ? Math.round((item.passCount / item.attempts) * 100) : null
+        })),
+        byQuestionSet: [...bySet.values()].sort((a, b) => b.attempts - a.attempts).map((item) => ({
+          questionSetId: item.questionSetId,
+          name: item.name,
+          attempts: item.attempts,
+          averagePct: item.attempts ? Math.round(item.avgPctTotal / item.attempts) : null,
+          passRate: item.attempts ? Math.round((item.passCount / item.attempts) * 100) : null
+        })),
+        weakestSections: [...weakSections.values()]
+          .map((item) => ({ ...item, averagePct: item.attempts ? Math.round(item.totalPct / item.attempts) : null }))
+          .sort((a, b) => a.averagePct - b.averagePct)
+          .slice(0, 12)
+      };
+    });
+    res.json({ ok: true, ...payload });
+  } catch (err) {
+    appLog('error', 'admin_analytics_overview_failed', { requestId: req.requestId, message: err.message });
+    res.status(500).json({ error: 'admin_analytics_overview_failed' });
+  }
+});
+
 app.post('/api/admin/clear-stale-sessions', requireAdmin, requireAdminRole('admin'), async (req, res) => {
   try {
     const payload = await withDb(async (conn) => {
-      const staleRows = await execQuery(
-        conn,
-        `SELECT ACCESS_CODE
-           FROM EXAM_SESSIONS
-          WHERE UPDATED_AT < ADD_SECONDS(CURRENT_UTCTIMESTAMP, ?)
-          ORDER BY UPDATED_AT ASC`,
-        [-1 * STALE_SESSION_MINUTES * 60]
-      );
-
-      const cleared = [];
-      for (const row of staleRows) {
-        const code = String(row.ACCESS_CODE || '').trim().toUpperCase();
-        if (!code) continue;
-        await deleteSession(conn, code);
-        await execQuery(
-          conn,
-          `UPDATE ACCESS_CODES
-              SET STATUS = 'unused',
-                  UPDATED_AT = CURRENT_UTCTIMESTAMP
-            WHERE ACCESS_CODE = ?
-              AND STATUS = 'active'
-              AND NOT EXISTS (
-                SELECT 1 FROM EXAM_RESULTS r WHERE r.ACCESS_CODE = ACCESS_CODES.ACCESS_CODE
-              )`,
-          [code]
-        );
-        cleared.push(code);
-      }
+      const cleared = await clearStaleSessionsWithConn(conn);
 
       await writeAdminAudit(conn, {
         action: 'admin_stale_sessions_cleared',
@@ -1709,10 +2601,6 @@ app.post('/api/admin/clear-stale-sessions', requireAdmin, requireAdminRole('admi
       return { ok: true, clearedCount: cleared.length, clearedCodes: cleared };
     });
 
-    for (const [token, value] of _examSessions.entries()) {
-      if (payload.clearedCodes.includes(value.code)) _examSessions.delete(token);
-    }
-
     res.json(payload);
   } catch (err) {
     appLog('error', 'admin_clear_stale_sessions_failed', { message: err.message });
@@ -1720,7 +2608,7 @@ app.post('/api/admin/clear-stale-sessions', requireAdmin, requireAdminRole('admi
   }
 });
 
-app.post('/api/admin/note', requireAdmin, async (req, res) => {
+app.post('/api/admin/note', requireAdmin, requirePermission('codes:note'), async (req, res) => {
   const code = String(req.body?.code || '').trim().toUpperCase();
   const notes = String(req.body?.notes || '');
   if (!/^[A-Z2-9]{6}$/.test(code)) return res.status(400).json({ error: 'invalid_code' });
@@ -1762,9 +2650,6 @@ app.post('/api/admin/reset', requireAdmin, requireAdminRole('admin'), async (req
         details: { status: 'unused' }
       });
     });
-    for (const [token, value] of _examSessions.entries()) {
-      if (value.code === code) _examSessions.delete(token);
-    }
     res.json({ ok: true });
   } catch (err) {
     appLog('error', 'admin_reset_failed', { code, message: err.message });
@@ -1805,9 +2690,6 @@ app.delete('/api/admin/codes/:code', requireAdmin, requireAdminRole('admin'), as
         details: { previousStatus: codeRow.status || 'unknown' }
       });
     });
-    for (const [token, value] of _examSessions.entries()) {
-      if (value.code === code) _examSessions.delete(token);
-    }
     res.json({ ok: true });
   } catch (err) {
     const status = err.message === 'code_not_found' ? 404 : 500;
@@ -1861,9 +2743,6 @@ app.post('/api/admin/codes/bulk-delete', requireAdmin, requireAdminRole('admin')
       });
       return { ok: true, deletedCount: deleted.length, deleted, notFound, summary };
     });
-    for (const [token, value] of _examSessions.entries()) {
-      if (payload.deleted.includes(value.code)) _examSessions.delete(token);
-    }
     res.json(payload);
   } catch (err) {
     appLog('error', 'admin_bulk_delete_codes_failed', { message: err.message });
@@ -1871,7 +2750,7 @@ app.post('/api/admin/codes/bulk-delete', requireAdmin, requireAdminRole('admin')
   }
 });
 
-app.post('/api/admin/generate', requireAdmin, async (req, res) => {
+app.post('/api/admin/generate', requireAdmin, requirePermission('codes:generate'), async (req, res) => {
   const count = Math.min(Math.max(Number(req.body?.count) || 10, 1), 200);
   const chars = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 
@@ -1974,7 +2853,7 @@ app.post('/api/admin/results/clear-summaries', requireAdmin, requireAdminRole('a
   }
 });
 
-app.post('/api/admin/codes/:code/question-set', requireAdmin, async (req, res) => {
+app.post('/api/admin/codes/:code/question-set', requireAdmin, requirePermission('codes:assign'), async (req, res) => {
   const code = String(req.params.code || '').trim().toUpperCase();
   const questionSetIdRaw = req.body?.questionSetId;
   const questionSetId = questionSetIdRaw == null || questionSetIdRaw === '' ? null : Number(questionSetIdRaw);
@@ -2015,7 +2894,7 @@ app.post('/api/admin/codes/:code/question-set', requireAdmin, async (req, res) =
   }
 });
 
-app.get('/api/admin/question-sets', requireAdmin, async (_req, res) => {
+app.get('/api/admin/question-sets', requireAdmin, requirePermission('content:read'), async (_req, res) => {
   try {
     const sets = await withDb(async (conn) => getQuestionSetRows(conn, { includeCounts: true }));
     res.json({ sets });
@@ -2024,20 +2903,127 @@ app.get('/api/admin/question-sets', requireAdmin, async (_req, res) => {
   }
 });
 
-app.post('/api/admin/question-sets', requireAdmin, requireAdminRole('admin'), async (req, res) => {
+app.post('/api/admin/question-sets/:id/clone', requireAdmin, requirePermission('content:write'), async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid_question_set_id' });
+  try {
+    const cloned = await withDb(async (conn) => {
+      const questionSet = await cloneQuestionSetWithChildren(conn, id, {
+        name: req.body?.name,
+        lifecycleStatus: 'DRAFT',
+        importSource: 'clone'
+      });
+      await writeAdminAudit(conn, {
+        action: 'admin_question_set_cloned',
+        actor: req.adminRole,
+        clientIp: getClientIp(req),
+        details: { sourceId: id, clonedId: questionSet.id }
+      });
+      return questionSet;
+    });
+    res.json({ ok: true, questionSet: cloned });
+  } catch (err) {
+    res.status(500).json({ error: 'admin_question_set_clone_failed', message: err.message });
+  }
+});
+
+app.post('/api/admin/question-sets/:id/publish', requireAdmin, requirePermission('content:publish'), async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid_question_set_id' });
+  try {
+    await withDb(async (conn) => {
+      const questionSet = await loadQuestionSet(conn, id);
+      const groupId = questionSet.versionGroupId || questionSet.id;
+      if (await hasQuestionSetVersionColumns(conn)) {
+        await execQuery(
+          conn,
+          `UPDATE QUESTION_SETS
+              SET LIFECYCLE_STATUS = CASE WHEN QUESTION_SET_ID = ? THEN 'PUBLISHED' ELSE CASE WHEN VERSION_GROUP_ID = ? THEN 'ARCHIVED' ELSE LIFECYCLE_STATUS END END,
+                  UPDATED_AT = CURRENT_UTCTIMESTAMP
+            WHERE QUESTION_SET_ID = ? OR VERSION_GROUP_ID = ?`,
+          [id, groupId, id, groupId]
+        );
+      }
+      await writeAdminAudit(conn, {
+        action: 'admin_question_set_published',
+        actor: req.adminRole,
+        clientIp: getClientIp(req),
+        details: { questionSetId: id, versionGroupId: groupId }
+      });
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: 'admin_question_set_publish_failed', message: err.message });
+  }
+});
+
+app.post('/api/admin/question-sets/:id/archive', requireAdmin, requirePermission('content:publish'), async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid_question_set_id' });
+  try {
+    await withDb(async (conn) => {
+      const rows = await execQuery(conn, 'SELECT IS_ACTIVE FROM QUESTION_SETS WHERE QUESTION_SET_ID = ?', [id]);
+      if (!rows.length) throw new Error('question_set_not_found');
+      if (Boolean(rows[0].IS_ACTIVE)) throw new Error('cannot_archive_active_set');
+      if (await hasQuestionSetVersionColumns(conn)) {
+        await execQuery(conn, `UPDATE QUESTION_SETS SET LIFECYCLE_STATUS = 'ARCHIVED', UPDATED_AT = CURRENT_UTCTIMESTAMP WHERE QUESTION_SET_ID = ?`, [id]);
+      }
+      await writeAdminAudit(conn, {
+        action: 'admin_question_set_archived',
+        actor: req.adminRole,
+        clientIp: getClientIp(req),
+        details: { questionSetId: id }
+      });
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    const status = ['question_set_not_found', 'cannot_archive_active_set'].includes(err.message) ? 400 : 500;
+    res.status(status).json({ error: err.message });
+  }
+});
+
+app.get('/api/admin/question-sets/:id/export.json', requireAdmin, requirePermission('results:export'), async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid_question_set_id' });
+  try {
+    const envelope = await withDb(async (conn) => {
+      const questionSet = await loadQuestionSet(conn, id, { allowEmpty: true });
+      return buildSignedEnvelope({
+        exportedAt: new Date().toISOString(),
+        questionSet
+      });
+    });
+    res.json({ ok: true, ...envelope });
+  } catch (err) {
+    res.status(500).json({ error: 'admin_question_set_export_failed', message: err.message });
+  }
+});
+
+app.post('/api/admin/question-sets', requireAdmin, requirePermission('content:write'), async (req, res) => {
   const name = String(req.body?.name || '').trim();
   const description = String(req.body?.description || '').trim();
   if (!name) return res.status(400).json({ error: 'name_required' });
 
   try {
     const created = await withDb(async (conn) => {
-      await execQuery(
-        conn,
-        `INSERT INTO QUESTION_SETS
-          (NAME, DESCRIPTION, IS_ACTIVE, DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, NUM_QUESTIONS, CREATED_AT, UPDATED_AT)
-         VALUES (?, ?, FALSE, 45, 80, TRUE, NULL, CURRENT_UTCTIMESTAMP, CURRENT_UTCTIMESTAMP)`,
-        [name, description || null]
-      );
+      const hasVersionColumns = await hasQuestionSetVersionColumns(conn);
+      if (hasVersionColumns) {
+        await execQuery(
+          conn,
+          `INSERT INTO QUESTION_SETS
+            (NAME, DESCRIPTION, IS_ACTIVE, DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, EXAM_MODE, SHOW_CORRECT_ANSWERS, COUNTS_TOWARD_RESULTS, NUM_QUESTIONS, VERSION_GROUP_ID, VERSION_NUMBER, LIFECYCLE_STATUS, PARENT_QUESTION_SET_ID, IMPORT_SOURCE, CREATED_AT, UPDATED_AT)
+           VALUES (?, ?, FALSE, 45, 80, TRUE, 'GRADED', FALSE, TRUE, NULL, NULL, 1, 'DRAFT', NULL, 'manual', CURRENT_UTCTIMESTAMP, CURRENT_UTCTIMESTAMP)`,
+          [name, description || null]
+        );
+      } else {
+        await execQuery(
+          conn,
+          `INSERT INTO QUESTION_SETS
+            (NAME, DESCRIPTION, IS_ACTIVE, DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, NUM_QUESTIONS, CREATED_AT, UPDATED_AT)
+           VALUES (?, ?, FALSE, 45, 80, TRUE, NULL, CURRENT_UTCTIMESTAMP, CURRENT_UTCTIMESTAMP)`,
+          [name, description || null]
+        );
+      }
       const rows = await execQuery(
         conn,
         `SELECT QUESTION_SET_ID, NAME, DESCRIPTION, IS_ACTIVE, DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, NUM_QUESTIONS, CREATED_AT, UPDATED_AT
@@ -2047,13 +3033,18 @@ app.post('/api/admin/question-sets', requireAdmin, requireAdminRole('admin'), as
           LIMIT 1`,
         [name]
       );
+      const createdId = Number(rows[0].QUESTION_SET_ID);
+      if (hasVersionColumns) {
+        await execQuery(conn, 'UPDATE QUESTION_SETS SET VERSION_GROUP_ID = COALESCE(VERSION_GROUP_ID, QUESTION_SET_ID), UPDATED_AT = CURRENT_UTCTIMESTAMP WHERE QUESTION_SET_ID = ?', [createdId]);
+      }
+      const normalized = await loadQuestionSet(conn, createdId, { allowEmpty: true });
       await writeAdminAudit(conn, {
         action: 'admin_question_set_created',
-        actor: 'admin',
+        actor: req.adminRole,
         clientIp: getClientIp(req),
         details: { name }
       });
-      return normalizeQuestionSetRow(rows[0]);
+      return normalized;
     });
     res.json({ ok: true, questionSet: created });
   } catch (err) {
@@ -2061,7 +3052,7 @@ app.post('/api/admin/question-sets', requireAdmin, requireAdminRole('admin'), as
   }
 });
 
-app.post('/api/admin/question-sets/:id/config', requireAdmin, requireAdminRole('admin'), async (req, res) => {
+app.post('/api/admin/question-sets/:id/config', requireAdmin, requirePermission('content:write'), async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid_question_set_id' });
   const name = String(req.body?.name || '').trim();
@@ -2113,7 +3104,7 @@ app.post('/api/admin/question-sets/:id/config', requireAdmin, requireAdminRole('
       clearQuestionSetCache(id);
       await writeAdminAudit(conn, {
         action: 'admin_question_set_config_updated',
-        actor: 'admin',
+        actor: req.adminRole,
         clientIp: getClientIp(req),
         details: { questionSetId: id, name, durationMinutes, passPct, proctorEnabled, examMode, showCorrectAnswers, countsTowardResults, numQuestions }
       });
@@ -2124,22 +3115,38 @@ app.post('/api/admin/question-sets/:id/config', requireAdmin, requireAdminRole('
   }
 });
 
-app.post('/api/admin/question-sets/:id/activate', requireAdmin, requireAdminRole('admin'), async (req, res) => {
+app.post('/api/admin/question-sets/:id/activate', requireAdmin, requirePermission('content:publish'), async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid_question_set_id' });
 
   try {
     await withDb(async (conn) => {
+      const hasVersionColumns = await hasQuestionSetVersionColumns(conn);
+      let versionGroupId = null;
+      if (hasVersionColumns) {
+        const rows = await execQuery(conn, 'SELECT VERSION_GROUP_ID FROM QUESTION_SETS WHERE QUESTION_SET_ID = ?', [id]);
+        versionGroupId = rows.length ? Number(rows[0].VERSION_GROUP_ID || id) : id;
+      }
       await execQuery(conn, 'UPDATE QUESTION_SETS SET IS_ACTIVE = FALSE, UPDATED_AT = CURRENT_UTCTIMESTAMP');
       await execQuery(
         conn,
         'UPDATE QUESTION_SETS SET IS_ACTIVE = TRUE, UPDATED_AT = CURRENT_UTCTIMESTAMP WHERE QUESTION_SET_ID = ?',
         [id]
       );
+      if (hasVersionColumns) {
+        await execQuery(
+          conn,
+          `UPDATE QUESTION_SETS
+              SET LIFECYCLE_STATUS = CASE WHEN QUESTION_SET_ID = ? THEN 'PUBLISHED' WHEN VERSION_GROUP_ID = ? THEN 'ARCHIVED' ELSE LIFECYCLE_STATUS END,
+                  UPDATED_AT = CURRENT_UTCTIMESTAMP
+            WHERE QUESTION_SET_ID = ? OR VERSION_GROUP_ID = ?`,
+          [id, versionGroupId, id, versionGroupId]
+        );
+      }
       clearQuestionSetCache();
       await writeAdminAudit(conn, {
         action: 'admin_question_set_activated',
-        actor: 'admin',
+        actor: req.adminRole,
         clientIp: getClientIp(req),
         details: { questionSetId: id }
       });
@@ -2150,7 +3157,7 @@ app.post('/api/admin/question-sets/:id/activate', requireAdmin, requireAdminRole
   }
 });
 
-app.delete('/api/admin/question-sets/:id', requireAdmin, requireAdminRole('admin'), async (req, res) => {
+app.delete('/api/admin/question-sets/:id', requireAdmin, requirePermission('content:publish'), async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid_question_set_id' });
 
@@ -2163,7 +3170,7 @@ app.delete('/api/admin/question-sets/:id', requireAdmin, requireAdminRole('admin
       clearQuestionSetCache(id);
       await writeAdminAudit(conn, {
         action: 'admin_question_set_deleted',
-        actor: 'admin',
+        actor: req.adminRole,
         clientIp: getClientIp(req),
         details: { questionSetId: id }
       });
@@ -2177,7 +3184,7 @@ app.delete('/api/admin/question-sets/:id', requireAdmin, requireAdminRole('admin
   }
 });
 
-app.get('/api/admin/question-sets/:id/questions', requireAdmin, async (req, res) => {
+app.get('/api/admin/question-sets/:id/questions', requireAdmin, requirePermission('content:read'), async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid_question_set_id' });
 
@@ -2190,6 +3197,11 @@ app.get('/api/admin/question-sets/:id/questions', requireAdmin, async (req, res)
           name: questionSet.name,
           description: questionSet.description,
           isActive: questionSet.isActive,
+          versionGroupId: questionSet.versionGroupId,
+          versionNumber: questionSet.versionNumber,
+          lifecycleStatus: questionSet.lifecycleStatus,
+          parentQuestionSetId: questionSet.parentQuestionSetId,
+          importSource: questionSet.importSource,
           examMode: questionSet.examMode,
           showCorrectAnswers: questionSet.showCorrectAnswers,
           countsTowardResults: questionSet.countsTowardResults,
@@ -2216,7 +3228,7 @@ app.get('/api/admin/question-sets/:id/questions', requireAdmin, async (req, res)
   }
 });
 
-app.post('/api/admin/question-sets/:setId/questions', requireAdmin, requireAdminRole('admin'), async (req, res) => {
+app.post('/api/admin/question-sets/:setId/questions', requireAdmin, requirePermission('content:write'), async (req, res) => {
   const setId = Number(req.params.setId);
   if (!Number.isInteger(setId)) return res.status(400).json({ error: 'invalid_question_set_id' });
 
@@ -2281,7 +3293,7 @@ app.post('/api/admin/question-sets/:setId/questions', requireAdmin, requireAdmin
   }
 });
 
-app.delete('/api/admin/question-sets/:setId/questions/:questionId', requireAdmin, requireAdminRole('admin'), async (req, res) => {
+app.delete('/api/admin/question-sets/:setId/questions/:questionId', requireAdmin, requirePermission('content:write'), async (req, res) => {
   const setId = Number(req.params.setId);
   const questionId = Number(req.params.questionId);
   if (!Number.isInteger(setId) || !Number.isInteger(questionId)) return res.status(400).json({ error: 'invalid_identifier' });
@@ -2303,7 +3315,7 @@ app.delete('/api/admin/question-sets/:setId/questions/:questionId', requireAdmin
   }
 });
 
-app.get('/api/admin/question-sets/:setId/sections', requireAdmin, async (req, res) => {
+app.get('/api/admin/question-sets/:setId/sections', requireAdmin, requirePermission('content:read'), async (req, res) => {
   const setId = Number(req.params.setId);
   if (!Number.isInteger(setId)) return res.status(400).json({ error: 'invalid_question_set_id' });
 
@@ -2336,7 +3348,7 @@ app.get('/api/admin/question-sets/:setId/sections', requireAdmin, async (req, re
   }
 });
 
-app.post('/api/admin/question-sets/:setId/sections', requireAdmin, requireAdminRole('admin'), async (req, res) => {
+app.post('/api/admin/question-sets/:setId/sections', requireAdmin, requirePermission('content:write'), async (req, res) => {
   const setId = Number(req.params.setId);
   if (!Number.isInteger(setId)) return res.status(400).json({ error: 'invalid_question_set_id' });
 
@@ -2381,7 +3393,7 @@ app.post('/api/admin/question-sets/:setId/sections', requireAdmin, requireAdminR
   }
 });
 
-app.delete('/api/admin/question-sets/:setId/sections/:sectionId', requireAdmin, requireAdminRole('admin'), async (req, res) => {
+app.delete('/api/admin/question-sets/:setId/sections/:sectionId', requireAdmin, requirePermission('content:write'), async (req, res) => {
   const setId = Number(req.params.setId);
   const sectionId = Number(req.params.sectionId);
   if (!Number.isInteger(setId) || !Number.isInteger(sectionId)) return res.status(400).json({ error: 'invalid_identifier' });
@@ -2404,22 +3416,68 @@ app.delete('/api/admin/question-sets/:setId/sections/:sectionId', requireAdmin, 
   }
 });
 
-app.post('/api/admin/question-sets/upload', requireAdmin, requireAdminRole('admin'), async (req, res) => {
+app.post('/api/admin/question-sets/upload/preview', requireAdmin, requirePermission('imports:write'), async (req, res) => {
+  const questions = Array.isArray(req.body?.questions) ? req.body.questions : [];
+  const validation = validateQuestionUploadEntries(questions);
+  if (!validation.ok) {
+    return res.status(400).json({ error: 'invalid_question_upload', errors: validation.errors, warnings: validation.warnings });
+  }
+  try {
+    const preview = await withDb(async (conn) => {
+      const dbRows = await execQuery(conn, 'SELECT STEM FROM QUESTION_SET_QUESTIONS');
+      const existing = new Set(dbRows.map((row) => String(row.STEM || '').trim().toLowerCase()).filter(Boolean));
+      const duplicateStems = validation.normalized
+        .filter((question) => existing.has(String(question.stem || '').trim().toLowerCase()))
+        .slice(0, 50)
+        .map((question) => question.stem);
+      return {
+        count: validation.normalized.length,
+        duplicatesAgainstDatabase: duplicateStems,
+        warnings: validation.warnings,
+        sample: validation.normalized.slice(0, 3)
+      };
+    });
+    res.json({ ok: true, ...preview });
+  } catch (err) {
+    res.status(500).json({ error: 'admin_question_set_upload_preview_failed', message: err.message });
+  }
+});
+
+app.post('/api/admin/question-sets/upload', requireAdmin, requirePermission('imports:write'), async (req, res) => {
   const name = String(req.body?.name || '').trim();
   const description = String(req.body?.description || '').trim();
   const questions = Array.isArray(req.body?.questions) ? req.body.questions : [];
   if (!name) return res.status(400).json({ error: 'name_required' });
   if (!questions.length) return res.status(400).json({ error: 'questions_required' });
+  const validation = validateQuestionUploadEntries(questions);
+  if (!validation.ok) {
+    return res.status(400).json({
+      error: 'invalid_question_upload',
+      errors: validation.errors,
+      warnings: validation.warnings
+    });
+  }
 
   try {
     const result = await withDb(async (conn) => {
-      await execQuery(
-        conn,
-        `INSERT INTO QUESTION_SETS
-          (NAME, DESCRIPTION, IS_ACTIVE, DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, NUM_QUESTIONS, CREATED_AT, UPDATED_AT)
-         VALUES (?, ?, FALSE, 45, 80, TRUE, NULL, CURRENT_UTCTIMESTAMP, CURRENT_UTCTIMESTAMP)`,
-        [name, description || null]
-      );
+      const hasVersionColumns = await hasQuestionSetVersionColumns(conn);
+      if (hasVersionColumns) {
+        await execQuery(
+          conn,
+          `INSERT INTO QUESTION_SETS
+            (NAME, DESCRIPTION, IS_ACTIVE, DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, EXAM_MODE, SHOW_CORRECT_ANSWERS, COUNTS_TOWARD_RESULTS, NUM_QUESTIONS, VERSION_GROUP_ID, VERSION_NUMBER, LIFECYCLE_STATUS, PARENT_QUESTION_SET_ID, IMPORT_SOURCE, CREATED_AT, UPDATED_AT)
+           VALUES (?, ?, FALSE, 45, 80, TRUE, 'GRADED', FALSE, TRUE, NULL, NULL, 1, 'DRAFT', NULL, 'csv_upload', CURRENT_UTCTIMESTAMP, CURRENT_UTCTIMESTAMP)`,
+          [name, description || null]
+        );
+      } else {
+        await execQuery(
+          conn,
+          `INSERT INTO QUESTION_SETS
+            (NAME, DESCRIPTION, IS_ACTIVE, DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, NUM_QUESTIONS, CREATED_AT, UPDATED_AT)
+           VALUES (?, ?, FALSE, 45, 80, TRUE, NULL, CURRENT_UTCTIMESTAMP, CURRENT_UTCTIMESTAMP)`,
+          [name, description || null]
+        );
+      }
       const createdRows = await execQuery(
         conn,
         `SELECT QUESTION_SET_ID
@@ -2430,17 +3488,19 @@ app.post('/api/admin/question-sets/upload', requireAdmin, requireAdminRole('admi
         [name]
       );
       const setId = Number(createdRows[0].QUESTION_SET_ID);
+      if (hasVersionColumns) {
+        await execQuery(
+          conn,
+          `UPDATE QUESTION_SETS
+              SET VERSION_GROUP_ID = COALESCE(VERSION_GROUP_ID, QUESTION_SET_ID),
+                  UPDATED_AT = CURRENT_UTCTIMESTAMP
+            WHERE QUESTION_SET_ID = ?`,
+          [setId]
+        );
+      }
 
-      for (const entry of questions) {
-        const qNum = Number(entry.qNum);
-        const stem = String(entry.stem || '').trim();
-        const note = String(entry.note || '').trim();
-        const opts = Array.isArray(entry.opts) ? entry.opts.map((item) => String(item || '').trim()).filter(Boolean) : [];
-        const correctIndices = Array.isArray(entry.correctIndices) ? entry.correctIndices.map((item) => Number(item)).filter((n) => Number.isInteger(n) && n >= 0) : [];
-        const multi = Boolean(entry.multi);
-        if (!Number.isInteger(qNum) || !stem || opts.length < 2 || !correctIndices.length) {
-          throw new Error(`invalid_question_payload_${qNum || 'unknown'}`);
-        }
+      for (const entry of validation.normalized) {
+        const { qNum, stem, note, opts, correctIndices, multi } = entry;
         await execQuery(
           conn,
           `INSERT INTO QUESTION_SET_QUESTIONS
@@ -2452,7 +3512,7 @@ app.post('/api/admin/question-sets/upload', requireAdmin, requireAdminRole('admi
       clearQuestionSetCache(setId);
       await writeAdminAudit(conn, {
         action: 'admin_question_set_uploaded',
-        actor: 'admin',
+        actor: req.adminRole,
         clientIp: getClientIp(req),
         details: { questionSetId: setId, name, count: questions.length }
       });
@@ -2464,11 +3524,70 @@ app.post('/api/admin/question-sets/upload', requireAdmin, requireAdminRole('admi
   }
 });
 
-app.get('/api/admin/export.csv', requireAdmin, async (_req, res) => {
+app.post('/api/admin/question-sets/:id/rollback-import', requireAdmin, requirePermission('imports:rollback'), async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid_question_set_id' });
+  try {
+    await withDb(async (conn) => {
+      const rows = await execQuery(conn, 'SELECT QUESTION_SET_ID, IMPORT_SOURCE, IS_ACTIVE FROM QUESTION_SETS WHERE QUESTION_SET_ID = ?', [id]);
+      if (!rows.length) throw new Error('question_set_not_found');
+      if (Boolean(rows[0].IS_ACTIVE)) throw new Error('cannot_rollback_active_set');
+      const hasVersionColumns = await hasQuestionSetVersionColumns(conn);
+      if (hasVersionColumns && String(rows[0].IMPORT_SOURCE || '') !== 'csv_upload') throw new Error('rollback_not_allowed');
+      const resultCountRows = await execQuery(conn, `SELECT COUNT(*) AS CNT FROM EXAM_RESULTS WHERE JSON_VALUE(RESULT_JSON, '$.questionSetId') = ?`, [String(id)]);
+      if (Number(resultCountRows?.[0]?.CNT || 0) > 0) throw new Error('rollback_has_results');
+      await execQuery(conn, 'DELETE FROM QUESTION_SETS WHERE QUESTION_SET_ID = ?', [id]);
+      clearQuestionSetCache();
+      await writeAdminAudit(conn, {
+        action: 'admin_question_set_import_rolled_back',
+        actor: req.adminRole,
+        clientIp: getClientIp(req),
+        details: { questionSetId: id }
+      });
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    const status = ['question_set_not_found', 'cannot_rollback_active_set', 'rollback_not_allowed', 'rollback_has_results'].includes(err.message) ? 400 : 500;
+    res.status(status).json({ error: err.message });
+  }
+});
+
+app.get('/api/admin/export.csv', requireAdmin, requirePermission('results:export'), async (_req, res) => {
   try {
     const rows = await withDb(async (conn) => {
       const hasNotes = await hasNotesColumn(conn);
       const hasDeletedAt = await hasDeletedAtColumn(conn);
+      const clauses = [];
+      const params = [];
+      const questionSetId = _req.query?.questionSetId == null || _req.query.questionSetId === ''
+        ? null
+        : Number(_req.query.questionSetId);
+      const statusFilter = String(_req.query?.status || '').trim().toLowerCase();
+      const modeFilter = String(_req.query?.mode || '').trim().toUpperCase();
+      const dateFrom = parseDateFilter(_req.query?.dateFrom, false);
+      const dateTo = parseDateFilter(_req.query?.dateTo, true);
+      if (hasDeletedAt) clauses.push('c.DELETED_AT IS NULL');
+      if (Number.isInteger(questionSetId)) {
+        clauses.push('c.QUESTION_SET_ID = ?');
+        params.push(questionSetId);
+      }
+      if (['unused', 'active', 'completed'].includes(statusFilter)) {
+        clauses.push('c.STATUS = ?');
+        params.push(statusFilter);
+      }
+      if (modeFilter === 'PRACTICE') {
+        clauses.push(`COALESCE(JSON_VALUE(r.RESULT_JSON, '$.examMode'), 'GRADED') = 'PRACTICE'`);
+      } else if (modeFilter === 'GRADED') {
+        clauses.push(`COALESCE(JSON_VALUE(r.RESULT_JSON, '$.examMode'), 'GRADED') = 'GRADED'`);
+      }
+      if (dateFrom) {
+        clauses.push('r.SUBMITTED_AT >= ?');
+        params.push(dateFrom);
+      }
+      if (dateTo) {
+        clauses.push('r.SUBMITTED_AT <= ?');
+        params.push(dateTo);
+      }
       return execQuery(
         conn,
         `SELECT c.ACCESS_CODE, c.LABEL, ${hasNotes ? 'c.NOTES,' : `'' AS NOTES,`} c.STATUS,
@@ -2477,8 +3596,9 @@ app.get('/api/admin/export.csv', requireAdmin, async (_req, res) => {
            FROM ACCESS_CODES c
            LEFT JOIN QUESTION_SETS qs ON qs.QUESTION_SET_ID = c.QUESTION_SET_ID
            LEFT JOIN EXAM_RESULTS r ON r.ACCESS_CODE = c.ACCESS_CODE
-          ${hasDeletedAt ? 'WHERE c.DELETED_AT IS NULL' : ''}
-          ORDER BY c.ACCESS_CODE ASC`
+          ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''}
+          ORDER BY c.ACCESS_CODE ASC`,
+        params
       );
     });
 
@@ -2507,7 +3627,7 @@ app.get('/api/admin/export.csv', requireAdmin, async (_req, res) => {
     }
 
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', 'attachment; filename="ITIL4_Exam_Results.csv"');
+    res.setHeader('Content-Disposition', 'attachment; filename="Academy_Exam_App_Results.csv"');
     res.send(lines.join('\n'));
   } catch (err) {
     appLog('error', 'admin_export_failed', { message: err.message });
@@ -2519,6 +3639,10 @@ app.get('/client-app.js', (_req, res) => {
   res.type('application/javascript').sendFile(CLIENT_APP_PATH);
 });
 
+app.get('/favicon.svg', (_req, res) => {
+  res.type('image/svg+xml').sendFile(FAVICON_PATH);
+});
+
 app.get('/', (_req, res) => {
   res.sendFile(INDEX_PATH);
 });
@@ -2526,15 +3650,60 @@ app.get('/', (_req, res) => {
 app.get('*', (req, res, next) => {
   if (req.path.startsWith('/api/')) return next();
   if (req.path === '/client-app.js' && fs.existsSync(CLIENT_APP_PATH)) return res.type('application/javascript').sendFile(CLIENT_APP_PATH);
+  if (req.path === '/favicon.svg' && fs.existsSync(FAVICON_PATH)) return res.type('image/svg+xml').sendFile(FAVICON_PATH);
   if (fs.existsSync(INDEX_PATH)) return res.sendFile(INDEX_PATH);
   return res.status(404).send('Not found');
 });
 
 app.use((err, _req, res, _next) => {
-  appLog('error', 'server_error', { message: err.message });
-  res.status(500).json({ error: 'server_error', message: err.message });
+  appLog('error', 'server_error', { requestId: _req.requestId, message: err.message });
+  res.status(500).json({ error: 'server_error', message: err.message, requestId: _req.requestId });
 });
 
-app.listen(PORT, () => {
-  console.log(`ITIL EvalApp server listening on port ${PORT}`);
-});
+function startBackgroundJobs() {
+  if (!HAS_DB_CONFIG || !AUTO_CLEAR_STALE_SESSIONS || _runtimeState.staleSessionSweepTimer) return;
+  _runtimeState.staleSessionSweepTimer = setInterval(() => {
+    withDb(async (conn) => clearStaleSessionsWithConn(conn))
+      .then((cleared) => {
+        if (cleared.length) appLog('info', 'stale_sessions_auto_cleared', { count: cleared.length });
+      })
+      .catch((err) => {
+        appLog('warn', 'stale_session_sweep_failed', { message: err.message });
+      });
+  }, STALE_SESSION_SWEEP_MINUTES * 60 * 1000);
+}
+
+function stopBackgroundJobs() {
+  if (_runtimeState.staleSessionSweepTimer) {
+    clearInterval(_runtimeState.staleSessionSweepTimer);
+    _runtimeState.staleSessionSweepTimer = null;
+  }
+}
+
+function startServer(port = PORT) {
+  const summary = startupSummary();
+  summary.errors.forEach((error) => appLog('error', 'startup_error', { error }));
+  summary.warnings.forEach((warning) => appLog('warn', 'startup_warning', { warning }));
+  if (STARTUP_STRICT && summary.errors.length) {
+    const error = new Error(`Startup validation failed: ${summary.errors.join(' | ')}`);
+    appLog('error', 'startup_validation_failed', { message: error.message });
+    throw error;
+  }
+  startBackgroundJobs();
+  return app.listen(port, () => {
+    console.log(`Academy Exam App server listening on port ${port}`);
+  });
+}
+
+module.exports = {
+  app,
+  startServer,
+  stopBackgroundJobs,
+  normalizeExamTitle,
+  validateQuestionUploadEntries,
+  startupSummary
+};
+
+if (require.main === module) {
+  startServer();
+}

@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="bg" x1="0" x2="0" y1="0" y2="1">
+      <stop offset="0%" stop-color="#f4f8ff"/>
+      <stop offset="100%" stop-color="#e6eefb"/>
+    </linearGradient>
+    <linearGradient id="bar1" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0%" stop-color="#0f6edc"/>
+      <stop offset="100%" stop-color="#4db1ff"/>
+    </linearGradient>
+    <linearGradient id="bar2" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0%" stop-color="#14a0ff"/>
+      <stop offset="100%" stop-color="#57c7ff"/>
+    </linearGradient>
+    <linearGradient id="bar3" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0%" stop-color="#36c6e9"/>
+      <stop offset="100%" stop-color="#72dfd2"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="56" height="56" rx="14" fill="url(#bg)"/>
+  <rect x="4" y="4" width="56" height="56" rx="14" fill="none" stroke="#d4e0f4"/>
+  <path d="M14 16H50L42 24H14Z" fill="url(#bar1)"/>
+  <path d="M14 28H50L42 36H14Z" fill="url(#bar2)"/>
+  <path d="M14 40H50L42 48H14Z" fill="url(#bar3)"/>
+  <path d="M31 50H45L41 54H31Z" fill="#b8c9e8" fill-opacity=".55"/>
+</svg>
