@@ -38,8 +38,11 @@ Notes:
     HANA_ENCRYPT, HANA_SSL_VALIDATE_CERTIFICATE
   - Recommended admin auth var:
     ADMIN_HASH
-  - Optional manager auth var:
-    MANAGER_HASH
+  - Optional role auth vars:
+    MANAGER_HASH, REVIEWER_HASH, CONTENT_EDITOR_HASH
+  - Optional runtime hardening / observability vars:
+    STARTUP_STRICT, AUTO_CLEAR_STALE_SESSIONS, STALE_SESSION_SWEEP_MINUTES,
+    SLOW_QUERY_MS, SLOW_REQUEST_MS
   - Optional Anthropic vars for AI proctoring:
     ANTHROPIC_API_KEY, ANTHROPIC_MODEL, ANTHROPIC_VERSION
 EOF
@@ -153,6 +156,9 @@ for v in "${REQUIRED_HANA_VARS[@]}"; do
   fi
 done
 
+echo "==> Running local env preflight"
+node scripts/check-env.mjs
+
 if [[ "$USE_SSO" == "true" ]]; then
   echo "==> Logging in with SSO to Cloud Foundry API: $CF_API"
   cf login -a "$CF_API" --sso
@@ -198,6 +204,52 @@ else
   echo "==> MANAGER_HASH not set; manager login will stay disabled"
 fi
 
+if [[ -n "${REVIEWER_HASH:-}" ]]; then
+  echo "==> Configuring REVIEWER_HASH for reviewer login"
+  cf set-env "$APP_NAME" REVIEWER_HASH "$REVIEWER_HASH"
+  NEED_RESTAGE="true"
+else
+  echo "==> REVIEWER_HASH not set; reviewer login will stay disabled"
+fi
+
+if [[ -n "${CONTENT_EDITOR_HASH:-}" ]]; then
+  echo "==> Configuring CONTENT_EDITOR_HASH for content editor login"
+  cf set-env "$APP_NAME" CONTENT_EDITOR_HASH "$CONTENT_EDITOR_HASH"
+  NEED_RESTAGE="true"
+else
+  echo "==> CONTENT_EDITOR_HASH not set; content editor login will stay disabled"
+fi
+
+if [[ -n "${STARTUP_STRICT:-}" ]]; then
+  echo "==> Configuring STARTUP_STRICT=$STARTUP_STRICT"
+  cf set-env "$APP_NAME" STARTUP_STRICT "$STARTUP_STRICT"
+  NEED_RESTAGE="true"
+fi
+
+if [[ -n "${AUTO_CLEAR_STALE_SESSIONS:-}" ]]; then
+  echo "==> Configuring AUTO_CLEAR_STALE_SESSIONS=$AUTO_CLEAR_STALE_SESSIONS"
+  cf set-env "$APP_NAME" AUTO_CLEAR_STALE_SESSIONS "$AUTO_CLEAR_STALE_SESSIONS"
+  NEED_RESTAGE="true"
+fi
+
+if [[ -n "${STALE_SESSION_SWEEP_MINUTES:-}" ]]; then
+  echo "==> Configuring STALE_SESSION_SWEEP_MINUTES=$STALE_SESSION_SWEEP_MINUTES"
+  cf set-env "$APP_NAME" STALE_SESSION_SWEEP_MINUTES "$STALE_SESSION_SWEEP_MINUTES"
+  NEED_RESTAGE="true"
+fi
+
+if [[ -n "${SLOW_QUERY_MS:-}" ]]; then
+  echo "==> Configuring SLOW_QUERY_MS=$SLOW_QUERY_MS"
+  cf set-env "$APP_NAME" SLOW_QUERY_MS "$SLOW_QUERY_MS"
+  NEED_RESTAGE="true"
+fi
+
+if [[ -n "${SLOW_REQUEST_MS:-}" ]]; then
+  echo "==> Configuring SLOW_REQUEST_MS=$SLOW_REQUEST_MS"
+  cf set-env "$APP_NAME" SLOW_REQUEST_MS "$SLOW_REQUEST_MS"
+  NEED_RESTAGE="true"
+fi
+
 if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
   echo "==> Configuring Anthropic env vars for server-side proctoring"
   cf set-env "$APP_NAME" ANTHROPIC_API_KEY "$ANTHROPIC_API_KEY"
@@ -219,3 +271,8 @@ fi
 
 echo "==> Deployment complete. App details:"
 cf app "$APP_NAME"
+
+APP_URL="https://${ROUTE_HOST}.${DEFAULT_DOMAIN}"
+echo "==> Running post-deploy health smoke: ${APP_URL}/api/health"
+curl --fail --silent --show-error "${APP_URL}/api/health"
+echo

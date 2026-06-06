@@ -9,6 +9,9 @@ applications:
     routes:
       - route: ((route_host)).((default_domain))
     env:
+      STARTUP_STRICT: true
+      AUTO_CLEAR_STALE_SESSIONS: true
+      STALE_SESSION_SWEEP_MINUTES: 10
       HANA_HOST: ((hana_host))
       HANA_PORT: ((hana_port))
       HANA_USER: ((hana_user))

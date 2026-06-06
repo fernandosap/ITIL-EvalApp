@@ -130,7 +130,7 @@ BEGIN
     INSERT INTO "ITIL_EXAM"."QUESTION_SETS"
       ("NAME", "DESCRIPTION", "IS_ACTIVE", "DURATION_MINUTES", "PASS_PCT", "PROCTOR_ENABLED", "NUM_QUESTIONS", "CREATED_AT", "UPDATED_AT")
     SELECT
-      ''ITIL 4 Foundation'',
+      ''Academy Exam App'',
       ''Migrated default exam set'',
       TRUE,
       45,

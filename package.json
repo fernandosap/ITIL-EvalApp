@@ -2,10 +2,12 @@
   "name": "itil-evalapp",
   "version": "1.0.0",
   "private": true,
-  "description": "ITIL exam app with Node middleware and SAP HANA persistence",
+  "description": "Academy Exam App with Node middleware and SAP HANA persistence",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "check:env": "node scripts/check-env.mjs",
+    "test:smoke": "node scripts/smoke-test.mjs"
   },
   "engines": {
     "node": "20.x"
