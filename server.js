@@ -1997,15 +1997,23 @@ app.get('/oauth/callback', async (req, res) => {
   }
   const redirectUri = buildOAuthRedirectUri(req);
   const tokenResp = await exchangeCodeForToken(xsuaa, code, redirectUri);
-  if (!tokenResp || !tokenResp.access_token) {
-    appLog('error', 'oauth_token_exchange_failed', { requestId: req.requestId });
+  if (!tokenResp || !tokenResp.ok || !tokenResp.accessToken) {
+    // Log enough detail to debug: what failed, the upstream status,
+    // and the human-readable error_description from XSUAA when present.
+    appLog('error', 'oauth_token_exchange_failed', {
+      requestId: req.requestId,
+      reason: tokenResp ? tokenResp.error : 'null',
+      statusCode: tokenResp ? tokenResp.statusCode : null,
+      errorDescription: tokenResp ? tokenResp.errorDescription : null,
+      message: tokenResp ? tokenResp.message : null
+    });
     return res.status(502).json({ error: 'token_exchange_failed' });
   }
   // Set the JWT in an httpOnly cookie. Max-Age from the token's
-  // expires_in (default 1h if absent).
-  const maxAge = Math.max(60, Number(tokenResp.expires_in || 3600));
+  // expiresIn (default 1h if absent).
+  const maxAge = Math.max(60, Number(tokenResp.expiresIn || 3600));
   const setCookie = [
-    `xsuaa_jwt=${encodeURIComponent(tokenResp.access_token)}`,
+    `xsuaa_jwt=${encodeURIComponent(tokenResp.accessToken)}`,
     'Path=/',
     `Max-Age=${maxAge}`,
     'HttpOnly',

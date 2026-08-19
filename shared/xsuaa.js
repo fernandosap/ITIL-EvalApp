@@ -163,21 +163,25 @@ function buildAuthorizeUrl(xsuaa, redirectUri, state) {
   return `${xsuaa.url.replace(/\/$/, '')}/oauth/authorize?${params.toString()}`;
 }
 
-// Exchange an authorization code for an access token. Returns the parsed
-// JSON body on success, or null on any error (network, non-2xx, malformed
-// JSON). Caller is responsible for handling the response.
+// Exchange an authorization code for an access token.
 //
-// Pure: this function accepts an `executor` (a function that takes a URL,
-// options, and a callback) so tests can inject a fake HTTP caller. The
-// default executor uses the global `https` module. XSUAA's /oauth/token
-// endpoint requires application/x-www-form-urlencoded with grant_type and
-// HTTP Basic auth using clientid:clientsecret.
+// Return shape (always an object — no more `null`):
+//   { ok: true,  accessToken, expiresIn, tokenType, body }  // success
+//   { ok: false, error: 'not_configured' | 'missing_code' | 'network' |
+//                   'upstream', statusCode, errorDescription, body }
+//   { ok: false, error: 'parse', body }                     // 2xx but bad JSON
+//
+// Pure: this function accepts an `executor` (a function that takes
+// options, a body string, and a callback) so tests can inject a fake
+// HTTP caller. The default executor uses the global `https` module.
+// XSUAA's /oauth/token endpoint requires application/x-www-form-urlencoded
+// with grant_type and HTTP Basic auth using clientid:clientsecret.
 function exchangeCodeForToken(xsuaa, code, redirectUri, executor) {
   if (!xsuaa || !xsuaa.clientid || !xsuaa.clientsecret) {
-    return Promise.resolve(null);
+    return Promise.resolve({ ok: false, error: 'not_configured' });
   }
   if (!code || typeof code !== 'string') {
-    return Promise.resolve(null);
+    return Promise.resolve({ ok: false, error: 'missing_code' });
   }
   const url = new URL(`${xsuaa.url.replace(/\/$/, '')}/oauth/token`);
   const auth = Buffer.from(`${xsuaa.clientid}:${xsuaa.clientsecret}`).toString('base64');
@@ -200,11 +204,34 @@ function exchangeCodeForToken(xsuaa, code, redirectUri, executor) {
   const exec = executor || defaultHttpsPost;
   return new Promise((resolve) => {
     exec(opts, body, (err, statusCode, rawBody) => {
-      if (err) return resolve(null);
-      if (statusCode < 200 || statusCode >= 300) return resolve(null);
+      if (err) return resolve({ ok: false, error: 'network', message: String(err.message || err) });
+      if (statusCode < 200 || statusCode >= 300) {
+        // XSUAA returns { error, error_description } on 4xx. Try to
+        // parse and surface that — it's what makes "why did this fail"
+        // debuggable in the logs.
+        let errorDescription = null;
+        try {
+          const parsed = JSON.parse(rawBody);
+          errorDescription = parsed && parsed.error_description;
+        } catch (_e) { /* not JSON */ }
+        return resolve({
+          ok: false,
+          error: 'upstream',
+          statusCode,
+          errorDescription,
+          body: String(rawBody || '').slice(0, 500)
+        });
+      }
       let parsed;
-      try { parsed = JSON.parse(rawBody); } catch (_e) { return resolve(null); }
-      resolve(parsed);
+      try { parsed = JSON.parse(rawBody); }
+      catch (_e) { return resolve({ ok: false, error: 'parse', body: String(rawBody || '').slice(0, 500) }); }
+      resolve({
+        ok: true,
+        accessToken: parsed.access_token,
+        expiresIn: parsed.expires_in,
+        tokenType: parsed.token_type,
+        body: parsed
+      });
     });
   });
 }

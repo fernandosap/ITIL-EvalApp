@@ -324,7 +324,9 @@ test('exchangeCodeForToken: posts to /oauth/token with Basic auth and form body'
   };
   const result = await exchangeCodeForToken(xsuaa, 'code-xyz', 'https://app/cb', fakeExecutor);
   assert.ok(result);
-  assert.equal(result.access_token, 'tok-abc');
+  assert.equal(result.ok, true);
+  assert.equal(result.accessToken, 'tok-abc');
+  assert.equal(result.expiresIn, 3600);
   assert.equal(captured.opts.method, 'POST');
   assert.equal(captured.opts.hostname, 'sap.example.com');
   assert.equal(captured.opts.path, '/oauth/token');
@@ -338,40 +340,55 @@ test('exchangeCodeForToken: posts to /oauth/token with Basic auth and form body'
   assert.equal(captured.opts.headers['Content-Type'], 'application/x-www-form-urlencoded');
 });
 
-test('exchangeCodeForToken: returns null on network error', async () => {
+test('exchangeCodeForToken: returns ok:false, error:network on network error', async () => {
   const xsuaa = { url: 'https://x', clientid: 'c', clientsecret: 's' };
   const fakeExecutor = (_opts, _body, cb) => cb(new Error('ECONNREFUSED'));
   const result = await exchangeCodeForToken(xsuaa, 'c', 'https://x/cb', fakeExecutor);
-  assert.equal(result, null);
+  assert.equal(result.ok, false);
+  assert.equal(result.error, 'network');
+  assert.match(result.message, /ECONNREFUSED/);
 });
 
-test('exchangeCodeForToken: returns null on non-2xx status', async () => {
+test('exchangeCodeForToken: returns ok:false, error:upstream with errorDescription on non-2xx', async () => {
   const xsuaa = { url: 'https://x', clientid: 'c', clientsecret: 's' };
-  const fakeExecutor = (_opts, _body, cb) => cb(null, 400, '{"error":"invalid_grant"}');
+  // XSUAA-style error body
+  const fakeExecutor = (_opts, _body, cb) => cb(
+    null,
+    400,
+    JSON.stringify({ error: 'invalid_grant', error_description: 'Authorization code expired' })
+  );
   const result = await exchangeCodeForToken(xsuaa, 'c', 'https://x/cb', fakeExecutor);
-  assert.equal(result, null);
+  assert.equal(result.ok, false);
+  assert.equal(result.error, 'upstream');
+  assert.equal(result.statusCode, 400);
+  assert.equal(result.errorDescription, 'Authorization code expired');
 });
 
-test('exchangeCodeForToken: returns null on malformed JSON', async () => {
+test('exchangeCodeForToken: returns ok:false, error:parse on malformed JSON', async () => {
   const xsuaa = { url: 'https://x', clientid: 'c', clientsecret: 's' };
   const fakeExecutor = (_opts, _body, cb) => cb(null, 200, 'not json');
   const result = await exchangeCodeForToken(xsuaa, 'c', 'https://x/cb', fakeExecutor);
-  assert.equal(result, null);
+  assert.equal(result.ok, false);
+  assert.equal(result.error, 'parse');
 });
 
-test('exchangeCodeForToken: returns null on missing xsuaa fields', async () => {
+test('exchangeCodeForToken: returns ok:false, error:not_configured on missing xsuaa fields', async () => {
   const result = await exchangeCodeForToken({}, 'c', 'r', () => {});
-  assert.equal(result, null);
+  assert.equal(result.ok, false);
+  assert.equal(result.error, 'not_configured');
   const result2 = await exchangeCodeForToken({ url: 'x' }, 'c', 'r', () => {});
-  assert.equal(result2, null);
+  assert.equal(result2.ok, false);
+  assert.equal(result2.error, 'not_configured');
 });
 
-test('exchangeCodeForToken: returns null on missing code', async () => {
+test('exchangeCodeForToken: returns ok:false, error:missing_code on missing code', async () => {
   const xsuaa = { url: 'https://x', clientid: 'c', clientsecret: 's' };
   const result = await exchangeCodeForToken(xsuaa, '', 'https://x/cb', () => {});
-  assert.equal(result, null);
+  assert.equal(result.ok, false);
+  assert.equal(result.error, 'missing_code');
   const result2 = await exchangeCodeForToken(xsuaa, null, 'https://x/cb', () => {});
-  assert.equal(result2, null);
+  assert.equal(result2.ok, false);
+  assert.equal(result2.error, 'missing_code');
 });
 
 // ---------------------------------------------------------------------------
