@@ -65,7 +65,8 @@ etc. (declared in `client/state.js`).
 | `client/admin-auth.js` | 6K | Login/logout: `showAdminLogin`, `doLogin`, `tryBootstrapFromCookie`, `logoutAdmin`, `revokeAdminSessions` |
 | `client/admin-codes.js` | 44K | Admin dashboard: `showAdmin` (the big one — loads 5 endpoints, renders the full console) + per-row actions (`deleteCode`, `bulkDeleteCodes`, `saveNote`, `resetCode`, `generateCodes`, etc.) + exports (`downloadExport`, `downloadAuditExport`, `downloadSignedResultSummary`) |
 | `client/admin-question-sets.js` | 53K | Exam set management: `createQuestionSet`, `configQuestionSet`, `activateQuestionSet`, `publishQuestionSet`, `archiveQuestionSet`, `deleteQuestionSet`, `exportQuestionSet`, `cloneQuestionSet`, `rollbackImportedSet` + CSV upload (`parseQuestionCsv`, `analyzeQuestionUpload`, `previewUploadedQuestionSet`, `submitUploadedQuestionSet`) + question/section editor (`openQuestionSet`, `showQuestionEditor`, `editSectionPrompt`, etc.) + per-set analytics (`showQuestionSetAnalytics`) |
-| `client/main.js` | 5K | Entry point: re-exports ~60 onclick handlers onto `window.*` and runs `DOMContentLoaded` |
+| `client/dispatcher.js` | 6K | Event delegation: one click listener + one change listener on `document` route `data-action` → `window.IE.*.<fn>(data-args...)`. Type-coerces args; resolves `__value__` and `__checked__` sentinels from the element. |
+| `client/main.js` | 3K | Entry point: registers `beforeunload` / `online` / `offline` listeners and runs the `DOMContentLoaded` bootstrap (handles `?admin=1` + XSUAA `?auth=ok` cookie bootstrap). |
 
 **Load order** (in `index.html`, strict):
 
@@ -73,12 +74,45 @@ etc. (declared in `client/state.js`).
 shared/constants.js → client/util.js → client/state.js →
 client/code-entry.js → client/exam.js → client/proctor.js →
 client/admin-auth.js → client/admin-codes.js →
-client/admin-question-sets.js → client/main.js
+client/admin-question-sets.js → client/dispatcher.js → client/main.js
 ```
 
 `client/state.js` must run before the others because it defines the
-shared globals. `client/main.js` runs last because it depends on every
+shared globals. `client/dispatcher.js` must run before `client/main.js`
+so the click/change listeners are wired up before the DOMContentLoaded
+bootstrap fires. `client/main.js` runs last because it depends on every
 `window.IE.*` namespace being populated.
+
+**Event delegation (data-action pattern):**
+
+Buttons, selects, checkboxes, and file inputs use `data-action` +
+`data-args` instead of inline `onclick="X()"` / `onchange="X()"`.
+
+```html
+<button data-action="doLogin">Login</button>
+<button data-action="deleteCode" data-args="ABC123,completed">Delete</button>
+<select data-action="setExportFilter" data-args="status,__value__">…</select>
+<input type="checkbox" data-action="toggleAllVisibleCodes" data-args="__checked__">
+```
+
+`data-args` is a CSV. Each cell is type-coerced by
+`client/dispatcher.js` `coerce()`:
+- `"0"` → `0` (number)
+- `"true"` / `"false"` → boolean
+- `"null"` → `null`
+- everything else → string
+
+Two sentinels read from the element itself at dispatch time:
+- `__value__` → `el.value`
+- `__checked__` → `el.checked`
+
+Click and change listeners are installed once on `document` (capture
+phase) in `client/dispatcher.js`. The dispatcher walks `window.IE.*`
+and dispatches to the first matching function name. Adding a new
+action is just: write the function on a module + use `data-action`.
+
+`onkeydown="if(event.key==='Enter') X()"` stays inline in
+`client/code-entry.js` (only 2 sites, no clean declarative form).
 
 ## HANA schema (actual, post-migration)
 
@@ -418,7 +452,7 @@ without any extra config.
 - [x] Investigate audit log silence in August → **NOT a bug, just no real admin activity.** Queried HANA directly: the last `admin_login_success` is `2026-07-23 12:35:30` (Fernando). Between that and 2026-08-19 (today), the only audit rows are 2 `admin_login_failed` from MY own password-login tests — internal CF IPs, no real session. The audit log is working; the silence reflects the operator not actively using the admin console.
 - [ ] Update BTP env var `HANA_PASSWORD` to match the new prod password (out of scope for this repo)
 - [ ] Move BTP creds out of `cf set-env` into a credential store (out of scope for this repo)
-- [ ] Convert `onclick="X()"` handlers to `data-action="X"` event delegation (eliminates the `window.X = X` re-export list in `client/main.js`)
+- [x] Convert `onclick="X()"` handlers to `data-action="X"` event delegation → done in commit `021c3c4`. `client/dispatcher.js` is the single listener. `client/main.js` no longer carries the `window.X = X` re-export list.
 
 ## Inspecting HANA (read-only)
 
