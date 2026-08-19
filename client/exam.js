@@ -53,11 +53,20 @@
     const dots = Array.from({ length: S.total }, (_, i) => {
       const a = S.answers[i] || [];
       const vis = S.visited.has(i);
+      const isCurrent = i === S.currentQ;
+      const isAnswered = a.length > 0;
+      const isSkipped = vis && !isAnswered;
       let cls = 'nav-dot';
-      if (i === S.currentQ) cls += ' current';
-      else if (a.length > 0) cls += ' answered';
-      else if (vis) cls += ' skipped';
-      return `<button type="button" class="${cls}" data-action="goToQ" data-args="${i}" title="Question ${i + 1}" aria-label="Go to question ${i + 1}" ${i === S.currentQ ? 'aria-current="step"' : ''}>${i + 1}</button>`;
+      if (isCurrent) cls += ' current';
+      else if (isAnswered) cls += ' answered';
+      else if (isSkipped) cls += ' skipped';
+      // Status glyph shown in the top-right corner of each dot.
+      // ✓ = answered, · = skipped/visited, empty = unanswered.
+      // The current question hides the glyph and relies on its
+      // background fill to convey "you are here".
+      const statusGlyph = isCurrent ? '' : (isAnswered ? '✓' : (isSkipped ? '·' : ''));
+      const statusLabel = isCurrent ? 'Current' : (isAnswered ? 'Answered' : (isSkipped ? 'Skipped' : 'Unanswered'));
+      return `<button type="button" class="${cls}" data-action="goToQ" data-args="${i}" title="Q${i + 1}: ${statusLabel}" aria-label="Go to question ${i + 1}: ${statusLabel}" ${isCurrent ? 'aria-current="step"' : ''}><span class="nav-dot-num">${i + 1}</span><span class="nav-dot-status" aria-hidden="true">${statusGlyph}</span></button>`;
     }).join('');
 
     render(`<div class="no-select exam-shell" style="min-height:100vh;display:flex;flex-direction:column">
@@ -88,7 +97,7 @@
         </div>
         <div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>
         <div class="nav-dots">${dots}</div>
-        <div class="nav-help">Tap any bubble to jump · answered / skipped / not visited · ←/→ moves · 1-9 jumps</div>
+        <div class="nav-help">Tap a number to jump &middot; <code>✓</code> answered &middot; <code>&middot;</code> skipped &middot; current = highlighted &middot; arrow keys move &middot; 1&ndash;9 jump</div>
       </div>
       <div style="flex:1;overflow-y:auto;padding:18px 16px 80px">
         <div style="max-width:720px;margin:0 auto">
