@@ -44,7 +44,7 @@
 
     const opts = q.opts.map((text, displayIdx) => {
       const isSel = sel.includes(displayIdx);
-      return `<button class="option${isSel ? ' selected' : ''}" onclick="pick(${displayIdx})">
+      return `<button class="option${isSel ? ' selected' : ''}" data-action="pick" data-args="${displayIdx}">
         <span class="opt-letter">${'ABCDEF'[displayIdx]}</span>
         <span class="opt-text">${_esc(text)}</span>
       </button>`;
@@ -57,7 +57,7 @@
       if (i === S.currentQ) cls += ' current';
       else if (a.length > 0) cls += ' answered';
       else if (vis) cls += ' skipped';
-      return `<button type="button" class="${cls}" onclick="goToQ(${i})" title="Question ${i + 1}" aria-label="Go to question ${i + 1}" ${i === S.currentQ ? 'aria-current="step"' : ''}>${i + 1}</button>`;
+      return `<button type="button" class="${cls}" data-action="goToQ" data-args="${i}" title="Question ${i + 1}" aria-label="Go to question ${i + 1}" ${i === S.currentQ ? 'aria-current="step"' : ''}>${i + 1}</button>`;
     }).join('');
 
     render(`<div class="no-select exam-shell" style="min-height:100vh;display:flex;flex-direction:column">
@@ -100,11 +100,11 @@
           ${q.multi && q.note ? `<div class="multi-note">${_esc(q.note)}</div>` : ''}
           <div class="options">${opts}</div>
           <div class="exam-nav">
-            <button class="btn btn-secondary" onclick="prevQ()" ${S.currentQ === 0 ? 'disabled' : ''}>← Back</button>
+            <button class="btn btn-secondary" data-action="prevQ" ${S.currentQ === 0 ? 'disabled' : ''}>← Back</button>
             <span class="sel-count">${sel.length ? (q.multi ? `${sel.length} selected` : '✓ Answered') : 'No answer'}</span>
             ${isLast
-              ? `<button class="btn btn-primary" onclick="trySubmit()" ${unanswered > 0 ? 'disabled' : ''}>Submit Exam</button>`
-              : `<button class="btn btn-primary" onclick="nextQ()">Next →</button>`}
+              ? `<button class="btn btn-primary" data-action="trySubmit" ${unanswered > 0 ? 'disabled' : ''}>Submit Exam</button>`
+              : `<button class="btn btn-primary" data-action="nextQ">Next →</button>`}
           </div>
           ${S.isPractice ? '<p style="text-align:center;font-size:12px;color:#1a5c1a;margin-top:8px;font-weight:700">Practice mode: you will see right/wrong feedback after submission.</p>' : ''}
           ${isLast && unanswered > 0 ? `<p style="text-align:center;font-size:12px;color:#c55a11;margin-top:8px">⚠ ${unanswered} unanswered — use the dots above to go back.</p>` : ''}
@@ -226,8 +226,8 @@
         <h2 style="margin-bottom:10px">Submission Queued</h2>
         <p style="color:#555;font-size:14px;line-height:1.7">Your browser could not reach the server, so the final submission was saved locally on this device. Keep this tab or reopen with the same code once your connection returns.</p>
         <p style="color:#8a5b00;font-size:13px;margin:12px 0 18px">Access code: <strong style="font-family:monospace">${_esc(S.code)}</strong></p>
-        <button class="btn btn-primary btn-full" onclick="retryPendingSubmission()">Retry Submission</button>
-        <button class="btn btn-secondary btn-full" onclick="showCodeEntry()">Return to Start</button>
+        <button class="btn btn-primary btn-full" data-action="retryPendingSubmission">Retry Submission</button>
+        <button class="btn btn-secondary btn-full" data-action="showCodeEntry">Return to Start</button>
       </div>
     </div>`);
   }
@@ -345,8 +345,8 @@
           <div style="font-size:13px;color:#555;line-height:1.9">${studyFocus.map((item) => `• ${_esc(item)}`).join('<br>')}</div>
         </div>` : ''}
         <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-bottom:12px">
-          <button class="btn btn-secondary btn-sm" onclick="downloadResultSummary('json')">Download JSON Summary</button>
-          <button class="btn btn-secondary btn-sm" onclick="downloadResultSummary('html')">Download Study Report</button>
+          <button class="btn btn-secondary btn-sm" data-action="downloadResultSummary" data-args="json">Download JSON Summary</button>
+          <button class="btn btn-secondary btn-sm" data-action="downloadResultSummary" data-args="html">Download Study Report</button>
         </div>
         <p style="font-size:13px;color:#999">${rec.isPractice ? 'Your practice attempt has been saved for learning analytics.' : 'Your result has been recorded. You may close this window.'}</p>
       </div>

@@ -66,7 +66,7 @@
           placeholder="• • • • • •" autocomplete="off" autocorrect="off" spellcheck="false"
           oninput="this.value=this.value.toUpperCase().replace(/[^A-Z0-9]/g,'')"
           onkeydown="if(event.key==='Enter')handleCodeSubmit()">
-        <button class="btn btn-primary btn-full" style="margin-top:6px" onclick="handleCodeSubmit()">Continue →</button>
+        <button class="btn btn-primary btn-full" style="margin-top:6px" data-action="handleCodeSubmit">Continue →</button>
         <p style="font-size:11px;color:#bbb;text-align:center;margin-top:8px">If you are resuming an interrupted exam, enter the same code to restore your progress.</p>
       </div>
     </div>`);
@@ -191,8 +191,8 @@
           <label for="cb-consent">I understand and agree to the exam conditions${root.IE.state.proctorEnabled() ? ' and proctoring' : ''} described above</label>
         </div>
         <div style="margin-top:18px">
-          <button class="btn btn-primary btn-full" onclick="handleConsentNext()">Continue →</button>
-          <button class="btn btn-secondary btn-full" onclick="showCodeEntry()">← Back</button>
+          <button class="btn btn-primary btn-full" data-action="handleConsentNext">Continue →</button>
+          <button class="btn btn-secondary btn-full" data-action="showCodeEntry">← Back</button>
         </div>
       </div>
     </div>`);
@@ -236,10 +236,10 @@
           <p style="font-size:11px;color:#888;margin-top:4px">Ensure your face is clearly visible</p>
         </div>
         <div style="margin-top:18px">
-          <button class="btn btn-primary btn-full" id="btn-cam" onclick="reqWebcam()">Enable Webcam</button>
-          <button class="btn btn-secondary btn-full" id="btn-screen" onclick="reqScreen()" disabled>Share Screen</button>
-          <button class="btn btn-success btn-full" id="btn-start" onclick="startExam()" disabled>${isResume ? 'Resume Exam' : 'Start Exam'} →</button>
-          <button class="btn btn-secondary btn-full" onclick="showConsent()">← Back</button>
+          <button class="btn btn-primary btn-full" id="btn-cam" data-action="reqWebcam">Enable Webcam</button>
+          <button class="btn btn-secondary btn-full" id="btn-screen" data-action="reqScreen" disabled>Share Screen</button>
+          <button class="btn btn-success btn-full" id="btn-start" data-action="startExam" disabled>${isResume ? 'Resume Exam' : 'Start Exam'} →</button>
+          <button class="btn btn-secondary btn-full" data-action="showConsent">← Back</button>
         </div>
       </div>
     </div>`);

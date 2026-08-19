@@ -382,8 +382,9 @@ input:focus{outline:none;border-color:#2E75B6}
   Script load order matters — every module attaches to window.IE and
   uses globals (S, _adminToken, etc.) defined by client/state.js, so
   that file must run before any of the others below. client/main.js
-  re-exports the onclick handlers onto window.* and registers the
-  DOMContentLoaded bootstrap, so it must run LAST.
+  registers the DOMContentLoaded bootstrap, so it must run LAST.
+  client/dispatcher.js must run BEFORE main.js so the click/change
+  listeners are active when the DOM is ready.
 -->
 <script src="/shared/constants.js"></script>
 <script src="/client/util.js"></script>
@@ -394,6 +395,7 @@ input:focus{outline:none;border-color:#2E75B6}
 <script src="/client/admin-auth.js"></script>
 <script src="/client/admin-codes.js"></script>
 <script src="/client/admin-question-sets.js"></script>
+<script src="/client/dispatcher.js"></script>
 <script src="/client/main.js"></script>
 </body>
 </html>

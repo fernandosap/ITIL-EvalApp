@@ -31,7 +31,7 @@
     const pwdBlock = methods.password
       ? `<label class="label">Password</label>
          <input type="password" id="pwd" placeholder="Admin password" autocomplete="off" onkeydown="if(event.key==='Enter')doLogin()">
-         <button class="btn btn-secondary btn-full" onclick="doLogin()">Access Console</button>`
+         <button class="btn btn-secondary btn-full" data-action="doLogin">Access Console</button>`
       : (!methods.xsuaa || !methods.xsuaa.enabled
           ? `<p style="color:#a00;font-size:13px">No admin authentication is configured on this server. Set ADMIN_HASH or bind XSUAA.</p>`
           : '');
@@ -41,7 +41,7 @@
         <p style="margin-bottom:18px;color:#666;font-size:14px">Proctor console — restricted access.</p>
         ${xsuaaBtn}
         ${pwdBlock}
-        <button class="btn btn-secondary btn-full" style="margin-top:18px" onclick="showCodeEntry()">← Back</button>
+        <button class="btn btn-secondary btn-full" style="margin-top:18px" data-action="showCodeEntry">← Back</button>
       </div>
     </div>`);
   }

@@ -1,101 +1,25 @@
 /* eslint-disable no-console */
 // client/main.js — the SPA entry point. Two responsibilities:
-//   1. Re-expose every function used by inline onclick="..." handlers
-//      in the rendered HTML onto window.*. (Modules attach to
-//      window.IE.<name>; onclick handlers need plain window.X.)
-//   2. Register global event listeners (offline, online, beforeunload)
-//      and run the DOMContentLoaded bootstrap.
+//   1. Register global event listeners (offline, online, beforeunload).
+//   2. Run the DOMContentLoaded bootstrap.
+//
+// Click and change events are handled by client/dispatcher.js via event
+// delegation (data-action / data-args attributes in the rendered
+// HTML). That means we no longer need the long `window.X = X` re-export
+// list that this file used to carry. Modules attach to window.IE.*
+// and the dispatcher walks those namespaces to find the right
+// function for a given data-action.
 //
 // Load order (in index.html) is strict:
 //   shared/constants.js → client/util.js → client/state.js → client/code-entry.js
 //   → client/exam.js → client/proctor.js → client/admin-auth.js
 //   → client/admin-codes.js → client/admin-question-sets.js
-//   → client/main.js
+//   → client/dispatcher.js → client/main.js
 
 (function (root) {
-  // ---- window.* re-exports for inline onclick handlers ----
-  // Keep this list in sync with the inline onclick attributes in the
-  // rendered HTML across all modules. Anything not on window will
-  // throw a ReferenceError when the user clicks the corresponding
-  // button.
-  const ONCLICK_EXPORTS = [
-    // code-entry
-    ['handleCodeSubmit', 'codeEntry'],
-    ['showCodeEntry', 'codeEntry'],
-    ['handleConsentNext', 'codeEntry'],
-    ['reqWebcam', 'codeEntry'],
-    ['reqScreen', 'codeEntry'],
-    ['startExam', 'codeEntry'],
-    // exam
-    ['goToQ', 'exam'],
-    ['prevQ', 'exam'],
-    ['nextQ', 'exam'],
-    ['pick', 'exam'],
-    ['trySubmit', 'exam'],
-    ['retryPendingSubmission', 'exam'],
-    ['downloadResultSummary', 'exam'],
-    // admin-auth
-    ['showAdminLogin', 'adminAuth'],
-    ['doLogin', 'adminAuth'],
-    ['logoutAdmin', 'adminAuth'],
-    ['revokeAdminSessions', 'adminAuth'],
-    // admin-codes (dashboard + per-row handlers)
-    ['showAdmin', 'admin'],
-    ['flagsFor', 'admin'],
-    ['clearStaleSessions', 'admin'],
-    ['toggleExamAvailability', 'admin'],
-    ['reviewResult', 'admin'],
-    ['repairResultSummaries', 'admin'],
-    ['clearResultSummaries', 'admin'],
-    ['toggleCodeSelection', 'admin'],
-    ['toggleAllVisibleCodes', 'admin'],
-    ['selectAllVisibleCodes', 'admin'],
-    ['clearCodeSelection', 'admin'],
-    ['bulkDeleteCodes', 'admin'],
-    ['saveNote', 'admin'],
-    ['resetCode', 'admin'],
-    ['deleteCode', 'admin'],
-    ['generateCodes', 'admin'],
-    ['setExportFilter', 'admin'],
-    ['downloadExport', 'admin'],
-    ['downloadAuditExport', 'admin'],
-    ['downloadSignedResultSummary', 'admin'],
-    // question-sets
-    ['assignQuestionSet', 'questionSets'],
-    ['showQuestionSetAnalytics', 'questionSets'],
-    ['createQuestionSet', 'questionSets'],
-    ['configQuestionSet', 'questionSets'],
-    ['saveQuestionSetConfig', 'questionSets'],
-    ['syncExamModeHelp', 'questionSets'],
-    ['activateQuestionSet', 'questionSets'],
-    ['deleteQuestionSet', 'questionSets'],
-    ['showUploadQuestionSet', 'questionSets'],
-    ['downloadQuestionTemplate', 'questionSets'],
-    ['previewUploadedQuestionSet', 'questionSets'],
-    ['submitUploadedQuestionSet', 'questionSets'],
-    ['openQuestionSet', 'questionSets'],
-    ['showQuestionEditor', 'questionSets'],
-    ['saveQuestionEditor', 'questionSets'],
-    ['deleteQuestion', 'questionSets'],
-    ['editSectionPrompt', 'questionSets'],
-    ['deleteSection', 'questionSets'],
-    ['exportQuestionSet', 'questionSets'],
-    ['cloneQuestionSet', 'questionSets'],
-    ['publishQuestionSet', 'questionSets'],
-    ['archiveQuestionSet', 'questionSets'],
-    ['rollbackImportedSet', 'questionSets']
-  ];
-
-  for (const [name, mod] of ONCLICK_EXPORTS) {
-    const fn = root.IE && root.IE[mod] && root.IE[mod][name];
-    if (typeof fn === 'function') {
-      root[name] = fn;
-    } else {
-      console.warn(`[client/main] onclick export missing: ${name} on IE.${mod}`);
-    }
-  }
-
   // ---- Global event listeners ----
+  // beforeunload: if the candidate is mid-exam, save progress and
+  // warn before the page unloads.
   root.addEventListener('beforeunload', (e) => {
     if (root.S && root.S.screen === 'exam' && !root.S.submitted) {
       root.IE.state.saveProgress();
@@ -103,16 +27,22 @@
       e.returnValue = '';
     }
   });
-  root.addEventListener('offline', () => {
+
+  // online / offline: refresh the connectivity banner and try to
+  // replay any pending submit when we come back online.
+  function onConnectivityChange() {
     if (root.IE.proctor && typeof root.IE.proctor.refreshConnectivityState === 'function') {
       root.IE.proctor.refreshConnectivityState();
     }
-  });
-  root.addEventListener('online', () => {
-    if (root.IE.proctor && typeof root.IE.proctor.refreshConnectivityState === 'function') {
-      root.IE.proctor.refreshConnectivityState();
+    if (root.IE.state && root.S && root.S.screen === 'submit-pending') {
+      const IE = root.IE;
+      if (IE.exam && typeof IE.exam.retryPendingSubmission === 'function') {
+        IE.exam.retryPendingSubmission();
+      }
     }
-  });
+  }
+  root.addEventListener('offline', onConnectivityChange);
+  root.addEventListener('online', onConnectivityChange);
 
   // ---- Bootstrap ----
   document.addEventListener('DOMContentLoaded', async () => {

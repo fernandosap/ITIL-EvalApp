@@ -173,7 +173,7 @@
         ${staleSessions.length ? `<div style="margin-top:10px;padding:10px 12px;background:rgba(255,248,230,.9);border-radius:10px;color:#8a5b00;font-size:13px">
           <strong>Stale active sessions (${systemStatus.staleSessionMinutes}+ min):</strong><br>
           ${staleSessions.map((s) => `${_esc(s.code)} · last save ${s.updatedAt ? _esc(new Date(s.updatedAt).toLocaleString()) : 'unknown'}`).join('<br>')}
-          ${canAdmin ? '<div style="margin-top:10px"><button class="btn btn-danger btn-sm" onclick="clearStaleSessions()">Clear Stale Sessions</button></div>' : ''}
+          ${canAdmin ? '<div style="margin-top:10px"><button class="btn btn-danger btn-sm" data-action="clearStaleSessions">Clear Stale Sessions</button></div>' : ''}
         </div>` : ''}
         ${warnings.length ? `<div style="margin-top:10px;font-size:13px;color:#7a251d">${warnings.map((w) => `• ${_esc(w)}`).join('<br>')}</div>` : ''}
       </div>` : '';
@@ -193,27 +193,27 @@
         <td style="text-align:center">${set.examMode === 'PRACTICE' ? '<span class="chip chip-pass">Practice</span>' : '<span class="chip chip-active">Graded</span>'}</td>
         <td style="text-align:center">${set.proctorEnabled !== false ? 'On' : 'Off'}</td>
         <td style="text-align:center;white-space:nowrap">
-          ${canAnalytics ? `<button class="btn btn-secondary btn-sm" onclick="showQuestionSetAnalytics(${set.id})">Analytics</button>` : ''}
-          ${canContentRead ? `<button class="btn btn-secondary btn-sm" onclick="openQuestionSet(${set.id}, '${_esc(set.name)}')">Manage</button>` : ''}
-          ${roleCan('results:export') ? `<button class="btn btn-secondary btn-sm" onclick="exportQuestionSet(${set.id})">Export</button>` : ''}
-          ${canContentWrite ? `<button class="btn btn-secondary btn-sm" onclick="cloneQuestionSet(${set.id}, '${_esc(set.name)}')">Clone</button>` : ''}
-          ${canContentWrite ? `<button class="btn btn-secondary btn-sm" onclick="configQuestionSet(${set.id}, ${set.durationMinutes || 45}, ${set.passPct || 80}, ${set.proctorEnabled !== false}, ${set.numQuestions == null ? 'null' : set.numQuestions}, ${set.questionCount || 0})">Config</button>` : ''}
-          ${canContentPublish && !set.isActive ? `<button class="btn btn-primary btn-sm" onclick="activateQuestionSet(${set.id})">Set Default</button>` : ''}
-          ${canContentPublish && String(set.lifecycleStatus || '') !== 'PUBLISHED' ? `<button class="btn btn-secondary btn-sm" onclick="publishQuestionSet(${set.id})">Publish</button>` : ''}
-          ${canContentPublish && !set.isActive && String(set.lifecycleStatus || '') !== 'ARCHIVED' ? `<button class="btn btn-secondary btn-sm" onclick="archiveQuestionSet(${set.id})">Archive</button>` : ''}
-          ${roleCan('imports:rollback') && set.importSource === 'csv_upload' && !set.isActive ? `<button class="btn btn-danger btn-sm" onclick="rollbackImportedSet(${set.id})">Rollback</button>` : ''}
-          ${canContentPublish && !set.isActive ? `<button class="btn btn-danger btn-sm" onclick="deleteQuestionSet(${set.id}, '${_esc(set.name)}')">Delete</button>` : ''}
+          ${canAnalytics ? `<button class="btn btn-secondary btn-sm" data-action="showQuestionSetAnalytics" data-args="${set.id}">Analytics</button>` : ''}
+          ${canContentRead ? `<button class="btn btn-secondary btn-sm" data-action="openQuestionSet" data-args="${set.id},${_esc(set.name)}">Manage</button>` : ''}
+          ${roleCan('results:export') ? `<button class="btn btn-secondary btn-sm" data-action="exportQuestionSet" data-args="${set.id}">Export</button>` : ''}
+          ${canContentWrite ? `<button class="btn btn-secondary btn-sm" data-action="cloneQuestionSet" data-args="${set.id},${_esc(set.name)}">Clone</button>` : ''}
+          ${canContentWrite ? `<button class="btn btn-secondary btn-sm" data-action="configQuestionSet" data-args="${set.id},${set.durationMinutes || 45},${set.passPct || 80},${set.proctorEnabled !== false},${set.numQuestions == null ? 'null' : set.numQuestions},${set.questionCount || 0}">Config</button>` : ''}
+          ${canContentPublish && !set.isActive ? `<button class="btn btn-primary btn-sm" data-action="activateQuestionSet" data-args="${set.id}">Set Default</button>` : ''}
+          ${canContentPublish && String(set.lifecycleStatus || '') !== 'PUBLISHED' ? `<button class="btn btn-secondary btn-sm" data-action="publishQuestionSet" data-args="${set.id}">Publish</button>` : ''}
+          ${canContentPublish && !set.isActive && String(set.lifecycleStatus || '') !== 'ARCHIVED' ? `<button class="btn btn-secondary btn-sm" data-action="archiveQuestionSet" data-args="${set.id}">Archive</button>` : ''}
+          ${roleCan('imports:rollback') && set.importSource === 'csv_upload' && !set.isActive ? `<button class="btn btn-danger btn-sm" data-action="rollbackImportedSet" data-args="${set.id}">Rollback</button>` : ''}
+          ${canContentPublish && !set.isActive ? `<button class="btn btn-danger btn-sm" data-action="deleteQuestionSet" data-args="${set.id},${_esc(set.name)}">Delete</button>` : ''}
         </td>
       </tr>`).join('');
 
     const rows = root._adminRows.map((row) => `
       <tr>
-        <td style="text-align:center">${canAdmin ? `<input type="checkbox" class="code-select" ${root._selectedCodes.has(row.code) ? 'checked' : ''} onchange="toggleCodeSelection('${row.code}', this.checked)">` : ''}</td>
+        <td style="text-align:center">${canAdmin ? `<input type="checkbox" class="code-select" ${root._selectedCodes.has(row.code) ? 'checked' : ''} data-action="toggleCodeSelection" data-args="${row.code},__checked__">` : ''}</td>
         <td style="font-family:monospace;font-weight:700">${_esc(row.code)}</td>
         <td>${_esc(row.label || '')}</td>
         <td>
           ${row.status === 'unused'
-            ? `<select style="margin:0;width:220px;font-size:12px;padding:6px 8px" onchange="assignQuestionSet('${row.code}', this.value)">
+            ? `<select style="margin:0;width:220px;font-size:12px;padding:6px 8px" data-action="assignQuestionSet" data-args="${row.code},__value__">
                 <option value="" ${row.questionSetId == null ? 'selected' : ''}>${root._activeQuestionSet ? `${_esc(root._activeQuestionSet.name)} (default)` : 'Default active set'}</option>
                 ${root._adminQuestionSets.map((set) => `<option value="${set.id}" ${row.questionSetId === set.id ? 'selected' : ''}>${_esc(set.name)}${set.isActive ? ' ⭐' : ''}</option>`).join('')}
               </select>`
@@ -225,12 +225,12 @@
         <td style="text-align:center">${row.pct == null ? '—' : `${row.pct}%`}</td>
         <td style="text-align:center">${row.durationSecs == null ? '—' : durationLabel(row.durationSecs)}</td>
         <td style="text-align:center">${row.tabSwitches || 0}</td>
-        <td style="text-align:center">${row.incidentCount ? `<button class="btn btn-secondary btn-sm" onclick="flagsFor('${row.code}')">${row.incidentCount}</button>` : '0'}</td>
+        <td style="text-align:center">${row.incidentCount ? `<button class="btn btn-secondary btn-sm" data-action="flagsFor" data-args="${row.code}">${row.incidentCount}</button>` : '0'}</td>
         <td style="text-align:center">${row.submittedAt ? new Date(row.submittedAt).toLocaleString() : '—'}</td>
         <td style="text-align:center;white-space:nowrap">
-          ${row.status === 'completed' ? `<button class="btn btn-secondary btn-sm" onclick="reviewResult('${row.code}')">Review</button>` : ''}
-          ${canAdmin ? `<button class="btn btn-danger btn-sm" onclick="resetCode('${row.code}')">Reset</button>` : ''}
-          ${canAdmin ? `<button class="btn btn-danger btn-sm" onclick="deleteCode('${row.code}', '${row.status}')">Delete</button>` : ''}
+          ${row.status === 'completed' ? `<button class="btn btn-secondary btn-sm" data-action="reviewResult" data-args="${row.code}">Review</button>` : ''}
+          ${canAdmin ? `<button class="btn btn-danger btn-sm" data-action="resetCode" data-args="${row.code}">Reset</button>` : ''}
+          ${canAdmin ? `<button class="btn btn-danger btn-sm" data-action="deleteCode" data-args="${row.code},${row.status}">Delete</button>` : ''}
         </td>
       </tr>`).join('');
 
@@ -241,17 +241,17 @@
           <div style="font-size:13px;color:rgba(255,255,255,.75)">${unused} unused · ${active} active · ${completed} completed · ${root._adminQuestionSets.length} exam set${root._adminQuestionSets.length === 1 ? '' : 's'} · Role: ${root._adminRole === 'admin' ? 'Admin' : root._adminRole === 'manager' ? 'Manager' : root._adminRole === 'reviewer' ? 'Reviewer' : 'Content Editor'}</div>
         </div>
         <div style="display:flex;gap:8px;flex-wrap:wrap">
-          <button class="btn btn-primary btn-sm" onclick="generateCodes()">+ Generate Codes</button>
-          ${canContentWrite ? '<button class="btn btn-primary btn-sm" onclick="createQuestionSet()">+ New Exam Set</button>' : ''}
-          ${roleCan('imports:write') ? '<button class="btn btn-secondary btn-sm" onclick="showUploadQuestionSet()">Upload Exam CSV</button>' : ''}
-          ${canAdmin ? `<button class="btn btn-secondary btn-sm" onclick="toggleExamAvailability(${examOpen ? 'false' : 'true'})">${examOpen ? 'Close Exams' : 'Open Exams'}</button>` : ''}
-          ${canAdmin ? '<button class="btn btn-secondary btn-sm" onclick="revokeAdminSessions()">Revoke Sessions</button>' : ''}
-          ${canAdmin ? '<button class="btn btn-secondary btn-sm" onclick="repairResultSummaries()">Repair Scores</button>' : ''}
-          ${canAdmin ? '<button class="btn btn-secondary btn-sm" onclick="clearResultSummaries()">Clear Scores</button>' : ''}
-          <button class="btn btn-secondary btn-sm" onclick="downloadExport()">Export CSV</button>
-          ${canAuditExport ? '<button class="btn btn-secondary btn-sm" onclick="downloadAuditExport()">Export Audit JSON</button>' : ''}
-          <button class="btn btn-secondary btn-sm" onclick="logoutAdmin()">Logout</button>
-          <button class="btn btn-secondary btn-sm" onclick="showAdmin()">↻ Refresh</button>
+          <button class="btn btn-primary btn-sm" data-action="generateCodes">+ Generate Codes</button>
+          ${canContentWrite ? '<button class="btn btn-primary btn-sm" data-action="createQuestionSet">+ New Exam Set</button>' : ''}
+          ${roleCan('imports:write') ? '<button class="btn btn-secondary btn-sm" data-action="showUploadQuestionSet">Upload Exam CSV</button>' : ''}
+          ${canAdmin ? `<button class="btn btn-secondary btn-sm" data-action="toggleExamAvailability" data-args="${examOpen ? 'false' : 'true'}">${examOpen ? 'Close Exams' : 'Open Exams'}</button>` : ''}
+          ${canAdmin ? '<button class="btn btn-secondary btn-sm" data-action="revokeAdminSessions">Revoke Sessions</button>' : ''}
+          ${canAdmin ? '<button class="btn btn-secondary btn-sm" data-action="repairResultSummaries">Repair Scores</button>' : ''}
+          ${canAdmin ? '<button class="btn btn-secondary btn-sm" data-action="clearResultSummaries">Clear Scores</button>' : ''}
+          <button class="btn btn-secondary btn-sm" data-action="downloadExport">Export CSV</button>
+          ${canAuditExport ? '<button class="btn btn-secondary btn-sm" data-action="downloadAuditExport">Export Audit JSON</button>' : ''}
+          <button class="btn btn-secondary btn-sm" data-action="logoutAdmin">Logout</button>
+          <button class="btn btn-secondary btn-sm" data-action="showAdmin">↻ Refresh</button>
         </div>
       </div>
       ${systemBanner}
@@ -307,34 +307,34 @@
         <div style="padding:14px 16px 0;font-size:12px;color:#666;display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap">
           <span>Sorted by seat number to make the roster easier to scan.</span>
           ${canAdmin ? `<span style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-            <button class="btn btn-secondary btn-sm" onclick="selectAllVisibleCodes()">Select Visible</button>
-            <button class="btn btn-secondary btn-sm" onclick="clearCodeSelection()">Clear Selection</button>
-            <button class="btn btn-danger btn-sm" onclick="bulkDeleteCodes()">Delete Selected (<span id="selected-code-count">${root._selectedCodes.size}</span>)</button>
+            <button class="btn btn-secondary btn-sm" data-action="selectAllVisibleCodes">Select Visible</button>
+            <button class="btn btn-secondary btn-sm" data-action="clearCodeSelection">Clear Selection</button>
+            <button class="btn btn-danger btn-sm" data-action="bulkDeleteCodes">Delete Selected (<span id="selected-code-count">${root._selectedCodes.size}</span>)</button>
           </span>` : ''}
         </div>
         <div style="padding:12px 16px 10px;display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px">
-          <select style="margin:0;font-size:12px;padding:8px 10px" onchange="setExportFilter('questionSetId', this.value)">
+          <select style="margin:0;font-size:12px;padding:8px 10px" data-action="setExportFilter" data-args="questionSetId,__value__">
             <option value="">All exam sets</option>
             ${root._adminQuestionSets.map((set) => `<option value="${set.id}" ${String(root._exportFilters.questionSetId) === String(set.id) ? 'selected' : ''}>${_esc(set.name)}</option>`).join('')}
           </select>
-          <select style="margin:0;font-size:12px;padding:8px 10px" onchange="setExportFilter('status', this.value)">
+          <select style="margin:0;font-size:12px;padding:8px 10px" data-action="setExportFilter" data-args="status,__value__">
             <option value="" ${!root._exportFilters.status ? 'selected' : ''}>All statuses</option>
             <option value="unused" ${root._exportFilters.status === 'unused' ? 'selected' : ''}>Unused</option>
             <option value="active" ${root._exportFilters.status === 'active' ? 'selected' : ''}>Active</option>
             <option value="completed" ${root._exportFilters.status === 'completed' ? 'selected' : ''}>Completed</option>
           </select>
-          <select style="margin:0;font-size:12px;padding:8px 10px" onchange="setExportFilter('mode', this.value)">
+          <select style="margin:0;font-size:12px;padding:8px 10px" data-action="setExportFilter" data-args="mode,__value__">
             <option value="" ${!root._exportFilters.mode ? 'selected' : ''}>All modes</option>
             <option value="GRADED" ${root._exportFilters.mode === 'GRADED' ? 'selected' : ''}>Graded only</option>
             <option value="PRACTICE" ${root._exportFilters.mode === 'PRACTICE' ? 'selected' : ''}>Practice only</option>
           </select>
-          <input type="date" value="${_esc(root._exportFilters.dateFrom || '')}" style="margin:0;font-size:12px;padding:8px 10px" onchange="setExportFilter('dateFrom', this.value)">
-          <input type="date" value="${_esc(root._exportFilters.dateTo || '')}" style="margin:0;font-size:12px;padding:8px 10px" onchange="setExportFilter('dateTo', this.value)">
+          <input type="date" value="${_esc(root._exportFilters.dateFrom || '')}" style="margin:0;font-size:12px;padding:8px 10px" data-action="setExportFilter" data-args="dateFrom,__value__">
+          <input type="date" value="${_esc(root._exportFilters.dateTo || '')}" style="margin:0;font-size:12px;padding:8px 10px" data-action="setExportFilter" data-args="dateTo,__value__">
         </div>
         <table class="admin-table">
           <thead>
             <tr>
-              <th style="text-align:center">${canAdmin ? '<input type="checkbox" onchange="toggleAllVisibleCodes(this.checked)">' : ''}</th><th>Code</th><th>Seat</th><th>Exam Set</th><th>Notes</th><th>Status</th><th style="text-align:center">Score</th><th style="text-align:center">Pct</th><th style="text-align:center">Duration</th><th style="text-align:center">Tabs</th><th style="text-align:center">Flags</th><th style="text-align:center">Submitted</th><th style="text-align:center">Actions</th>
+              <th style="text-align:center">${canAdmin ? '<input type="checkbox" data-action="toggleAllVisibleCodes" data-args="__checked__">' : ''}</th><th>Code</th><th>Seat</th><th>Exam Set</th><th>Notes</th><th>Status</th><th style="text-align:center">Score</th><th style="text-align:center">Pct</th><th style="text-align:center">Duration</th><th style="text-align:center">Tabs</th><th style="text-align:center">Flags</th><th style="text-align:center">Submitted</th><th style="text-align:center">Actions</th>
             </tr>
           </thead>
           <tbody>${rows || '<tr><td colspan="13" style="text-align:center;color:#888;padding:20px">No access codes found</td></tr>'}</tbody>
@@ -557,8 +557,8 @@
               <div style="font-size:12px;color:#777;margin-top:6px">${result.score ?? '—'} / ${result.total ?? '—'} · ${result.pct == null ? '—' : `${result.pct}%`} · ${result.pass ? 'Passed' : 'Did not pass'}</div>
             </div>
             <div style="display:flex;gap:8px;flex-wrap:wrap">
-              ${roleCan('compliance:read') ? `<button class="btn btn-secondary btn-sm" onclick="downloadSignedResultSummary('${code}')">Signed Summary</button>` : ''}
-              <button class="btn btn-secondary btn-sm" onclick="showAdmin()">← Back to Admin</button>
+              ${roleCan('compliance:read') ? `<button class="btn btn-secondary btn-sm" data-action="downloadSignedResultSummary" data-args="${code}">Signed Summary</button>` : ''}
+              <button class="btn btn-secondary btn-sm" data-action="showAdmin">← Back to Admin</button>
             </div>
           </div>
         </div>

@@ -87,7 +87,7 @@
               <div style="font-size:22px;font-weight:800;color:#1F3864">Analytics</div>
               <div style="font-size:13px;color:#666;margin-top:4px">${_esc(resp.questionSet?.name || 'Exam Set')} · ${resp.questionSet?.isPractice ? 'Practice' : 'Graded'} · ${resp.questionSet?.questionCount || 0} questions</div>
             </div>
-            <button class="btn btn-secondary btn-sm" onclick="showAdmin()">← Back to Admin</button>
+            <button class="btn btn-secondary btn-sm" data-action="showAdmin">← Back to Admin</button>
           </div>
         </div>
         <div class="card" style="margin-bottom:16px">
@@ -145,9 +145,16 @@
 
   async function configQuestionSet(id, currentDuration, currentPassPct, currentProctor, currentNumQuestions, totalQuestions) {
     const current = root.__currentQuestionSet || null;
+    // The "← Back" / "Cancel" button: return to the open question set
+    // editor if we're already in it, otherwise back to the admin
+    // dashboard. With event delegation, the action name and the
+    // args are separate attributes (data-action / data-args).
     const returnAction = current && current.id === id
-      ? `openQuestionSet(${id}, '${_esc(current.name || '')}')`
-      : 'showAdmin()';
+      ? 'openQuestionSet'
+      : 'showAdmin';
+    const returnArgs = current && current.id === id
+      ? `${id},${_esc(current.name || '')}`
+      : '';
     const setMeta = root._adminQuestionSets.find((set) => set.id === id) || {};
     const setName = current && current.id === id ? current.name : (setMeta.name || 'Exam Set');
     const setDescription = current && current.id === id ? (current.description || '') : (setMeta.description || '');
@@ -164,7 +171,7 @@
             <div style="font-size:22px;font-weight:800;color:#1F3864">Exam Set Configuration</div>
             <div style="font-size:13px;color:#666;margin-top:4px">${_esc(setName)}</div>
           </div>
-          <button class="btn btn-secondary btn-sm" onclick="${returnAction}">← Back</button>
+          <button class="btn btn-secondary btn-sm" data-action="${returnAction}" data-args="${returnArgs}">← Back</button>
         </div>
 
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-bottom:18px">
@@ -206,12 +213,12 @@
         <label class="label">Exam Mode</label>
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin-bottom:16px">
           <label style="display:block;padding:14px;border:2px solid #d0d8e8;border-radius:14px;background:#fff;cursor:pointer">
-            <input type="radio" name="cfg-exam-mode" value="GRADED" ${examMode !== 'PRACTICE' ? 'checked' : ''} onchange="syncExamModeHelp()" style="width:16px;height:16px;margin-right:8px">
+            <input type="radio" name="cfg-exam-mode" value="GRADED" ${examMode !== 'PRACTICE' ? 'checked' : ''} data-action="syncExamModeHelp" style="width:16px;height:16px;margin-right:8px">
             <strong style="color:#1F3864">Graded Exam</strong>
             <div style="font-size:12px;color:#666;margin-top:6px;line-height:1.55">Official exam behavior. Candidates do not see the answer key after submission.</div>
           </label>
           <label style="display:block;padding:14px;border:2px solid #8acb95;border-radius:14px;background:#f3fbf5;cursor:pointer">
-            <input type="radio" name="cfg-exam-mode" value="PRACTICE" ${examMode === 'PRACTICE' ? 'checked' : ''} onchange="syncExamModeHelp()" style="width:16px;height:16px;margin-right:8px">
+            <input type="radio" name="cfg-exam-mode" value="PRACTICE" ${examMode === 'PRACTICE' ? 'checked' : ''} data-action="syncExamModeHelp" style="width:16px;height:16px;margin-right:8px">
             <strong style="color:#1a5c1a">Practice / Knowledge Check</strong>
             <div style="font-size:12px;color:#466;margin-top:6px;line-height:1.55">Learning mode. Candidates can review right/wrong answers at the end.</div>
           </label>
@@ -230,8 +237,8 @@
         </div>
 
         <div style="display:flex;gap:8px;flex-wrap:wrap">
-          <button class="btn btn-primary" onclick="saveQuestionSetConfig(${id}, '${_esc(setName)}')">Save Configuration</button>
-          <button class="btn btn-secondary" onclick="${returnAction}">Cancel</button>
+          <button class="btn btn-primary" data-action="saveQuestionSetConfig" data-args="${id},${_esc(setName)}">Save Configuration</button>
+          <button class="btn btn-secondary" data-action="${returnAction}" data-args="${returnArgs}">Cancel</button>
         </div>
       </div>
     </div>`);
@@ -362,8 +369,8 @@
             <div style="font-size:13px;color:#666">Import a new exam from a spreadsheet-friendly CSV without changing application code.</div>
           </div>
           <div style="display:flex;gap:8px;flex-wrap:wrap">
-            <button class="btn btn-secondary btn-sm" onclick="downloadQuestionTemplate()">Download Excel-Friendly Template</button>
-            <button class="btn btn-secondary btn-sm" onclick="showAdmin()">← Back to Admin</button>
+            <button class="btn btn-secondary btn-sm" data-action="downloadQuestionTemplate">Download Excel-Friendly Template</button>
+            <button class="btn btn-secondary btn-sm" data-action="showAdmin">← Back to Admin</button>
           </div>
         </div>
         <div style="padding:16px 18px;border:1px solid #d8e1f0;border-radius:14px;background:#f8fbff;margin-bottom:18px">
@@ -410,7 +417,7 @@
         <input id="upload-desc" type="text" placeholder="Optional">
         <div style="font-size:12px;color:#666;margin-top:-6px;margin-bottom:12px">Optional notes like cohort, language, version, or intended audience.</div>
         <label class="label">CSV File</label>
-        <input id="upload-file" type="file" accept=".csv" style="width:100%" onchange="previewUploadedQuestionSet()">
+        <input id="upload-file" type="file" accept=".csv" style="width:100%" data-action="previewUploadedQuestionSet">
         <div style="font-size:12px;color:#666;margin:10px 0 18px;line-height:1.7">
           Upload the CSV exported from your spreadsheet. The template already contains the correct headers, sample rows, and formatting examples.<br>
           Tip: if Excel asks how to save, choose <strong>CSV UTF-8</strong> when available.
@@ -418,7 +425,7 @@
         <div id="upload-preview" style="margin:0 0 18px;padding:14px;border:1px solid #d8e1f0;border-radius:14px;background:#fff">
           <div style="font-size:12px;color:#777">Select a CSV to preview row count, warnings, and import readiness.</div>
         </div>
-        <button class="btn btn-primary btn-full" onclick="submitUploadedQuestionSet()">Upload Exam Set</button>
+        <button class="btn btn-primary btn-full" data-action="submitUploadedQuestionSet">Upload Exam Set</button>
       </div>
     </div>`);
   }
@@ -629,8 +636,8 @@
           <td style="text-align:center">${q.multi ? 'Multi' : 'Single'}</td>
           <td style="text-align:center">${Array.isArray(q.opts) ? q.opts.length : 0}</td>
           <td style="text-align:center;white-space:nowrap">
-            <button class="btn btn-secondary btn-sm" onclick="showQuestionEditor(${setId}, ${q.id})">Edit</button>
-            <button class="btn btn-danger btn-sm" onclick="deleteQuestion(${setId}, ${q.id})">Delete</button>
+            <button class="btn btn-secondary btn-sm" data-action="showQuestionEditor" data-args="${setId},${q.id}">Edit</button>
+            <button class="btn btn-danger btn-sm" data-action="deleteQuestion" data-args="${setId},${q.id}">Delete</button>
           </td>
         </tr>`).join('');
       const sectionRows = sections.map((section) => `
@@ -641,8 +648,8 @@
           <td style="text-align:center">${section.drawCount == null ? '—' : section.drawCount}</td>
           <td style="text-align:center">${section.questionCount || 0}</td>
           <td style="text-align:center;white-space:nowrap">
-            <button class="btn btn-secondary btn-sm" onclick="editSectionPrompt(${setId}, ${section.id})">Edit</button>
-            <button class="btn btn-danger btn-sm" onclick="deleteSection(${setId}, ${section.id})">Delete</button>
+            <button class="btn btn-secondary btn-sm" data-action="editSectionPrompt" data-args="${setId},${section.id}">Edit</button>
+            <button class="btn btn-danger btn-sm" data-action="deleteSection" data-args="${setId},${section.id}">Delete</button>
           </td>
         </tr>`).join('');
 
@@ -665,10 +672,10 @@
               <div style="font-size:12px;color:#777;margin-top:6px">${questions.length} questions · ${sections.length} sections · ${setMeta.numQuestions ? `${setMeta.numQuestions} delivered per candidate` : 'All questions delivered'} · ${setMeta.durationMinutes || 45}m · ${setMeta.passPct || 80}% target · ${setMeta.examMode === 'PRACTICE' ? 'Practice mode' : 'Graded mode'}</div>
             </div>
             <div style="display:flex;gap:8px;flex-wrap:wrap">
-              <button class="btn btn-primary btn-sm" onclick="showQuestionEditor(${setId})">+ Add Question</button>
-              <button class="btn btn-secondary btn-sm" onclick="editSectionPrompt(${setId})">+ Add Section</button>
-              <button class="btn btn-secondary btn-sm" onclick="configQuestionSet(${setId}, ${setMeta.durationMinutes || 45}, ${setMeta.passPct || 80}, ${setMeta.proctorEnabled !== false}, ${setMeta.numQuestions == null ? 'null' : setMeta.numQuestions}, ${setMeta.questionCount || questions.length})">Config</button>
-              <button class="btn btn-secondary btn-sm" onclick="showAdmin()">← Back</button>
+              <button class="btn btn-primary btn-sm" data-action="showQuestionEditor" data-args="${setId}">+ Add Question</button>
+              <button class="btn btn-secondary btn-sm" data-action="editSectionPrompt" data-args="${setId}">+ Add Section</button>
+              <button class="btn btn-secondary btn-sm" data-action="configQuestionSet" data-args="${setId},${setMeta.durationMinutes || 45},${setMeta.passPct || 80},${setMeta.proctorEnabled !== false},${setMeta.numQuestions == null ? 'null' : setMeta.numQuestions},${setMeta.questionCount || questions.length}">Config</button>
+              <button class="btn btn-secondary btn-sm" data-action="showAdmin">← Back</button>
             </div>
           </div>
         </div>
@@ -714,7 +721,7 @@
             <div style="font-size:22px;font-weight:800;color:#1F3864">${question ? 'Edit Question' : 'Add Question'}</div>
             <div style="font-size:13px;color:#666">${_esc(current.name || 'Exam Set')}</div>
           </div>
-          <button class="btn btn-secondary btn-sm" onclick="openQuestionSet(${setId}, '${_esc(current.name || '')}')">← Back</button>
+          <button class="btn btn-secondary btn-sm" data-action="openQuestionSet" data-args="${setId},${_esc(current.name || '')}">← Back</button>
         </div>
         <label class="label">Question Number</label>
         <input id="qe-qnum" type="number" min="1" value="${question?.qNum || (current.questions.length + 1)}">
@@ -734,8 +741,8 @@
         <label class="label">Correct Option Indexes</label>
         <input id="qe-correct" type="text" value="${_esc(answerLines)}" placeholder="e.g. 1 or 0,2">
         <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:16px">
-          <button class="btn btn-primary" onclick="saveQuestionEditor(${setId}, ${question ? question.id : 'null'})">${question ? 'Save Question' : 'Create Question'}</button>
-          <button class="btn btn-secondary" onclick="openQuestionSet(${setId}, '${_esc(current.name || '')}')">Cancel</button>
+          <button class="btn btn-primary" data-action="saveQuestionEditor" data-args="${setId},${question ? question.id : 'null'}">${question ? 'Save Question' : 'Create Question'}</button>
+          <button class="btn btn-secondary" data-action="openQuestionSet" data-args="${setId},${_esc(current.name || '')}">Cancel</button>
         </div>
       </div>
     </div>`);
