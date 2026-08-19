@@ -5,6 +5,7 @@ const CFG = {
 };
 
 let _adminToken = null;
+let _adminAuthMethod = 'token';  // 'token' (X-Admin-Token) or 'xsuaa' (cookie)
 let _adminRole = 'admin';
 let _adminSystemStatus = null;
 let _adminAuditEntries = [];
@@ -178,6 +179,9 @@ async function apiFetch(url, opts = {}, cfg = {}) {
     try {
       const headers = { ...(opts.headers || {}) };
       if (_adminToken) headers['X-Admin-Token'] = _adminToken;
+      // XSUAA cookie path: the browser sends the xsuaa_jwt cookie
+      // automatically. We do NOT need to set Authorization: Bearer here —
+      // the cookie is sufficient for requireAdmin to authenticate.
       if (S.examToken) headers['X-Exam-Token'] = S.examToken;
       const resp = await fetch(url, { ...opts, headers, signal: controller.signal });
       clearTimeout(timer);
@@ -1159,14 +1163,34 @@ function statusChip(row) {
 async function showAdminLogin() {
   S.screen = 'admin-login';
   document.body.classList.remove('exam-bg');
+  // Probe the server to learn which auth methods are available. XSUAA
+  // takes precedence when bound; the password form is shown as a
+  // fallback only when it's also enabled.
+  let methods = { password: false, xsuaa: { enabled: false } };
+  try {
+    const r = await fetch('/api/admin/auth-methods', { credentials: 'same-origin' });
+    if (r.ok) methods = await r.json();
+  } catch (_e) {
+    // If we can't reach the server, fall through to the password form.
+  }
+  const xsuaaBtn = methods.xsuaa && methods.xsuaa.enabled
+    ? `<a class="btn btn-primary btn-full" href="${methods.xsuaa.authorizeUrl || '/oauth/login'}">Sign in with SAP</a>
+       <div style="text-align:center;color:#888;font-size:12px;margin:14px 0">or</div>`
+    : '';
+  const pwdBlock = methods.password
+    ? `<label class="label">Password</label>
+       <input type="password" id="pwd" placeholder="Admin password" autocomplete="off" onkeydown="if(event.key==='Enter')doLogin()">
+       <button class="btn btn-secondary btn-full" onclick="doLogin()">Access Console</button>`
+    : (!methods.xsuaa || !methods.xsuaa.enabled
+        ? `<p style="color:#a00;font-size:13px">No admin authentication is configured on this server. Set ADMIN_HASH or bind XSUAA.</p>`
+        : '');
   render(`<div class="screen" style="max-width:380px">
     <div class="card" style="margin-top:80px">
       <h2>Admin Access</h2>
       <p style="margin-bottom:18px;color:#666;font-size:14px">Proctor console — restricted access.</p>
-      <label class="label">Password</label>
-      <input type="password" id="pwd" placeholder="Admin password" autocomplete="off" onkeydown="if(event.key==='Enter')doLogin()">
-      <button class="btn btn-primary btn-full" onclick="doLogin()">Access Console</button>
-      <button class="btn btn-secondary btn-full" onclick="showCodeEntry()">← Back</button>
+      ${xsuaaBtn}
+      ${pwdBlock}
+      <button class="btn btn-secondary btn-full" style="margin-top:18px" onclick="showCodeEntry()">← Back</button>
     </div>
   </div>`);
 }
@@ -1185,8 +1209,29 @@ async function doLogin() {
     return;
   }
   _adminToken = resp.token;
+  _adminAuthMethod = 'token';
   _adminRole = resp.role || 'admin';
   showAdmin();
+}
+
+// Bootstrap an admin session from the XSUAA cookie, if one is set. The
+// /oauth/callback redirect lands the browser back at the SPA with the
+// xsuaa_jwt cookie set — we call /api/admin/me to learn the role and
+// jump straight into the admin console. Returns true if a session was
+// detected.
+async function tryBootstrapFromCookie() {
+  try {
+    const r = await fetch('/api/admin/me', { credentials: 'same-origin' });
+    if (!r.ok) return false;
+    const data = await r.json();
+    if (!data || !data.ok) return false;
+    _adminRole = data.role || 'admin';
+    _adminAuthMethod = data.authMethod || 'token';
+    _adminToken = null;  // rely on cookie
+    return true;
+  } catch (_e) {
+    return false;
+  }
 }
 
 function summaryValue(rows, status) {
@@ -2707,6 +2752,7 @@ function logoutAdmin() {
         // local token clear still happens
       }
       _adminToken = null;
+      _adminAuthMethod = 'token';
       _adminRole = 'admin';
       showAdminLogin();
     }},
@@ -2839,6 +2885,22 @@ window.addEventListener('offline', refreshConnectivityState);
 window.addEventListener('online', refreshConnectivityState);
 
 document.addEventListener('DOMContentLoaded', async () => {
-  if (new URLSearchParams(window.location.search).get('admin') === '1') showAdminLogin();
-  else showCodeEntry();
+  const params = new URLSearchParams(window.location.search);
+  if (params.get('admin') === '1') {
+    // After an XSUAA callback, ?auth=ok is in the URL. Try to bootstrap
+    // from the cookie first; fall through to the login form if no
+    // session was set.
+    if (await tryBootstrapFromCookie()) {
+      showAdmin();
+      // Strip ?auth=ok from the URL so a refresh doesn't repeat the
+      // bootstrap dance. Use replaceState to avoid polluting history.
+      params.delete('auth');
+      const newSearch = params.toString();
+      window.history.replaceState({}, '', window.location.pathname + (newSearch ? '?' + newSearch : ''));
+      return;
+    }
+    showAdminLogin();
+  } else {
+    showCodeEntry();
+  }
 });

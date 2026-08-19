@@ -2071,8 +2071,13 @@ app.post('/api/admin/logout', requireAdmin, async (req, res) => {
     action: 'admin_logout',
     actor: req.adminRole || 'admin',
     clientIp: getClientIp(req),
-    details: { ok: true }
+    details: { ok: true, authMethod: req.authMethod || 'token' }
   });
+  // Clear the XSUAA cookie if it was used for this session. Setting
+  // Max-Age=0 expires the cookie on the browser immediately.
+  res.setHeader('Set-Cookie',
+    'xsuaa_jwt=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax' +
+    (req.secure ? '; Secure' : ''));
   res.json({ ok: true });
 });
 
