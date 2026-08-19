@@ -78,6 +78,14 @@ test('resolveSentinels: __value__ and __checked__ are read from el', () => {
   );
 });
 
+test('resolveSentinels: __el__ passes the element itself (not its value)', () => {
+  const fakeEl = { id: 'xsuaa-login', tagName: 'A' };
+  const result = dispatcher.resolveSentinels(['__el__'], fakeEl);
+  assert.equal(result.length, 1);
+  assert.equal(result[0], fakeEl, '__el__ must resolve to the same element reference');
+  assert.equal(result[0].id, 'xsuaa-login');
+});
+
 test('lookupAction: finds the function in any IE.* module', () => {
   // window.IE is the namespace populated by the modules. The
   // dispatcher walks it and returns the first match. We need a

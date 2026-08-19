@@ -74,9 +74,16 @@
     S.screen = 'admin';
     document.body.classList.remove('exam-bg');
     render('<div class="admin-wrap"><div style="padding:60px;text-align:center;color:white;font-size:18px">Loading admin data...</div></div>');
-    let data, systemStatus, auditData, notificationData, overviewData;
+    let data, systemStatus, auditData, notificationData, overviewData, me;
     try {
-      [data, systemStatus, auditData, notificationData, overviewData] = await Promise.all([
+      [me, data, systemStatus, auditData, notificationData, overviewData] = await Promise.all([
+        // /api/admin/me is the canonical source for the current role —
+        // it works regardless of which permission set the operator has
+        // (e.g. reviewer without codes:read). Earlier we used `data.role`
+        // from /api/admin/codes, which is fine for admins/managers but
+        // fails open for everyone else. Keep the codes response as a
+        // fallback in case /me 401s (e.g. session expired mid-load).
+        fetch('/api/admin/me', { credentials: 'same-origin' }).then((r) => r.ok ? r.json() : null).catch(() => null),
         apiJson('/api/admin/codes', {}, { timeoutMs: 12000, retries: 1 }),
         apiJson('/api/admin/system-status', {}, { timeoutMs: 12000, retries: 1 }),
         apiJson('/api/admin/audit?limit=12', {}, { timeoutMs: 12000, retries: 1 }),
@@ -84,7 +91,7 @@
         apiJson('/api/admin/analytics/overview?days=30', {}, { timeoutMs: 16000, retries: 1 })
       ]);
     } catch (_e) {
-      data = systemStatus = auditData = notificationData = overviewData = null;
+      data = systemStatus = auditData = notificationData = overviewData = me = null;
     }
     if (!data || data.error) {
       modal('❌', 'Error', 'Could not load admin data from the server.', [{ label: 'OK', cls: 'btn-primary' }]);
@@ -94,7 +101,9 @@
     root._adminAuditEntries = Array.isArray(auditData?.entries) ? auditData.entries : [];
     root._adminNotifications = Array.isArray(notificationData?.notifications) ? notificationData.notifications : [];
     root._adminOverview = overviewData && overviewData.ok ? overviewData : null;
-    root._adminRole = data.role || root._adminRole || 'admin';
+    // /me first, then /codes.role, then whatever we already had.
+    root._adminRole = (me && me.ok && me.role) || (data && data.role) || root._adminRole || 'admin';
+    if (me && me.authMethod) root._adminAuthMethod = me.authMethod;
     const canAdmin = roleCan('*');
     const canContentRead = roleCan('content:read');
     const canContentWrite = roleCan('content:write');

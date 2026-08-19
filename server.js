@@ -31,7 +31,18 @@ function loadDotEnv(filePath) {
 
 loadDotEnv(path.join(__dirname, '.env'));
 
-const { normalizeExamTitle, hasPermission } = require('./shared/constants.js');
+const {
+  normalizeExamTitle,
+  hasPermission,
+  ROLES,
+  ROLE_LIST,
+  isValidRole,
+  CODE_STATUS,
+  CODE_STATUS_LIST,
+  QUESTION_SET_LIFECYCLE,
+  EXAM_MODE,
+  AUDIT_ACTION
+} = require('./shared/constants.js');
 const {
   makePRNG,
   seededShuffle,
@@ -53,6 +64,20 @@ const {
   acquireConn,
   releaseConn
 } = require('./shared/db-pool.js');
+const audit = require('./lib/audit.js');
+const rateLimit = require('./lib/rate-limit.js');
+const { createAuthMiddleware } = require('./lib/middleware.js');
+const sweeper = require('./lib/sweeper.js');
+const {
+  toCsvCell,
+  toCsvRow,
+  parseJsonOrNull,
+  parseAnthropicText,
+  buildSignedEnvelope,
+  verifySignedEnvelope,
+  jsonError,
+  jsonOk
+} = require('./lib/responses.js');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -91,15 +116,29 @@ const HAS_DB_CONFIG = Boolean(HANA_HOST && HANA_USER && HANA_PASSWORD && HANA_SC
 const INDEX_PATH = path.join(__dirname, 'index.html');
 const CLIENT_APP_PATH = path.join(__dirname, 'client-app.js'); // legacy shim, no longer used
 
+// Wire lib/audit.js with the current HANA config. This must run before
+// any tryWriteAdminAudit() call (which happens in route handlers).
+audit.init({
+  hasDbConfig: HAS_DB_CONFIG,
+  hanaHost: HANA_HOST,
+  hanaPort: HANA_PORT,
+  hanaUser: HANA_USER,
+  hanaPassword: HANA_PASSWORD,
+  hanaSchema: HANA_SCHEMA,
+  hanaEncrypt: HANA_ENCRYPT,
+  hanaSslValidateCertificate: HANA_SSL_VALIDATE_CERTIFICATE
+});
+
 const FAVICON_PATH = path.join(__dirname, 'favicon.svg');
 
 const EXAM_TTL_MS = 90 * 60 * 1000;
 const ADMIN_TTL_MS = 8 * 60 * 60 * 1000;
-const _rateLimitBuckets = new Map();
 const VALIDATE_MAX = 10;
 const VALIDATE_WINDOW = 10 * 60 * 1000;
 const ADMIN_LOGIN_MAX = 8;
 const ADMIN_LOGIN_WINDOW = 15 * 60 * 1000;
+const ADMIN_LOGIN_HASH_MAX = 20;       // defense vs password spray across IPs
+const ADMIN_LOGIN_HASH_WINDOW = 15 * 60 * 1000;
 const PROCTOR_MAX = 90;
 const PROCTOR_WINDOW = 60 * 1000;
 const _questionSetCache = new Map();
@@ -231,15 +270,6 @@ async function withDb(fn) {
   }
 }
 
-function parseJsonOrNull(s) {
-  if (!s) return null;
-  try {
-    return JSON.parse(s);
-  } catch (_e) {
-    return null;
-  }
-}
-
 function appLog(level, event, meta = {}) {
   console.log(JSON.stringify({ ts: new Date().toISOString(), level, event, ...meta }));
 }
@@ -258,17 +288,16 @@ function getSigningSecret() {
     .digest('hex');
 }
 
+// Signed-envelope helpers are now in lib/responses.js. Local thin
+// wrappers keep the existing call sites readable (no need to pass the
+// signing secret on every call) and stay in lockstep with the per-env
+// getSigningSecret() value.
 function signPayload(payload) {
   const json = JSON.stringify(payload);
   return crypto.createHmac('sha256', getSigningSecret()).update(json).digest('hex');
 }
-
-function buildSignedEnvelope(payload) {
-  return {
-    payload,
-    signature: signPayload(payload),
-    algorithm: 'HMAC-SHA256'
-  };
+function buildSignedEnvelopeLocal(payload) {
+  return buildSignedEnvelope(payload, getSigningSecret());
 }
 
 function getMetricsSnapshot() {
@@ -284,22 +313,11 @@ function getMetricsSnapshot() {
     topRoutes: [..._metrics.requestsByRoute.entries()]
       .sort((a, b) => b[1] - a[1])
       .slice(0, 12)
-      .map(([route, count]) => ({ route, count }))
+      .map(([route, count]) => ({ route, count })),
+    // Audit-write visibility — surfaces a quietly broken audit log
+    // (e.g. table dropped, HANA outage) without grepping logs.
+    audit: audit.getMetrics()
   };
-}
-
-function toCsvCell(v) {
-  if (v === null || v === undefined) return '';
-  return `"${String(v).replace(/"/g, '""')}"`;
-}
-
-function parseAnthropicText(content) {
-  if (!Array.isArray(content)) return '';
-  return content
-    .filter((c) => c && c.type === 'text' && typeof c.text === 'string')
-    .map((c) => c.text)
-    .join('\n')
-    .trim();
 }
 
 let _hasNotesColumn = null;
@@ -493,17 +511,17 @@ function sanitizeProgress(progress) {
 }
 
 function tokenSecretForRole(role) {
-  if (role === 'manager') return MANAGER_HASH;
-  if (role === 'reviewer') return REVIEWER_HASH;
-  if (role === 'content_editor') return CONTENT_EDITOR_HASH;
+  if (role === ROLES.MANAGER) return MANAGER_HASH;
+  if (role === ROLES.REVIEWER) return REVIEWER_HASH;
+  if (role === ROLES.CONTENT_EDITOR) return CONTENT_EDITOR_HASH;
   return ADMIN_HASH;
 }
 
-function createAdminToken(role = 'admin') {
+function createAdminToken(role = ROLES.ADMIN) {
   const issuedAt = Date.now();
   const expiry = Date.now() + ADMIN_TTL_MS;
   const nonce = crypto.randomBytes(16).toString('hex');
-  const safeRole = ['admin', 'manager', 'reviewer', 'content_editor'].includes(role) ? role : 'admin';
+  const safeRole = isValidRole(role) ? role : ROLES.ADMIN;
   const secret = tokenSecretForRole(safeRole);
   if (!secret) throw new Error(`${safeRole.toUpperCase()}_HASH is not configured.`);
   const payload = `${expiry}:${nonce}:${safeRole}:${issuedAt}`;
@@ -518,13 +536,13 @@ function parseAdminToken(token) {
     const parts = decoded.split(':');
     const expiry = parts[0];
     const nonce = parts[1];
-    const role = parts.length >= 4 ? parts[2] : 'admin';
+    const role = parts.length >= 4 ? parts[2] : ROLES.ADMIN;
     const issuedAt = parts.length === 5 ? Number(parts[3]) : 0;
     const sig = parts.length === 5 ? parts[4] : (parts.length === 4 ? parts[3] : parts[2]);
     if (!expiry || !nonce || !sig) return null;
     if (Date.now() > Number(expiry)) return null;
     const payload = parts.length === 5 ? `${expiry}:${nonce}:${role}:${issuedAt}` : (parts.length === 4 ? `${expiry}:${nonce}:${role}` : `${expiry}:${nonce}`);
-    const safeRole = ['admin', 'manager', 'reviewer', 'content_editor'].includes(role) ? role : 'admin';
+    const safeRole = isValidRole(role) ? role : ROLES.ADMIN;
     const secret = tokenSecretForRole(safeRole);
     if (!secret) return null;
     const expected = crypto.createHmac('sha256', secret).update(payload).digest('hex');
@@ -594,86 +612,46 @@ function tryXsuaaAuth(req) {
   return null;
 }
 
-async function requireAdmin(req, res, next) {
-  // XSUAA Bearer token (when VCAP_SERVICES has the xsuaa binding)
-  const xsuaaAuth = tryXsuaaAuth(req);
-  if (xsuaaAuth) {
-    req.adminRole = xsuaaAuth.role;
-    req.adminSubject = xsuaaAuth.sub;
-    req.authMethod = 'xsuaa';
-    return next();
-  }
+// Auth middlewares are constructed via lib/middleware.js's factory.
+// We declare the const AFTER the factory inputs (tryXsuaaAuth, etc.) so
+// every dependency is in scope, then expose the middlewares as local
+// function references for the rest of server.js to use.
+const adminAuth = createAuthMiddleware({
+  tryXsuaaAuth,
+  parseAdminToken,
+  getAdminTokenNotBefore,
+  withDb,
+  hasDbConfig: HAS_DB_CONFIG,
+  getXsuaaConfig,
+  hasPermission,
+  log: appLog
+});
 
-  // Legacy SHA-256 token path (local dev or until XSUAA is rolled out to all admins)
-  const token = String(req.headers['x-admin-token'] || '').trim();
-  const parsed = parseAdminToken(token);
-  if (!parsed) {
-    return res.status(401).json({
-      error: 'unauthorized',
-      hint: getXsuaaConfig()
-        ? 'Provide an Authorization: Bearer <jwt> from the bound XSUAA service.'
-        : 'Provide X-Admin-Token (SHA-256 role token) or bind XSUAA.'
-    });
-  }
-  try {
-    const revokedBefore = HAS_DB_CONFIG
-      ? await withDb(async (conn) => getAdminTokenNotBefore(conn))
-      : 0;
-    if (parsed.issuedAt && revokedBefore && parsed.issuedAt < revokedBefore) {
-      return res.status(401).json({ error: 'session_revoked' });
-    }
-    req.adminRole = parsed.role;
-    req.authMethod = 'token';
-    next();
-  } catch (err) {
-    appLog('error', 'admin_auth_failed', { requestId: req.requestId, message: err.message });
-    res.status(500).json({ error: 'admin_auth_failed' });
-  }
+async function requireAdmin(req, res, next) {
+  return adminAuth.requireAdmin(req, res, next);
 }
 
 function requireAdminRole(role) {
-  return (req, res, next) => {
-    if (role === 'admin' && req.adminRole !== 'admin') {
-      return res.status(403).json({ error: 'admin_role_required' });
-    }
-    next();
-  };
+  return adminAuth.requireAdminRole(role);
 }
 
 function requirePermission(permission) {
-  return (req, res, next) => {
-    if (!hasPermission(req.adminRole, permission)) {
-      return res.status(403).json({ error: 'forbidden', permission });
-    }
-    next();
-  };
+  return adminAuth.requirePermission(permission);
 }
 
 async function writeAdminAudit(conn, entry) {
-  if (!(await hasAuditLogTable(conn))) return false;
-  await execQuery(
-    conn,
-    `INSERT INTO ADMIN_AUDIT_LOG (ACTION, TARGET_CODE, DETAILS_JSON, ACTOR, CLIENT_IP, CREATED_AT)
-     VALUES (?, ?, ?, ?, ?, CURRENT_UTCTIMESTAMP)`,
-    [
-      String(entry.action || 'unknown'),
-      entry.targetCode ? String(entry.targetCode) : null,
-      entry.details ? JSON.stringify(entry.details) : null,
-      String(entry.actor || 'admin'),
-      entry.clientIp ? String(entry.clientIp) : null
-    ]
-  );
-  return true;
+  // Thin delegate to the lib/audit module. Kept as a function reference
+  // so call sites in this file stay readable. The real logic — and the
+  // failure metrics — live in lib/audit.js.
+  return audit.tryWriteAdminAudit(entry).then((r) => r === 'ok');
 }
 
 async function tryWriteAdminAudit(entry) {
-  if (!HAS_DB_CONFIG) return false;
-  try {
-    return await withDb(async (conn) => writeAdminAudit(conn, entry));
-  } catch (err) {
-    appLog('warn', 'admin_audit_write_failed', { message: err.message, action: entry.action });
-    return false;
-  }
+  // Delegate. Returns true on 'ok', false otherwise. For richer status
+  // (skipped_no_table, failed, etc.) call audit.getMetrics() or wait
+  // on the returned string directly via audit.tryWriteAdminAudit.
+  const r = await audit.tryWriteAdminAudit(entry);
+  return r === 'ok';
 }
 
 function createPersistedExamSessionFromSet(code, questionSet) {
@@ -700,20 +678,10 @@ function createPersistedExamSessionFromSet(code, questionSet) {
 }
 
 function checkRateLimit(bucket, key, max, windowMs) {
-  const now = Date.now();
-  const bucketKey = `${bucket}:${key}`;
-  let entry = _rateLimitBuckets.get(bucketKey);
-  if (!entry || entry.resetAt < now) {
-    entry = { count: 0, resetAt: now + windowMs };
-    _rateLimitBuckets.set(bucketKey, entry);
-  }
-  entry.count += 1;
-  if (_rateLimitBuckets.size > 5000) {
-    for (const [storedKey, value] of _rateLimitBuckets.entries()) {
-      if (value.resetAt < now) _rateLimitBuckets.delete(storedKey);
-    }
-  }
-  return entry.count <= max;
+  // Delegate to lib/rate-limit.js. Same shape: returns true if under
+  // the limit, false if exceeded. The lib tracks the same sliding window
+  // and sweeps when the bucket Map grows past MAX_BUCKETS.
+  return rateLimit.checkRateLimit(bucket, key, max, windowMs);
 }
 
 function requireExamSession(req, res, next) {
@@ -1221,36 +1189,11 @@ async function deleteSession(conn, code) {
   await execQuery(conn, 'DELETE FROM EXAM_SESSIONS WHERE ACCESS_CODE = ?', [code]);
 }
 
+// Stale-session sweeper logic lives in lib/sweeper.js for testability.
+// We just delegate with the right threshold and our local deleteSession
+// (which goes through the same execQuery wrapper as everywhere else).
 async function clearStaleSessionsWithConn(conn) {
-  const staleRows = await execQuery(
-    conn,
-    `SELECT ACCESS_CODE
-       FROM EXAM_SESSIONS
-      WHERE UPDATED_AT < ADD_SECONDS(CURRENT_UTCTIMESTAMP, ?)
-      ORDER BY UPDATED_AT ASC`,
-    [-1 * STALE_SESSION_MINUTES * 60]
-  );
-
-  const cleared = [];
-  for (const row of staleRows) {
-    const code = String(row.ACCESS_CODE || '').trim().toUpperCase();
-    if (!code) continue;
-    await deleteSession(conn, code);
-    await execQuery(
-      conn,
-      `UPDATE ACCESS_CODES
-          SET STATUS = 'unused',
-              UPDATED_AT = CURRENT_UTCTIMESTAMP
-        WHERE ACCESS_CODE = ?
-          AND STATUS = 'active'
-          AND NOT EXISTS (
-            SELECT 1 FROM EXAM_RESULTS r WHERE r.ACCESS_CODE = ACCESS_CODES.ACCESS_CODE
-          )`,
-      [code]
-    );
-    cleared.push(code);
-  }
-  return cleared;
+  return sweeper.clearStaleSessionsWithConn(conn, STALE_SESSION_MINUTES, deleteSession);
 }
 
 // Snapshot of the stale-session sweeper state for the admin /sweeper-status
@@ -1448,7 +1391,7 @@ async function syncAccessCodeSummaryFromResult(conn, code, result) {
   await execQuery(
     conn,
     `UPDATE ACCESS_CODES
-        SET STATUS = 'completed',
+        SET STATUS = '${CODE_STATUS.COMPLETED}',
             SCORE = ?,
             PCT = ?,
             PASS = ?,
@@ -1903,7 +1846,7 @@ app.get('/api/admin/results/:code/signed-summary', requireAdmin, requirePermissi
         durationSecs: result.durationSecs ?? null,
         incidentCount: result.incidentCount ?? (Array.isArray(result.incidents) ? result.incidents.length : 0)
       };
-      return buildSignedEnvelope(payload);
+      return buildSignedEnvelopeLocal(payload);
     });
     res.json({ ok: true, ...envelope });
   } catch (err) {
@@ -2037,12 +1980,21 @@ function buildOAuthRedirectUri(req) {
 app.post('/api/admin/login', (req, res) => {
   if (!ADMIN_HASH && !MANAGER_HASH) return res.status(503).json({ ok: false, error: 'admin_not_configured' });
   const ip = getClientIp(req);
+  // IP-based limit: same IP can attempt at most N times per window.
   if (!checkRateLimit('admin_login', String(ip), ADMIN_LOGIN_MAX, ADMIN_LOGIN_WINDOW)) {
     appLog('warn', 'admin_login_rate_limited', { requestId: req.requestId, clientIp: ip });
     return res.status(429).json({ ok: false, error: 'too_many_attempts' });
   }
 
   const hash = String(req.body?.hash || '').trim().toLowerCase();
+  // Hash-based limit: same SHA-256 (i.e. same candidate password) can be
+  // tried at most M times per window ACROSS all IPs. Stops a password spray
+  // where the attacker rotates IPs to dodge the per-IP limit. Bucket key
+  // is the hash itself; never logged.
+  if (hash && !checkRateLimit('admin_login_hash', hash, ADMIN_LOGIN_HASH_MAX, ADMIN_LOGIN_HASH_WINDOW)) {
+    appLog('warn', 'admin_login_hash_rate_limited', { requestId: req.requestId, clientIp: ip });
+    return res.status(429).json({ ok: false, error: 'too_many_attempts' });
+  }
   const role = hash && hash === ADMIN_HASH
     ? 'admin'
     : (MANAGER_HASH && hash === MANAGER_HASH
@@ -2052,11 +2004,12 @@ app.post('/api/admin/login', (req, res) => {
         : (CONTENT_EDITOR_HASH && hash === CONTENT_EDITOR_HASH ? 'content_editor' : null)));
   if (!role) {
     _metrics.loginFailures += 1;
-    const bucketState = _rateLimitBuckets.get(`admin_login:${String(ip)}`);
-    const attempts = Number(bucketState?.count || 0);
+    const ipState = rateLimit.peekRateLimit('admin_login', String(ip));
+    const hashState = rateLimit.peekRateLimit('admin_login_hash', hash || 'no_hash');
+    const attempts = Math.max(Number(ipState.count || 0), Number(hashState.count || 0));
     void tryWriteAdminAudit({
-      action: 'admin_login_failed',
-      actor: 'admin',
+      action: AUDIT_ACTION.LOGIN_FAILED,
+      actor: ROLES.ADMIN,
       clientIp: ip,
       details: { reason: 'invalid_credentials', attempts }
     });
@@ -2067,7 +2020,7 @@ app.post('/api/admin/login', (req, res) => {
   }
 
   void tryWriteAdminAudit({
-    action: 'admin_login_success',
+    action: AUDIT_ACTION.LOGIN_SUCCESS,
     actor: role,
     clientIp: ip,
     details: { ok: true, role }
@@ -2077,8 +2030,8 @@ app.post('/api/admin/login', (req, res) => {
 
 app.post('/api/admin/logout', requireAdmin, async (req, res) => {
   void tryWriteAdminAudit({
-    action: 'admin_logout',
-    actor: req.adminRole || 'admin',
+    action: AUDIT_ACTION.LOGOUT,
+    actor: req.adminRole || ROLES.ADMIN,
     clientIp: getClientIp(req),
     details: { ok: true, authMethod: req.authMethod || 'token' }
   });
@@ -2090,7 +2043,7 @@ app.post('/api/admin/logout', requireAdmin, async (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/admin/sessions/revoke-all', requireAdmin, requireAdminRole('admin'), async (req, res) => {
+app.post('/api/admin/sessions/revoke-all', requireAdmin, requireAdminRole(ROLES.ADMIN), async (req, res) => {
   try {
     const revokedAt = Date.now();
     await withDb(async (conn) => {
@@ -2098,8 +2051,8 @@ app.post('/api/admin/sessions/revoke-all', requireAdmin, requireAdminRole('admin
       _runtimeState.adminTokenNotBefore = revokedAt;
       _runtimeState.adminTokenNotBeforeFetchedAt = Date.now();
       await writeAdminAudit(conn, {
-        action: 'admin_sessions_revoked',
-        actor: 'admin',
+        action: AUDIT_ACTION.SESSIONS_REVOKED,
+        actor: ROLES.ADMIN,
         clientIp: getClientIp(req),
         details: { revokedAt }
       });
@@ -2167,7 +2120,7 @@ app.get('/api/admin/codes', requireAdmin, requirePermission('codes:read'), async
       codes,
       questionSets: payload.questionSets,
       examActive: payload.examEnabled,
-      role: _req.adminRole || 'admin'
+      role: _req.adminRole || ROLES.ADMIN
     });
   } catch (err) {
     appLog('error', 'admin_codes_failed', { message: err.message });
@@ -2297,7 +2250,7 @@ app.get('/api/admin/audit', requireAdmin, requirePermission('audit:read'), async
         id: row.AUDIT_ID,
         action: row.ACTION,
         targetCode: row.TARGET_CODE || '',
-        actor: row.ACTOR || 'admin',
+        actor: row.ACTOR || ROLES.ADMIN,
         clientIp: row.CLIENT_IP || '',
         createdAt: row.CREATED_AT ? new Date(row.CREATED_AT).toISOString() : null,
         details: parseJsonOrNull(row.DETAILS_JSON) || null
@@ -2328,7 +2281,7 @@ app.get('/api/admin/audit/export.json', requireAdmin, requirePermission('audit:e
   const limit = Math.min(Math.max(Number(req.query?.limit) || 500, 1), 5000);
   try {
     const envelope = await withDb(async (conn) => {
-      if (!(await hasAuditLogTable(conn))) return buildSignedEnvelope({ entries: [], generatedAt: new Date().toISOString(), limit });
+      if (!(await hasAuditLogTable(conn))) return buildSignedEnvelopeLocal({ entries: [], generatedAt: new Date().toISOString(), limit });
       const rows = await execQuery(
         conn,
         `SELECT AUDIT_ID, ACTION, TARGET_CODE, DETAILS_JSON, ACTOR, CLIENT_IP, CREATED_AT
@@ -2349,7 +2302,7 @@ app.get('/api/admin/audit/export.json', requireAdmin, requirePermission('audit:e
           details: parseJsonOrNull(row.DETAILS_JSON) || null
         }))
       };
-      return buildSignedEnvelope(payload);
+      return buildSignedEnvelopeLocal(payload);
     });
     res.json({ ok: true, ...envelope });
   } catch (err) {
@@ -2358,14 +2311,14 @@ app.get('/api/admin/audit/export.json', requireAdmin, requirePermission('audit:e
   }
 });
 
-app.post('/api/admin/exam-availability', requireAdmin, requireAdminRole('admin'), async (req, res) => {
+app.post('/api/admin/exam-availability', requireAdmin, requireAdminRole(ROLES.ADMIN), async (req, res) => {
   const enabled = req.body?.enabled !== false;
   try {
     await withDb(async (conn) => {
       await setAppSetting(conn, APP_SETTING_EXAMS_ENABLED, enabled ? 'true' : 'false');
       await writeAdminAudit(conn, {
         action: 'admin_exam_availability_updated',
-        actor: 'admin',
+        actor: ROLES.ADMIN,
         clientIp: getClientIp(req),
         details: { enabled }
       });
@@ -2645,14 +2598,14 @@ app.get('/api/admin/analytics/overview', requireAdmin, requirePermission('analyt
   }
 });
 
-app.post('/api/admin/clear-stale-sessions', requireAdmin, requireAdminRole('admin'), async (req, res) => {
+app.post('/api/admin/clear-stale-sessions', requireAdmin, requireAdminRole(ROLES.ADMIN), async (req, res) => {
   try {
     const payload = await withDb(async (conn) => {
       const cleared = await clearStaleSessionsWithConn(conn);
 
       await writeAdminAudit(conn, {
         action: 'admin_stale_sessions_cleared',
-        actor: 'admin',
+        actor: ROLES.ADMIN,
         clientIp: getClientIp(req),
         details: { count: cleared.length, codes: cleared.slice(0, 20) }
       });
@@ -2687,7 +2640,7 @@ app.post('/api/admin/note', requireAdmin, requirePermission('codes:note'), async
       await writeAdminAudit(conn, {
         action: 'admin_note_saved',
         targetCode: code,
-        actor: req.adminRole || 'admin',
+        actor: req.adminRole || ROLES.ADMIN,
         clientIp: getClientIp(req),
         details: { noteLength: notes.length }
       });
@@ -2699,7 +2652,7 @@ app.post('/api/admin/note', requireAdmin, requirePermission('codes:note'), async
   }
 });
 
-app.post('/api/admin/reset', requireAdmin, requireAdminRole('admin'), async (req, res) => {
+app.post('/api/admin/reset', requireAdmin, requireAdminRole(ROLES.ADMIN), async (req, res) => {
   const code = String(req.body?.code || '').trim().toUpperCase();
   if (!/^[A-Z2-9]{6}$/.test(code)) return res.status(400).json({ error: 'invalid_code' });
 
@@ -2711,7 +2664,7 @@ app.post('/api/admin/reset', requireAdmin, requireAdminRole('admin'), async (req
       await writeAdminAudit(conn, {
         action: 'admin_code_reset',
         targetCode: code,
-        actor: 'admin',
+        actor: ROLES.ADMIN,
         clientIp: getClientIp(req),
         details: { status: 'unused' }
       });
@@ -2723,7 +2676,7 @@ app.post('/api/admin/reset', requireAdmin, requireAdminRole('admin'), async (req
   }
 });
 
-app.delete('/api/admin/codes/:code', requireAdmin, requireAdminRole('admin'), async (req, res) => {
+app.delete('/api/admin/codes/:code', requireAdmin, requireAdminRole(ROLES.ADMIN), async (req, res) => {
   const code = String(req.params.code || '').trim().toUpperCase();
   if (!/^[A-Z2-9]{6}$/.test(code)) return res.status(400).json({ error: 'invalid_code' });
 
@@ -2751,7 +2704,7 @@ app.delete('/api/admin/codes/:code', requireAdmin, requireAdminRole('admin'), as
       await writeAdminAudit(conn, {
         action: 'admin_code_deleted',
         targetCode: code,
-        actor: 'admin',
+        actor: ROLES.ADMIN,
         clientIp: getClientIp(req),
         details: { previousStatus: codeRow.status || 'unknown' }
       });
@@ -2763,7 +2716,7 @@ app.delete('/api/admin/codes/:code', requireAdmin, requireAdminRole('admin'), as
   }
 });
 
-app.post('/api/admin/codes/bulk-delete', requireAdmin, requireAdminRole('admin'), async (req, res) => {
+app.post('/api/admin/codes/bulk-delete', requireAdmin, requireAdminRole(ROLES.ADMIN), async (req, res) => {
   const codes = Array.isArray(req.body?.codes)
     ? [...new Set(req.body.codes.map((code) => String(code || '').trim().toUpperCase()).filter((code) => /^[A-Z2-9]{6}$/.test(code)))]
     : [];
@@ -2803,7 +2756,7 @@ app.post('/api/admin/codes/bulk-delete', requireAdmin, requireAdminRole('admin')
       }
       await writeAdminAudit(conn, {
         action: 'admin_codes_bulk_deleted',
-        actor: req.adminRole || 'admin',
+        actor: req.adminRole || ROLES.ADMIN,
         clientIp: getClientIp(req),
         details: { count: deleted.length, summary, codes: deleted.slice(0, 50), notFound: notFound.slice(0, 50) }
       });
@@ -2852,7 +2805,7 @@ app.post('/api/admin/generate', requireAdmin, requirePermission('codes:generate'
       }
       await writeAdminAudit(conn, {
         action: 'admin_codes_generated',
-        actor: req.adminRole || 'admin',
+        actor: req.adminRole || ROLES.ADMIN,
         clientIp: getClientIp(req),
         details: { count: created.length, firstCode: created[0] || null, lastCode: created[created.length - 1] || null }
       });
@@ -2866,7 +2819,7 @@ app.post('/api/admin/generate', requireAdmin, requirePermission('codes:generate'
   }
 });
 
-app.post('/api/admin/results/repair-summaries', requireAdmin, requireAdminRole('admin'), async (req, res) => {
+app.post('/api/admin/results/repair-summaries', requireAdmin, requireAdminRole(ROLES.ADMIN), async (req, res) => {
   try {
     const payload = await withDb(async (conn) => {
       const rows = await execQuery(conn, 'SELECT ACCESS_CODE, RESULT_JSON FROM EXAM_RESULTS');
@@ -2887,7 +2840,7 @@ app.post('/api/admin/results/repair-summaries', requireAdmin, requireAdminRole('
       }
       await writeAdminAudit(conn, {
         action: 'admin_result_summaries_repaired',
-        actor: 'admin',
+        actor: ROLES.ADMIN,
         clientIp: getClientIp(req),
         details: { repaired, skipped }
       });
@@ -2900,14 +2853,14 @@ app.post('/api/admin/results/repair-summaries', requireAdmin, requireAdminRole('
   }
 });
 
-app.post('/api/admin/results/clear-summaries', requireAdmin, requireAdminRole('admin'), async (req, res) => {
+app.post('/api/admin/results/clear-summaries', requireAdmin, requireAdminRole(ROLES.ADMIN), async (req, res) => {
   try {
     await withDb(async (conn) => {
       await execQuery(conn, 'UPDATE ACCESS_CODES SET SCORE = NULL, PCT = NULL, PASS = NULL, UPDATED_AT = CURRENT_UTCTIMESTAMP');
       await execQuery(conn, 'UPDATE EXAM_RESULTS SET SCORE = NULL, PCT = NULL, PASS = NULL');
       await writeAdminAudit(conn, {
         action: 'admin_result_summaries_cleared',
-        actor: 'admin',
+        actor: ROLES.ADMIN,
         clientIp: getClientIp(req),
         details: { scope: 'all' }
       });
@@ -2945,7 +2898,7 @@ app.post('/api/admin/codes/:code/question-set', requireAdmin, requirePermission(
       await writeAdminAudit(conn, {
         action: 'admin_code_question_set_assigned',
         targetCode: code,
-        actor: 'admin',
+        actor: ROLES.ADMIN,
         clientIp: getClientIp(req),
         details: { questionSetId }
       });
@@ -3054,7 +3007,7 @@ app.get('/api/admin/question-sets/:id/export.json', requireAdmin, requirePermiss
   try {
     const envelope = await withDb(async (conn) => {
       const questionSet = await loadQuestionSet(conn, id, { allowEmpty: true });
-      return buildSignedEnvelope({
+      return buildSignedEnvelopeLocal({
         exportedAt: new Date().toISOString(),
         questionSet
       });
@@ -3348,7 +3301,7 @@ app.post('/api/admin/question-sets/:setId/questions', requireAdmin, requirePermi
       clearQuestionSetCache(setId);
       await writeAdminAudit(conn, {
         action: questionId != null ? 'admin_question_updated' : 'admin_question_created',
-        actor: 'admin',
+        actor: ROLES.ADMIN,
         clientIp: getClientIp(req),
         details: { questionSetId: setId, questionId, qNum }
       });
@@ -3370,7 +3323,7 @@ app.delete('/api/admin/question-sets/:setId/questions/:questionId', requireAdmin
       clearQuestionSetCache(setId);
       await writeAdminAudit(conn, {
         action: 'admin_question_deleted',
-        actor: 'admin',
+        actor: ROLES.ADMIN,
         clientIp: getClientIp(req),
         details: { questionSetId: setId, questionId }
       });
@@ -3448,7 +3401,7 @@ app.post('/api/admin/question-sets/:setId/sections', requireAdmin, requirePermis
       clearQuestionSetCache(setId);
       await writeAdminAudit(conn, {
         action: sectionId != null ? 'admin_section_updated' : 'admin_section_created',
-        actor: 'admin',
+        actor: ROLES.ADMIN,
         clientIp: getClientIp(req),
         details: { questionSetId: setId, sectionId, name }
       });
@@ -3471,7 +3424,7 @@ app.delete('/api/admin/question-sets/:setId/sections/:sectionId', requireAdmin, 
       clearQuestionSetCache(setId);
       await writeAdminAudit(conn, {
         action: 'admin_section_deleted',
-        actor: 'admin',
+        actor: ROLES.ADMIN,
         clientIp: getClientIp(req),
         details: { questionSetId: setId, sectionId }
       });
@@ -3824,7 +3777,7 @@ module.exports = {
   startupSummary,
   getSweeperStatus,
   signPayload,
-  buildSignedEnvelope,
+  buildSignedEnvelope: buildSignedEnvelopeLocal,
   getSigningSecret
 };
 

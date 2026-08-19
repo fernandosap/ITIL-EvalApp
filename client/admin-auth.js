@@ -24,8 +24,12 @@
     } catch (_e) {
       // If we can't reach the server, fall through to the password form.
     }
+    // XSUAA button shows a spinner on click because the redirect to the
+    // IdP is server-side (302) and can take a few seconds. Without the
+    // spinner the user thinks the click did nothing and clicks again,
+    // which sometimes starts a second OAuth flow that races the first.
     const xsuaaBtn = methods.xsuaa && methods.xsuaa.enabled
-      ? `<a class="btn btn-primary btn-full" href="${methods.xsuaa.authorizeUrl || '/oauth/login'}">Sign in with SAP</a>
+      ? `<a class="btn btn-primary btn-full" id="xsuaa-login" href="${methods.xsuaa.authorizeUrl || '/oauth/login'}" data-action="startXsuaaLogin" data-args="__el__">Sign in with SAP</a>
          <div style="text-align:center;color:#888;font-size:12px;margin:14px 0">or</div>`
       : '';
     const pwdBlock = methods.password
@@ -65,6 +69,31 @@
     if (root.IE.admin && typeof root.IE.admin.showAdmin === 'function') {
       root.IE.admin.showAdmin();
     }
+  }
+
+  // Show a spinner inside the "Sign in with SAP" button while the
+  // 302 to the XSUAA /oauth/authorize endpoint is in flight. The
+  // browser will navigate away within ~1s on a healthy network, but
+  // on a slow link or a transient 5xx the user could otherwise click
+  // the button again, starting a second OAuth flow. After ~6s we
+  // re-enable the button so a hard failure (IdP down) doesn't leave
+  // the user stuck.
+  function startXsuaaLogin(anchor) {
+    if (!anchor) return;
+    if (anchor.dataset.loading === '1') return;  // already in flight
+    anchor.dataset.loading = '1';
+    const original = anchor.innerHTML;
+    anchor.innerHTML = '<span class="spinner" aria-hidden="true"></span> Redirecting to SAP...';
+    anchor.style.pointerEvents = 'none';
+    setTimeout(() => {
+      // If we're still here after 6s, the navigation didn't happen.
+      // Restore the button so the user can try again.
+      if (anchor.dataset.loading === '1') {
+        anchor.innerHTML = original;
+        anchor.style.pointerEvents = '';
+        delete anchor.dataset.loading;
+      }
+    }, 6000);
   }
 
   // Bootstrap an admin session from the XSUAA cookie, if one is set.
@@ -126,6 +155,7 @@
   root.IE.adminAuth = {
     showAdminLogin: showAdminLogin,
     doLogin: doLogin,
+    startXsuaaLogin: startXsuaaLogin,
     tryBootstrapFromCookie: tryBootstrapFromCookie,
     logoutAdmin: logoutAdmin,
     revokeAdminSessions: revokeAdminSessions

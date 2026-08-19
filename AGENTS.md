@@ -28,26 +28,30 @@ codes, and review results.
 
 ## File map
 
-### Server + shared (Node)
+### Server + shared + lib (Node)
 
 | File | Lines | Role |
 |---|---:|---|
-| `server.js` | ~3,800 | API + admin + HANA queries + token signing + metrics |
-| `shared/constants.js` | 80 | UMD — `normalizeExamTitle` + `ROLE_PERMISSIONS` + `hasPermission` |
+| `server.js` | ~3,720 | API + admin + HANA queries + token signing + metrics |
+| `lib/audit.js` | ~150 | `tryWriteAdminAudit()` + `getMetrics()` for compliance visibility (counts attempts, writes, failures, last failure message) |
+| `lib/middleware.js` | ~95 | `createAuthMiddleware({...})` factory → `requireAdmin` / `requireAdminRole` / `requirePermission` |
+| `lib/rate-limit.js` | ~55 | In-memory sliding-window `checkRateLimit(bucket, key, max, windowMs)` + `peekRateLimit` (no-op increment) |
+| `lib/responses.js` | ~95 | `jsonError` / `jsonOk` / `toCsvCell` / `toCsvRow` / `parseJsonOrNull` / `parseAnthropicText` / `buildSignedEnvelope` / `verifySignedEnvelope` (HMAC-SHA256) |
+| `shared/constants.js` | ~135 | UMD — `normalizeExamTitle` + `ROLE_PERMISSIONS` + `hasPermission` + `ROLES` + `CODE_STATUS` + `QUESTION_SET_LIFECYCLE` + `EXAM_MODE` + `AUDIT_ACTION` |
 | `shared/scoring.js` | 120 | `makePRNG`, `seededShuffle`, `buildOrdering`, `pickQuestionsForSession`, `gradeExamFromSession` |
 | `shared/xsuaa.js` | ~270 | XSUAA helpers: VCAP parsing, JWT verify (RS256, no `@sap/xssec`), scope→role, `buildAuthorizeUrl`, `exchangeCodeForToken`, `parseCookieHeader` |
 | `shared/db-pool.js` | ~120 | Opt-in HANA connection pool via `HANA_POOL_SIZE` |
-| `index.html` | ~400 | Shell, all CSS inline. Loads `client/*.js` in strict order. |
+| `index.html` | ~410 | Shell, all CSS inline. Loads `client/*.js` in strict order. |
 | `migrations/*.sql` | 369 total | 7 idempotent migrations, all currently applied in prod |
 | `scripts/check-env.mjs` | 65 | Validates required env vars before deploy |
 | `scripts/smoke-test.mjs` | 299 | Boots server, hits HANA real, exercises admin login + code generation |
 | `scripts/inspect-hana.mjs` | ~175 | Read-only schema/data dump (overridable via `HANA_PASSWORD=`) |
-| `tests/*.test.js` | ~1,600 | 117 unit tests, runs in ~500ms |
+| `tests/*.test.js` | ~3,200 | 211 unit tests, runs in ~700ms |
 | `deploy_btp.sh` | 278 | `cf push` with env-file + SSO support (currently bypassed — see Deployment status) |
 | `manifest.yml` | 577 | CF app manifest with `((...))` placeholders for env vars |
 | `favicon.svg` | 26 | Brand mark (blue/teal gradient) |
 | `.cfignore` | 41 | Excludes `.git/`, `.gitignore`, `.DS_Store`, `node_modules/` |
-| `.githooks/pre-commit` | ~90 | Replaces CI: `npm test` + secret scan + `node --check` on every JS file |
+| `.githooks/pre-commit` | ~110 | Replaces CI: `npm test` + secret scan + `node --check` on every JS file |
 
 ### Client SPA (browser)
 
@@ -65,7 +69,7 @@ etc. (declared in `client/state.js`).
 | `client/admin-auth.js` | 6K | Login/logout: `showAdminLogin`, `doLogin`, `tryBootstrapFromCookie`, `logoutAdmin`, `revokeAdminSessions` |
 | `client/admin-codes.js` | 44K | Admin dashboard: `showAdmin` (the big one — loads 5 endpoints, renders the full console) + per-row actions (`deleteCode`, `bulkDeleteCodes`, `saveNote`, `resetCode`, `generateCodes`, etc.) + exports (`downloadExport`, `downloadAuditExport`, `downloadSignedResultSummary`) |
 | `client/admin-question-sets.js` | 53K | Exam set management: `createQuestionSet`, `configQuestionSet`, `activateQuestionSet`, `publishQuestionSet`, `archiveQuestionSet`, `deleteQuestionSet`, `exportQuestionSet`, `cloneQuestionSet`, `rollbackImportedSet` + CSV upload (`parseQuestionCsv`, `analyzeQuestionUpload`, `previewUploadedQuestionSet`, `submitUploadedQuestionSet`) + question/section editor (`openQuestionSet`, `showQuestionEditor`, `editSectionPrompt`, etc.) + per-set analytics (`showQuestionSetAnalytics`) |
-| `client/dispatcher.js` | 6K | Event delegation: one click listener + one change listener on `document` route `data-action` → `window.IE.*.<fn>(data-args...)`. Type-coerces args; resolves `__value__` and `__checked__` sentinels from the element. |
+| `client/dispatcher.js` | 6K | Event delegation: one click listener + one change listener on `document` route `data-action` → `window.IE.*.<fn>(data-args...)`. Type-coerces args; resolves `__value__`, `__checked__`, and `__el__` sentinels from the element. |
 | `client/main.js` | 3K | Entry point: registers `beforeunload` / `online` / `offline` listeners and runs the `DOMContentLoaded` bootstrap (handles `?admin=1` + XSUAA `?auth=ok` cookie bootstrap). |
 
 **Load order** (in `index.html`, strict):
@@ -105,6 +109,7 @@ Buttons, selects, checkboxes, and file inputs use `data-action` +
 Two sentinels read from the element itself at dispatch time:
 - `__value__` → `el.value`
 - `__checked__` → `el.checked`
+- `__el__` → the element itself (e.g. to update its innerHTML while a 302 is in flight, as `startXsuaaLogin` does for the "Sign in with SAP" button)
 
 Click and change listeners are installed once on `document` (capture
 phase) in `client/dispatcher.js`. The dispatcher walks `window.IE.*`
@@ -154,7 +159,7 @@ Unique index: `UX_QITEMS_SET_QINDEX` on `QUESTION_SET_QUESTIONS(QUESTION_SET_ID,
 | `ADMIN_AUDIT_LOG` | 1,295 | Last entry: **2026-07-23** (silent in August — see findings) |
 | `APP_SETTINGS` | 2 | `EXAMS_ENABLED` (set Mar 31), `ADMIN_TOKEN_NOT_BEFORE` (set May 25) |
 
-## API surface (57 routes)
+## API surface (60+ routes; 4-role auth + XSUAA OAuth)
 
 ### Candidate (no auth)
 - `POST /api/validate` — validate 6-char access code
@@ -271,6 +276,10 @@ Reads HANA vars from `.env` or `--env-file`. Sets `APP_REVISION` from `git rev-p
 11. **`STARTUP_STRICT=true`** means missing config throws on boot. Good for prod, annoying for local. Use it deliberately.
 12. **Question set activation** demotes other sets in the same `VERSION_GROUP_ID` to `ARCHIVED`. Currently the 3 inactive sets are all in `PUBLISHED` — drift to fix.
 13. **`getQuestionSetRows` is the single source of truth** for listing sets. Always go through it, never query `QUESTION_SETS` directly in new code.
+14. **Admin login is rate-limited TWICE** — once by IP (`admin_login:<ip>`, 8/15min) and once by SHA-256 of the password itself (`admin_login_hash:<hash>`, 20/15min). The hash bucket exists to stop a password-spray where the attacker rotates IPs to dodge the per-IP limit. **Never log the hash** (it's the password, just hashed). The 429 response is identical for both — no oracle to tell the attacker which limit they hit.
+15. **`/api/admin/me` is the canonical role probe** for the client. It works for any role (admin, manager, reviewer, content_editor) because it doesn't require a specific permission, only valid auth. Don't fall back to reading `data.role` from `/api/admin/codes` for the cookie-based XSUAA flow — codes requires `codes:read` which reviewers don't have.
+16. **`lib/audit.js` is a self-contained module** that owns the audit log + its metrics. Server.js just calls `tryWriteAdminAudit()` and exposes `audit.getMetrics()` in `/api/admin/metrics`. The metrics track `attempts / writes / skippedNoTable / skippedNoDb / failures / lastFailureAt / lastFailureMessage / auditTablePresent` so a quietly broken audit log (table dropped, HANA outage) is visible in metrics instead of being silently swallowed.
+17. **String literals for roles / code statuses / lifecycle / exam modes / audit actions** are in `shared/constants.js` (`ROLES`, `CODE_STATUS`, `QUESTION_SET_LIFECYCLE`, `EXAM_MODE`, `AUDIT_ACTION`). Use the constants, not raw strings — `grep " 'admin'"` should ideally be empty in the codebase.
 
 ## HANA findings (Fase 0, 2026-08-18)
 
@@ -442,6 +451,74 @@ xsuaa binding, the server uses Bearer auth; otherwise it falls back to
 the SHA-256 hash. This means local dev (no XSUAA bound) keeps working
 without any extra config.
 
+## CSRF analysis
+
+**Threat model**: an attacker hosts a page on `evil.com`. The victim's
+browser holds a session cookie or storage state for our app. The
+attacker tricks the victim's browser into issuing a state-changing
+request (POST/DELETE/PUT) to our origin, with the victim's auth attached.
+
+**Why this app is mostly not vulnerable**:
+
+1. **No cookie-based auth on the candidate or admin side.** Both auth
+   mechanisms (SHA-256 token, XSUAA JWT) are sent in **headers** that
+   the attacker cannot set from a cross-origin page:
+   - `X-Admin-Token: <base64url>` — set as a custom header, not
+     auto-attached by the browser.
+   - `Authorization: Bearer <jwt>` — same.
+   - `X-Exam-Token: <base64url>` — same.
+   Browsers DO NOT send custom headers cross-origin without an explicit
+   CORS preflight, and a `evil.com` script cannot trigger that preflight
+   (no `Content-Type: application/json` would force it; even if it did,
+   the server's CORS policy would reject it).
+
+2. **`xsuaa_jwt` cookie** is the one token that IS auto-attached. It
+   is set with `SameSite=Lax; HttpOnly; Secure`. Lax means it is
+   **not** sent on cross-site sub-requests (XHR / fetch / form POSTs
+   from another origin), only on top-level navigations (the user
+   typing the URL, following a link, or hitting back). A `evil.com`
+   `<form action="https://academycd-evalapp.../api/admin/codes" method="POST">`
+   would NOT include the `xsuaa_jwt` cookie because Lax blocks cookies
+   on cross-site POSTs. So even the cookie-based path is safe.
+
+3. **No GET-as-state-change endpoints.** Every state-changing endpoint
+   requires POST / DELETE / PUT. Express routes are explicit per
+   method. (See API surface section — there are no GETs that mutate.)
+
+4. **CORS is not configured for cross-origin admin access.** A
+   `evil.com` script doing `fetch('https://academycd-evalapp.../api/admin/...')`
+   would have to handle CORS preflight (`OPTIONS`), and the server
+   doesn't reply with permissive `Access-Control-Allow-Origin` for any
+   non-self origin. So even with the cookie, the attacker cannot read
+   the response.
+
+5. **Rate limits + audit** mean a successful CSRF would be visible in
+   `ADMIN_AUDIT_LOG` within seconds. The IP-keyed login rate limit
+   stops brute-force auth attempts; the new hash-keyed limit stops
+   password-spray across IPs.
+
+**What an attacker CAN do**:
+
+- Force a top-level navigation (the Lax exception). E.g.
+  `<a href="https://academycd-evalapp.../api/admin/codes/ABC123/reset">`
+  via a phishing link. The server will not reset anything because
+  `POST /api/admin/codes/:code/reset` requires a POST — a GET
+  navigation just hits the SPA shell.
+- Read the SPA shell HTML (no auth) and link the user to the public
+  landing. Already public, no information disclosure.
+- Phish the admin's password via a fake login page that submits to
+  `evil.com`. This is the standard phishing threat, not a CSRF
+  bypass. Mitigations: bind XSUAA so admins never see a password
+  prompt; ensure the password page is served over HTTPS with HSTS
+  (CF router sets HSTS by default).
+
+**Conclusion**: the CSRF attack surface is minimal. No mitigation
+needed beyond the existing SameSite=Lax + header-based tokens + CORS
+defaults. **Do not** add CSRF tokens unless the auth model changes
+(e.g. switching to cookie-based sessions with `SameSite=None` for
+cross-origin SSO, or adding a webhook-style endpoint callable from
+another origin).
+
 ## Open items / TODO
 
 - [x] Investigate stale-session sweeper health → **NOT a code bug, deployment drift.** BTP runs `a0dae34` (2026-03-31) but the sweeper was added in `e843506` (2026-06-06). Fix = deploy HEAD once `HANA_PASSWORD` is rotated in BTP. Also hardened: per-tick log, `GET /api/admin/sweeper-status` endpoint, `isStuck` flag for silent crashes.
@@ -453,6 +530,18 @@ without any extra config.
 - [ ] Update BTP env var `HANA_PASSWORD` to match the new prod password (out of scope for this repo)
 - [ ] Move BTP creds out of `cf set-env` into a credential store (out of scope for this repo)
 - [x] Convert `onclick="X()"` handlers to `data-action="X"` event delegation → done in commit `021c3c4`. `client/dispatcher.js` is the single listener. `client/main.js` no longer carries the `window.X = X` re-export list.
+- [x] `lib/` extraction: `audit.js` (compliance metrics), `middleware.js` (auth middlewares via factory), `responses.js` (jsonError/jsonOk/csvCell/signed-envelope), `rate-limit.js` (sliding window). `server.js` shrunk from ~3830 → ~3720 LOC.
+- [x] `tryWriteAdminAudit` visibility: failure counters (attempts, writes, skippedNoTable, skippedNoDb, failures, lastFailureAt, lastFailureMessage, auditTablePresent) exposed via `audit.getMetrics()` → `/api/admin/metrics.audit`.
+- [x] Admin-login rate limit by SHA-256 hash (in addition to IP) → stops password-spray across IPs. 20 attempts per 15min per hash. Hash never logged.
+- [x] String literal centralization: `ROLES`, `CODE_STATUS`, `QUESTION_SET_LIFECYCLE`, `EXAM_MODE`, `AUDIT_ACTION` in `shared/constants.js`. 16 unit tests cover the catalog.
+- [x] `/api/admin/me` as canonical for client role lookup → cookie-based XSUAA flow + reviewers (no `codes:read`) both work.
+- [x] "Sign in with SAP" loading state (spinner during 302 to IdP) → prevents double-click that races the OAuth flow.
+- [x] Inactivity banner on candidate landing → shows exam duration + pass mark + "Session secure" indicator.
+- [x] CSRF analysis writeup → minimal attack surface (header-based tokens, SameSite=Lax, no CORS, no GET-as-state-change).
+- [x] `__el__` sentinel in event delegation → allows the XSUAA login button to pass its own element to `startXsuaaLogin(el)` for in-place spinner swap.
+- [ ] Sweeper end-to-end test (real HANA stale session cleared by sweeper) — deferred to next session, requires CI infra.
+- [ ] JSDOM-light tests for client renderers (`renderQ`, `showAdmin`, `showResultsFromRecord`) — deferred, no test deps added.
+- [ ] Route split (deferred — multi-day effort, deserves its own session).
 
 ## Inspecting HANA (read-only)
 

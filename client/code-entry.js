@@ -12,6 +12,31 @@
   const { $, render, modal, brandLockup, apiJson } = root.IE.util;
   const S = root.S;
 
+  // Build the "session secure" banner shown on the candidate landing.
+  // Surfaces the exam duration / pass mark so the candidate knows what
+  // they're walking into, and a last-refreshed marker so they know the
+  // server is still talking to them. Refreshed every time showCodeEntry
+  // runs (i.e. on every /api/status call).
+  function buildSessionBanner(status) {
+    if (!status) return '';
+    const duration = Number(status.durationSecs || 0);
+    const total = Number(status.total || 0);
+    const passPct = Number(status.passPct || 0);
+    const passScore = Number(status.passScore || 0);
+    const mins = Math.round(duration / 60);
+    const items = [];
+    if (total) items.push(`<strong>${total}</strong> questions`);
+    if (mins) items.push(`<strong>${mins}</strong> min`);
+    if (passScore) items.push(`<strong>${passScore}/${total || '?'}</strong> to pass (${passPct}%)`);
+    if (!items.length) return '';
+    return `<div class="session-banner" role="status" aria-live="polite">
+      <span class="session-banner__dot" aria-hidden="true"></span>
+      <span class="session-banner__label">Session secure</span>
+      <span class="session-banner__sep" aria-hidden="true">·</span>
+      <span class="session-banner__detail">${items.join(' · ')}</span>
+    </div>`;
+  }
+
   async function showCodeEntry() {
     S.screen = 'code';
     S.examToken = null;
@@ -20,6 +45,7 @@
     const statusLoaded = Boolean(status && !status.error);
     const examName = root.IE.util.normalizeExamTitle(status?.examName || 'Academy Exam App');
     const examActive = statusLoaded && status?.examActive !== false;
+    const sessionBanner = statusLoaded ? buildSessionBanner(status) : '';
 
     const logoBlock = brandLockup(
       examName,
@@ -58,6 +84,7 @@
 
     render(`<div class="screen" style="max-width:480px">
       ${logoBlock}
+      ${sessionBanner}
       ${root.IE.state.connectivityBanner()}
       <div class="glass-card">
         <h2>Enter Your Access Code</h2>
@@ -363,6 +390,8 @@
     showTechCheck: showTechCheck,
     reqWebcam: reqWebcam,
     reqScreen: reqScreen,
-    startExam: startExam
+    startExam: startExam,
+    // Exposed for unit tests; not part of the SPA's public API.
+    __test__: { buildSessionBanner: buildSessionBanner }
   };
 })(typeof window !== 'undefined' ? window : globalThis);

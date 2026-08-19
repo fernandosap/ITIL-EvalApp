@@ -61,13 +61,14 @@
     return csv.split(',').map((s) => coerce(s.trim()));
   }
 
-  // Sentinel resolver: replace __value__ and __checked__ sentinels
-  // with the live element's value/checked. Other entries pass
-  // through unchanged.
+  // Sentinel resolver: replace __value__, __checked__, and __el__
+  // sentinels with the live element's value/checked/element. Other
+  // entries pass through unchanged.
   function resolveSentinels(args, el) {
     return args.map((a) => {
       if (a === '__value__') return el.value;
       if (a === '__checked__') return el.checked;
+      if (a === '__el__') return el;
       return a;
     });
   }
