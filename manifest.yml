@@ -4,7 +4,7 @@ applications:
     memory: 256M
     instances: 1
     buildpacks:
-      - nodejs_buildpack
+      - https://github.com/cloudfoundry/nodejs-buildpack#v1.9.1
     path: .
     routes:
       - route: ((route_host)).((default_domain))

@@ -250,28 +250,69 @@ Operations executed in prod HANA (`be84eee8-9540-4517-be90-a3267f32084a.hna1.pro
 
 ## Deployment status (as of 2026-08-18)
 
-**BTP is running `a0dae34` (2026-03-31). HEAD is `e843506` (2026-06-06) plus 5 commits.**
+**BTP is now running `e1165e6` (HEAD, deployed today 2026-08-18 21:04 PDT).**
 
-This is a meaningful drift: 8 commits behind, +1,378 lines in `server.js`, 18 new admin
-routes, 2 new migrations, 8 new env vars, and the stale-session sweeper is
-NOT in the deployed version. Most of the headling admin/audit/question-set
-functionality documented in this file is therefore not live.
+The deployment drift documented earlier in this file has been resolved:
+all 8 commits between the previous deployed version (`a0dae34`) and HEAD
+are now live, including the stale-session sweeper, the admin console,
+question set versioning, audit log, and the proctoring endpoint.
 
-| Metric | Deployed (`a0dae34`) | HEAD | Notes |
-|---|---:|---:|---|
-| Commits | 1 | 8 | |
-| `server.js` lines | 2,142 | 3,520 | +64% |
-| API routes | 40 | 58 | All new routes are admin/audit/question-set |
-| Migrations | 5 | 7 | 2 new (both idempotent, both already applied) |
-| Env vars | ~7 | ~15 | 8 new, several required for admin features |
-| Stale-session sweeper | ❌ missing | ✅ present | root cause of 7WGME9 not auto-cleaned |
+| Metric | Was deployed (`a0dae34`) | Now live (HEAD) |
+|---|---:|---:|
+| Commits | 1 | 8 |
+| `server.js` lines | 2,142 | 3,520 |
+| API routes | 40 | 58 |
+| Stale-session sweeper | ❌ missing | ✅ running every 10 min |
 
-**Risk of deploying HEAD to BTP**: low (additive only, no breaking changes to
-candidate or admin APIs). **Blocker**: `HANA_PASSWORD` in BTP is the
-pre-rotation value; the deploy will start a live app that fails HANA
-auth on first request until the env var is updated. Update password first
-via `cf set-env itil4-evalapp HANA_PASSWORD <new> && cf restage itil4-evalapp`,
-then deploy HEAD. Out of scope for this project; operator decision.
+**BTP env vars confirmed after deploy:**
+- HANA: `ITIL_EXAM_ADMIN` / `SAPacademy_ITIL_EXAM_2026!` (separate from DBADMIN used for local dev)
+- `ADMIN_HASH`, `MANAGER_HASH` set
+- `REVIEWER_HASH`, `CONTENT_EDITOR_HASH` not set (login disabled for those roles)
+- `STARTUP_STRICT=true`, `AUTO_CLEAR_STALE_SESSIONS=true`, `STALE_SESSION_SWEEP_MINUTES=10` (new in this deploy)
+- Note: `APP_REVISION` and `APP_DEPLOYED_AT` still show the April values because they are only updated by `deploy_btp.sh`. The live code is the HEAD version.
+
+**Buildpack pin** (added in deploy commit, see git log):
+The manifest now pins the buildpack to `nodejs_buildpack#v1.9.1` (via the
+git URI form). BTP's default `nodejs_buildpack` resolves to 1.9.2 which
+fails in the python bootstrap step on `cflinuxfs4`. Pinning to 1.9.1
+matches the version that worked for the April 11 deploy. When SAP
+deprecates 1.9.1, this pin needs to be updated.
+
+### Deploy procedure used (documented for next time)
+
+```bash
+# 1. Get current BTP env vars (especially HANA_*)
+cf env itil4-evalapp
+
+# 2. Build a vars file from the current env (do NOT use the .env; it
+#    has the stale DBADMIN dev credentials).
+cat > /tmp/cf-vars.yml <<EOF
+route_host: academycd-evalapp
+default_domain: cfapps.us10.hana.ondemand.com
+hana_host: <from cf env>
+hana_port: "443"
+hana_user: ITIL_EXAM_ADMIN
+hana_password: <from cf env>
+hana_schema: ITIL_EXAM
+hana_encrypt: "true"
+hana_ssl_validate_certificate: "false"
+EOF
+
+# 3. Push
+cf push itil4-evalapp --vars-file /tmp/cf-vars.yml
+
+# 4. Verify health
+cf app itil4-evalapp
+cf logs itil4-evalapp --recent
+
+# 5. Clean up: rm /tmp/cf-vars.yml
+```
+
+**Why not `deploy_btp.sh`**: that script reads HANA vars from `.env` and
+overrides BTP env vars. Since the local `.env` has the stale DBADMIN dev
+credentials (and the user explicitly excluded password rotation from
+this session), the right approach is to use the values that are already
+working in BTP, not the local dev defaults.
 
 ## Open items / TODO
 
