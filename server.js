@@ -44,6 +44,11 @@ const {
   verifyXsuaaJwt,
   roleFromClaims
 } = require('./shared/xsuaa.js');
+const {
+  getPool,
+  acquireConn,
+  releaseConn
+} = require('./shared/db-pool.js');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -190,12 +195,18 @@ function closeConn(conn) {
 }
 
 async function withDb(fn) {
-  const conn = dbConnect();
+  // Opt-in pool: if HANA_POOL_SIZE > 0, acquire from pool. Otherwise,
+  // open/close a fresh connection per call (original behavior).
+  const pool = await getPool();
+  const conn = pool
+    ? await acquireConn(pool)
+    : dbConnect();
   try {
     await execQuery(conn, `SET SCHEMA "${HANA_SCHEMA}"`);
     return await fn(conn);
   } finally {
-    await closeConn(conn);
+    if (pool) await releaseConn(pool, conn);
+    else await closeConn(conn);
   }
 }
 
