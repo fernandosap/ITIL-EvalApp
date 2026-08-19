@@ -415,7 +415,7 @@ without any extra config.
 - [x] Pool HANA connections → opt-in via `HANA_POOL_SIZE`, see gotcha #3.
 - [x] Dedupe `normalizeExamTitle` and `roleCan` → now in `shared/constants.js` (UMD), used by both server and client. See gotcha #1.
 - [x] Document Anthropic proctoring data flow → see "Proctoring data flow" section above.
-- [ ] Investigate audit log silence in August (likely tied to BTP app health post-password-rotation)
+- [x] Investigate audit log silence in August → **NOT a bug, just no real admin activity.** Queried HANA directly: the last `admin_login_success` is `2026-07-23 12:35:30` (Fernando). Between that and 2026-08-19 (today), the only audit rows are 2 `admin_login_failed` from MY own password-login tests — internal CF IPs, no real session. The audit log is working; the silence reflects the operator not actively using the admin console.
 - [ ] Update BTP env var `HANA_PASSWORD` to match the new prod password (out of scope for this repo)
 - [ ] Move BTP creds out of `cf set-env` into a credential store (out of scope for this repo)
 - [ ] Convert `onclick="X()"` handlers to `data-action="X"` event delegation (eliminates the `window.X = X` re-export list in `client/main.js`)
