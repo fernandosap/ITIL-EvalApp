@@ -41,6 +41,22 @@ if ! npm test --silent; then
 fi
 ok "All tests pass."
 
+# Client modules: syntax-only check (no execution, browser-only APIs).
+say "Syntax-checking client modules..."
+SYNTAX_FAILED=0
+for f in server.js client/*.js shared/*.js; do
+  if ! node --check "$f" 2>/dev/null; then
+    fail "Syntax error in $f"
+    node --check "$f" 2>&1 | sed 's/^/    /'
+    SYNTAX_FAILED=1
+  fi
+done
+if [ "$SYNTAX_FAILED" -ne 0 ]; then
+  fail "Fix the syntax errors above before committing."
+  exit 1
+fi
+ok "All JS files parse cleanly."
+
 # ---------------------------------------------------------------------------
 # 2. Secret scan over staged diff (added lines only).
 # ---------------------------------------------------------------------------

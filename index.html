@@ -378,7 +378,22 @@ input:focus{outline:none;border-color:#2E75B6}
 <video id="hidden-cam" autoplay muted playsinline style="display:none"></video>
 <canvas id="cap-canvas" style="display:none"></canvas>
 
+<!--
+  Script load order matters — every module attaches to window.IE and
+  uses globals (S, _adminToken, etc.) defined by client/state.js, so
+  that file must run before any of the others below. client/main.js
+  re-exports the onclick handlers onto window.* and registers the
+  DOMContentLoaded bootstrap, so it must run LAST.
+-->
 <script src="/shared/constants.js"></script>
-<script src="/client-app.js"></script>
+<script src="/client/util.js"></script>
+<script src="/client/state.js"></script>
+<script src="/client/code-entry.js"></script>
+<script src="/client/exam.js"></script>
+<script src="/client/proctor.js"></script>
+<script src="/client/admin-auth.js"></script>
+<script src="/client/admin-codes.js"></script>
+<script src="/client/admin-question-sets.js"></script>
+<script src="/client/main.js"></script>
 </body>
 </html>
