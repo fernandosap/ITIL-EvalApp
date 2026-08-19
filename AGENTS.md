@@ -102,6 +102,7 @@ Unique index: `UX_QITEMS_SET_QINDEX` on `QUESTION_SET_QUESTIONS(QUESTION_SET_ID,
 - `POST /api/admin/codes/:code/question-set` (assign per code)
 - `POST /api/admin/exam-availability` (global on/off)
 - `POST /api/admin/clear-stale-sessions`
+- `GET /api/admin/sweeper-status` — read-only sweeper state (last tick, stuck flag, total cleared)
 - `GET /api/admin/results/:code/review`, `GET /api/admin/results/:code/signed-summary`, `POST /api/admin/results/verify-signature`
 - `POST /api/admin/results/repair-summaries`, `POST /api/admin/results/clear-summaries`
 - `GET /api/admin/analytics/overview`, `GET /api/admin/question-sets/:id/analytics`
@@ -247,9 +248,34 @@ Operations executed in prod HANA (`be84eee8-9540-4517-be90-a3267f32084a.hna1.pro
 | 3 | `UPDATE QUESTION_SETS SET LIFECYCLE_STATUS='ARCHIVED' WHERE IS_ACTIVE=FALSE AND LIFECYCLE_STATUS='PUBLISHED'` | ✅ 3 rows affected (IDs 1, 2, 5) | normalizes drift |
 | 4 | `DELETE FROM EXAM_SESSIONS WHERE ACCESS_CODE='7WGME9'` + `UPDATE ACCESS_CODES SET STATUS='unused' WHERE ACCESS_CODE='7WGME9' AND STATUS='active'` | ✅ 1 session deleted, 1 access code returned to `unused` pool | stale 33 days, sweeper had not run |
 
+## Deployment status (as of 2026-08-18)
+
+**BTP is running `a0dae34` (2026-03-31). HEAD is `e843506` (2026-06-06) plus 5 commits.**
+
+This is a meaningful drift: 8 commits behind, +1,378 lines in `server.js`, 18 new admin
+routes, 2 new migrations, 8 new env vars, and the stale-session sweeper is
+NOT in the deployed version. Most of the headling admin/audit/question-set
+functionality documented in this file is therefore not live.
+
+| Metric | Deployed (`a0dae34`) | HEAD | Notes |
+|---|---:|---:|---|
+| Commits | 1 | 8 | |
+| `server.js` lines | 2,142 | 3,520 | +64% |
+| API routes | 40 | 58 | All new routes are admin/audit/question-set |
+| Migrations | 5 | 7 | 2 new (both idempotent, both already applied) |
+| Env vars | ~7 | ~15 | 8 new, several required for admin features |
+| Stale-session sweeper | ❌ missing | ✅ present | root cause of 7WGME9 not auto-cleaned |
+
+**Risk of deploying HEAD to BTP**: low (additive only, no breaking changes to
+candidate or admin APIs). **Blocker**: `HANA_PASSWORD` in BTP is the
+pre-rotation value; the deploy will start a live app that fails HANA
+auth on first request until the env var is updated. Update password first
+via `cf set-env itil4-evalapp HANA_PASSWORD <new> && cf restage itil4-evalapp`,
+then deploy HEAD. Out of scope for this project; operator decision.
+
 ## Open items / TODO
 
-- [ ] Investigate stale-session sweeper health (sweeper did NOT clean 7WGME9 over 33 days; either off, or crashed, or env var differs in BTP)
+- [x] Investigate stale-session sweeper health → **NOT a code bug, deployment drift.** BTP runs `a0dae34` (2026-03-31) but the sweeper was added in `e843506` (2026-06-06). Fix = deploy HEAD once `HANA_PASSWORD` is rotated in BTP. Also hardened: per-tick log, `GET /api/admin/sweeper-status` endpoint, `isStuck` flag for silent crashes.
 - [ ] Decide on PRACTICE feature scope (0 uses in 242 results)
 - [ ] Investigate audit log silence in August (likely tied to BTP app health post-password-rotation)
 - [ ] Update BTP env var `HANA_PASSWORD` to match the new prod password (out of scope for this repo)

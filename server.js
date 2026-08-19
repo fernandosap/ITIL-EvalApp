@@ -91,7 +91,19 @@ const _questionSetCache = new Map();
 const _runtimeState = {
   adminTokenNotBefore: 0,
   adminTokenNotBeforeFetchedAt: 0,
-  staleSessionSweepTimer: null
+  staleSessionSweepTimer: null,
+  // Sweeper observability: a "tick" is one execution of the scheduled
+  // cleanup. Without these fields, a silent crash of the sweep (e.g. HANA
+  // unreachable) would be invisible — we only logged when something was
+  // cleared. Now we log every tick and expose status via an admin endpoint.
+  sweeperEnabled: false,
+  sweeperStartedAt: 0,
+  sweeperTickCount: 0,
+  sweeperLastTickAt: 0,
+  sweeperLastDurationMs: 0,
+  sweeperLastCleared: [],
+  sweeperLastError: null,
+  sweeperTotalCleared: 0
 };
 const _metrics = {
   startedAt: Date.now(),
@@ -1145,6 +1157,34 @@ async function clearStaleSessionsWithConn(conn) {
     cleared.push(code);
   }
   return cleared;
+}
+
+// Snapshot of the stale-session sweeper state for the admin /sweeper-status
+// endpoint. Pure read of _runtimeState; safe to call any time.
+function getSweeperStatus() {
+  const now = Date.now();
+  const lastTickAt = _runtimeState.sweeperLastTickAt;
+  const lastTickAgeMs = lastTickAt > 0 ? now - lastTickAt : null;
+  return {
+    enabled: _runtimeState.sweeperEnabled,
+    intervalMinutes: STALE_SESSION_SWEEP_MINUTES,
+    thresholdMinutes: STALE_SESSION_MINUTES,
+    startedAt: _runtimeState.sweeperStartedAt || null,
+    tickCount: _runtimeState.sweeperTickCount,
+    lastTickAt: lastTickAt > 0 ? new Date(lastTickAt).toISOString() : null,
+    lastTickAgeMs,
+    // Flag as "stuck" if a tick was expected in the last 2 sweep intervals
+    // but hasn't happened. Helps surface silent crashes.
+    isStuck: _runtimeState.sweeperEnabled
+      && lastTickAt > 0
+      && lastTickAgeMs !== null
+      && lastTickAgeMs > STALE_SESSION_SWEEP_MINUTES * 60 * 1000 * 2,
+    lastDurationMs: _runtimeState.sweeperLastDurationMs,
+    lastClearedCount: _runtimeState.sweeperLastCleared.length,
+    lastClearedCodes: _runtimeState.sweeperLastCleared.slice(0, 20),
+    totalCleared: _runtimeState.sweeperTotalCleared,
+    lastError: _runtimeState.sweeperLastError
+  };
 }
 
 function normalizeQuestionUploadEntry(entry) {
@@ -2414,6 +2454,13 @@ app.post('/api/admin/clear-stale-sessions', requireAdmin, requireAdminRole('admi
   }
 });
 
+// Read-only: returns the sweeper's last-tick metadata. Used to surface
+// "stuck" states (timer started but no recent tick) and silent crashes
+// (HANA connection failure logged on every attempt).
+app.get('/api/admin/sweeper-status', requireAdmin, requirePermission('dashboard:read'), (_req, res) => {
+  res.json({ ok: true, sweeper: getSweeperStatus() });
+});
+
 app.post('/api/admin/note', requireAdmin, requirePermission('codes:note'), async (req, res) => {
   const code = String(req.body?.code || '').trim().toUpperCase();
   const notes = String(req.body?.notes || '');
@@ -3473,15 +3520,50 @@ app.use((err, _req, res, _next) => {
 
 function startBackgroundJobs() {
   if (!HAS_DB_CONFIG || !AUTO_CLEAR_STALE_SESSIONS || _runtimeState.staleSessionSweepTimer) return;
+  _runtimeState.sweeperEnabled = true;
+  _runtimeState.sweeperStartedAt = Date.now();
   _runtimeState.staleSessionSweepTimer = setInterval(() => {
+    const startedAt = Date.now();
     withDb(async (conn) => clearStaleSessionsWithConn(conn))
       .then((cleared) => {
-        if (cleared.length) appLog('info', 'stale_sessions_auto_cleared', { count: cleared.length });
+        _runtimeState.sweeperTickCount += 1;
+        _runtimeState.sweeperLastTickAt = Date.now();
+        _runtimeState.sweeperLastDurationMs = Date.now() - startedAt;
+        _runtimeState.sweeperLastCleared = cleared;
+        _runtimeState.sweeperLastError = null;
+        _runtimeState.sweeperTotalCleared += cleared.length;
+        // Always log on tick — silent ticks are how 7WGME9 happened.
+        if (cleared.length) {
+          appLog('info', 'stale_sessions_auto_cleared', {
+            count: cleared.length,
+            durationMs: _runtimeState.sweeperLastDurationMs,
+            tickNumber: _runtimeState.sweeperTickCount
+          });
+        } else {
+          appLog('debug', 'stale_session_sweep_tick', {
+            durationMs: _runtimeState.sweeperLastDurationMs,
+            tickNumber: _runtimeState.sweeperTickCount
+          });
+        }
       })
       .catch((err) => {
-        appLog('warn', 'stale_session_sweep_failed', { message: err.message });
+        _runtimeState.sweeperTickCount += 1;
+        _runtimeState.sweeperLastTickAt = Date.now();
+        _runtimeState.sweeperLastDurationMs = Date.now() - startedAt;
+        _runtimeState.sweeperLastError = { message: err.message, at: Date.now() };
+        appLog('warn', 'stale_session_sweep_failed', {
+          message: err.message,
+          tickNumber: _runtimeState.sweeperTickCount,
+          durationMs: _runtimeState.sweeperLastDurationMs
+        });
       });
   }, STALE_SESSION_SWEEP_MINUTES * 60 * 1000);
+  appLog('info', 'stale_session_sweeper_started', {
+    intervalMinutes: STALE_SESSION_SWEEP_MINUTES,
+    thresholdMinutes: STALE_SESSION_MINUTES,
+    autoClearEnabled: AUTO_CLEAR_STALE_SESSIONS,
+    hasDbConfig: HAS_DB_CONFIG
+  });
 }
 
 function stopBackgroundJobs() {
@@ -3489,6 +3571,7 @@ function stopBackgroundJobs() {
     clearInterval(_runtimeState.staleSessionSweepTimer);
     _runtimeState.staleSessionSweepTimer = null;
   }
+  _runtimeState.sweeperEnabled = false;
 }
 
 function startServer(port = PORT) {
@@ -3512,7 +3595,8 @@ module.exports = {
   stopBackgroundJobs,
   normalizeExamTitle,
   validateQuestionUploadEntries,
-  startupSummary
+  startupSummary,
+  getSweeperStatus
 };
 
 if (require.main === module) {
