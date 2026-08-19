@@ -89,7 +89,8 @@ const STARTUP_STRICT = String(process.env.STARTUP_STRICT || 'false').toLowerCase
 
 const HAS_DB_CONFIG = Boolean(HANA_HOST && HANA_USER && HANA_PASSWORD && HANA_SCHEMA);
 const INDEX_PATH = path.join(__dirname, 'index.html');
-const CLIENT_APP_PATH = path.join(__dirname, 'client-app.js');
+const CLIENT_APP_PATH = path.join(__dirname, 'client-app.js'); // legacy shim, no longer used
+
 const FAVICON_PATH = path.join(__dirname, 'favicon.svg');
 
 const EXAM_TTL_MS = 90 * 60 * 1000;
@@ -3693,11 +3694,25 @@ app.get('/api/admin/export.csv', requireAdmin, requirePermission('results:export
 });
 
 app.get('/client-app.js', (_req, res) => {
-  res.type('application/javascript').sendFile(CLIENT_APP_PATH);
+  // Legacy single-file bundle, kept as a 404 shim for old clients
+  // that may have the URL cached. The active app loads /client/*.js.
+  res.status(404).send('Not found');
 });
 
 app.get('/shared/constants.js', (_req, res) => {
   res.type('application/javascript').sendFile(path.join(__dirname, 'shared', 'constants.js'));
+});
+
+// Serve any /client/*.js file (the refactored SPA modules).
+// Reject paths that try to escape the client/ directory.
+app.get(/^\/client\/([A-Za-z0-9_-]+\.js)$/, (req, res) => {
+  const fileName = req.params[0];
+  const filePath = path.join(__dirname, 'client', fileName);
+  if (!filePath.startsWith(path.join(__dirname, 'client') + path.sep)) {
+    return res.status(400).send('Bad path');
+  }
+  if (!fs.existsSync(filePath)) return res.status(404).send('Not found');
+  res.type('application/javascript').sendFile(filePath);
 });
 
 app.get('/favicon.svg', (_req, res) => {
@@ -3710,7 +3725,6 @@ app.get('/', (_req, res) => {
 
 app.get('*', (req, res, next) => {
   if (req.path.startsWith('/api/')) return next();
-  if (req.path === '/client-app.js' && fs.existsSync(CLIENT_APP_PATH)) return res.type('application/javascript').sendFile(CLIENT_APP_PATH);
   if (req.path === '/shared/constants.js' && fs.existsSync(path.join(__dirname, 'shared', 'constants.js'))) return res.type('application/javascript').sendFile(path.join(__dirname, 'shared', 'constants.js'));
   if (req.path === '/favicon.svg' && fs.existsSync(FAVICON_PATH)) return res.type('image/svg+xml').sendFile(FAVICON_PATH);
   if (fs.existsSync(INDEX_PATH)) return res.sendFile(INDEX_PATH);
