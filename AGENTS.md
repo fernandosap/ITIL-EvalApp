@@ -95,6 +95,10 @@ Unique index: `UX_QITEMS_SET_QINDEX` on `QUESTION_SET_QUESTIONS(QUESTION_SET_ID,
 
 ### Admin (4 roles: admin / manager / reviewer / content_editor)
 - `POST /api/admin/login`, `/logout`, `/sessions/revoke-all`
+- `GET /api/admin/auth-methods` — public; returns `{ password, xsuaa: { enabled, authorizeUrl, xsappname } }`
+- `GET /api/admin/me` — auth; returns `{ ok, role, sub, authMethod }` (used by SPA to bootstrap from cookie)
+- `GET /oauth/login` — public; 302 to XSUAA authorize URL, sets `xsuaa_state` cookie
+- `GET /oauth/callback` — public; exchanges code, sets `xsuaa_jwt` cookie, 302s to `/?auth=ok`
 - `GET /api/admin/system-status`, `/metrics`, `/notifications`, `/audit`, `/audit/export.json`
 - `GET /api/admin/codes` (paginated codes + joins)
 - `POST /api/admin/generate` (create codes), `POST /api/admin/reset`, `POST /api/admin/note`
@@ -116,12 +120,33 @@ Unique index: `UX_QITEMS_SET_QINDEX` on `QUESTION_SET_QUESTIONS(QUESTION_SET_ID,
 
 ## Auth model
 
+Two parallel paths for the admin console; the password path is the
+fallback when XSUAA is not bound.
+
+### Password path (legacy / local dev)
+
 - **Admin login**: client-side `SHA-256(plaintext)` via `crypto.subtle.digest`, sends hash. Server compares against `ADMIN_HASH`/`MANAGER_HASH`/`REVIEWER_HASH`/`CONTENT_EDITOR_HASH` env vars.
 - **Admin token**: HMAC-SHA256 over `expiry:nonce:role[:issuedAt]`, base64url-encoded, sent in `X-Admin-Token` header. **TTL: 8h.**
-- **Exam token**: HMAC-SHA256 over `CODE:expiry:nonce`, sent in `X-Exam-Token` header. TTL: `max(90min, exam_duration + 30min)`.
 - **Session revocation**: `APP_SETTINGS.ADMIN_TOKEN_NOT_BEFORE` is checked on every admin request; bumping it invalidates all tokens issued before that timestamp.
+
+### XSUAA / OAuth 2.0 path (BTP)
+
+- **Service instance**: `itil-evalapp-xsuaa` (plan `application`), bound to the app. Config in `xs-security.json` declares 4 scopes (`$XSAPPNAME.{admin,manager,reviewer,content_editor}`).
+- **Browser flow**: SPA calls `GET /api/admin/auth-methods` → if XSUAA is bound, shows a "Sign in with SAP" button. Clicking it navigates to `GET /oauth/login` → 302 to `https://<xsuaa>/oauth/authorize?response_type=code&client_id=...&redirect_uri=...&state=<rand>`. The user authenticates at SAP, which redirects to `GET /oauth/callback?code=...&state=...`. The server validates state (cookie `xsuaa_state`, httpOnly, 10 min), exchanges the code for an access token at `https://<xsuaa>/oauth/token` (HTTP Basic auth with clientid:clientsecret), sets the JWT in cookie `xsuaa_jwt` (httpOnly, SameSite=Lax, Secure, Max-Age = `expires_in`), and 302s to `/?auth=ok`.
+- **API clients**: send `Authorization: Bearer <jwt>` directly (RS256, signed by XSUAA's verification key).
+- **JWT validation** (`shared/xsuaa.js` `verifyXsuaaJwt`): manual RS256 verification using the verification key from `VCAP_SERVICES.xsuaa[0].credentials.verificationkey`. Validates `alg=RS256`, signature, `exp`, `nbf`, `aud == xsappname` (or `*`).
+- **Role mapping**: highest-priority scope wins. `admin` > `manager` > `reviewer` > `content_editor`.
+- **Logout**: `POST /api/admin/logout` sets `xsuaa_jwt=; Max-Age=0` to expire the cookie. Does NOT invalidate the IdP session (XSUAA session is separate and would need `/oauth/logout` against XSUAA — not implemented; not needed for this app).
+- **No `@sap/xssec` dependency** — manual JWT verification keeps the dep tree small (~140 LOC in `shared/xsuaa.js`).
+
+### Exam token
+
+- HMAC-SHA256 over `CODE:expiry:nonce`, sent in `X-Exam-Token` header. TTL: `max(90min, exam_duration + 30min)`.
+
+### Common
+
 - **Rate limits**: validate 10/10min/IP, admin login 8/15min/IP, proctor 90/min/code-IP.
-- **Permissions** are per-role, per-action (`codes:read`, `content:write`, etc.). Full list in `ROLE_PERMISSIONS` in `server.js` (line ~562) and mirrored in `roleCan` in `client-app.js` (line ~106).
+- **Permissions** are per-role, per-action (`codes:read`, `content:write`, etc.). Full list in `ROLE_PERMISSIONS` in `server.js` and mirrored in `roleCan` in `client-app.js`.
 
 ## Env vars
 
