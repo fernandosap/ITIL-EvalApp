@@ -233,7 +233,7 @@ fallback when XSUAA is not bound.
 |---|---|---|
 | `HANA_HOST`, `HANA_PORT`, `HANA_USER`, `HANA_PASSWORD`, `HANA_SCHEMA` | ✅ | Prod schema is `ITIL_EXAM`. |
 | `HANA_ENCRYPT` | optional | `true` by default |
-| `HANA_SSL_VALIDATE_CERTIFICATE` | optional | `false` is current (with `STARTUP_STRICT` this generates a warning) |
+| `HANA_SSL_VALIDATE_CERTIFICATE` | **debt** | `false` is current (the app warns at boot). **Default in `@sap/hana-client` is `true` and SAP recommends leaving it on.** This is a known security debt — see "Open security debt" below for the migration plan. |
 | `ADMIN_HASH`, `MANAGER_HASH`, `REVIEWER_HASH`, `CONTENT_EDITOR_HASH` | optional | 64-char SHA-256 hex of role password. If absent, that role's login is disabled. |
 | `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `ANTHROPIC_VERSION` | optional | If absent, proctor endpoint returns `{ enabled: false }` |
 | `EXAM_NAME`, `EXAM_DURATION_SECS`, `EXAM_PASS_PCT`, `EXAM_ACTIVE`, `PROCTOR_ENABLED` | optional | Defaults: 45min, 80%, true, true |
@@ -246,7 +246,7 @@ fallback when XSUAA is not bound.
 
 ### ⚠️ Password handling (current state)
 
-- The `.env` file in this repo is **stale** (the original `WelcomeWelcome1.`, last deploy April 11).
+- The `.env` file in this repo is **stale** (the original `DBADMIN_DEV_PASSWORD` value, last deploy April 11). The literal value is not reproduced here — refer to `OPEN_SECRETS.md` for context.
 - HANA's DBADMIN password was rotated on 2026-08-18. The new password is held by the operator (not committed in this repo).
 - The **live BTP app's `HANA_PASSWORD` env var is now mismatched** and the app is in a degraded state until `cf set-env` is run.
 - **Out of scope for this project to touch**: BTP env var updates, secret rotation policy, credential store migration.
@@ -289,7 +289,7 @@ Reads HANA vars from `.env` or `--env-file`. Sets `APP_REVISION` from `git rev-p
 4. **All inactive sets in `LIFECYCLE_STATUS=PUBLISHED`** — should be `ARCHIVED`. **Fixed 2026-08-18** ✅ — IDs 1, 2, 5 are now ARCHIVED.
 5. **Zero PRACTICE results in 242** — feature implemented but never used. Confirm with stakeholders if it's still in scope, otherwise document as "deferred".
 6. **Audit log silent in August** — last entry 2026-07-23, zero events in August. No `admin_login_failed` either, so the BTP app may not be reachable (possibly due to DBADMIN password rotation). Cross-check with `cf logs itil4-evalapp --recent` once env is fixed.
-7. **DBADMIN password rotated 2026-08-18** — `.env` in this repo is **stale** (still has the original `WelcomeWelcome1.` which is no longer valid). Live BTP app status is **unknown** and out of scope to fix from this repo. The new password is held by the operator — do not commit it.
+7. **DBADMIN password rotated 2026-08-18** — `.env` in this repo is **stale** (still has the original `DBADMIN_DEV_PASSWORD` value, which is no longer valid). Live BTP app status is **unknown** and out of scope to fix from this repo. The new password is held by the operator — do not commit it. The literal value is referenced symbolically only; see `OPEN_SECRETS.md`.
 
 ## Proctoring data flow
 
@@ -549,6 +549,71 @@ another origin).
 - [ ] Sweeper end-to-end test (real HANA stale session cleared by sweeper) — deferred to next session, requires CI infra.
 - [ ] JSDOM-light tests for client renderers (`renderQ`, `showAdmin`, `showResultsFromRecord`) — deferred, no test deps added.
 - [ ] Route split (deferred — multi-day effort, deserves its own session).
+
+## Open security debt
+
+These are the remaining security follow-ups. Ordered by recommended
+sequence — rotate the leaked password FIRST, then run the platform
+upgrades, then tighten the operational defaults.
+
+### 1. Rotate `HANA_ITIL_EXAM_ADMIN_PASSWORD` in BTP (P0)
+
+The password was committed in `b06518d` (Aug 2026) and briefly
+re-published in `OPEN_SECRETS.md` in `13e156b`. Both values are
+public. The literal value is **not** reproduced in this file or in
+`OPEN_SECRETS.md` — see `OPEN_SECRETS.md` for the identifier and
+the action plan. Operationally: rotate via BTP Cockpit → HANA
+Cloud → "Reset Administrator Password" for `ITIL_EXAM_ADMIN`,
+store the new value in the BTP credential store, and audit the
+HANA audit trail (NOT `cf logs`) for any connections from
+non-CF source IPs in the window between 2026-08-18 and the
+rotation time.
+
+### 2. Migrate to Node 22 LTS + cflinuxfs5 (P1)
+
+`engines.node` is `20.x` in `package.json`, but Node 20 reached
+EOL on 2026-04-30. SAP BTP continues to support it temporarily but
+will retire it. Plan: bump `engines.node` to `22.x`, validate
+`@sap/hana-client` compatibility (we're on `^2.25.27`, which
+supports 22), then re-pin the buildpack to a `cflinuxfs5`-ready
+buildpack version (the current pin `nodejs_buildpack#v1.9.1` is
+on `cflinuxfs4` and is itself deprecated). Validate end-to-end
+with a staging deploy + smoke test before touching prod.
+
+### 3. HANA TLS certificate validation (P1)
+
+`HANA_SSL_VALIDATE_CERTIFICATE=false` is a known deviation from
+the SAP-recommended default. The justification at the time of
+deployment was pragmatic ("we couldn't get the cert chain
+trusted in a hurry"), but it should not stay this way
+indefinitely. Plan: enable `true` once the HANA Cloud CA chain
+is in the buildpack's default trust store (or ship a
+`sslTrustStore` PEM file with the app). Verify with a single
+`/api/health` call after enabling; the connection will fail at
+boot if the chain is untrusted, which is the right behavior.
+
+### 4. Versioned result-signing key (P2)
+
+`getSigningSecret()` derives from `HANA_PASSWORD +
+{role hashes} + APP_REVISION`. Rotating any of those invalidates
+historical signed result summaries (compliance exports).
+Plan: introduce a dedicated `RESULT_SIGNING_KEY` env var, add a
+`kid` (key id) to the envelope, and support a "current + previous"
+key set so old envelopes still verify during the transition.
+This is a protocol change — coordinate with anyone consuming
+signed summaries before deploying.
+
+### 5. Replace custom XSUAA JWT verifier with `@sap/xssec` (P2)
+
+The current verifier in `shared/xsuaa.js` is ~270 LOC of
+hand-rolled RS256 + `exp` / `nbf` / `aud` / `iss` / scope checks.
+SAP's `@sap/xssec` is the supported library for this and tracks
+XSUAA protocol changes (new claims, rotation semantics, etc.) for
+us. Migration is straightforward: add the dep, replace
+`verifyXsuaaJwt()` with the xssec equivalent, keep the same
+return shape, and update the 44 unit tests. Carrying a
+custom verifier in a production codebase is risk that grows
+over time as XSUAA evolves.
 
 ## Inspecting HANA (read-only)
 
