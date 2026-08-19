@@ -161,7 +161,7 @@ Reads HANA vars from `.env` or `--env-file`. Sets `APP_REVISION` from `git rev-p
 2. **Result JSON contains everything**: stem, options, given, expected — per question, per result. NCLOB. With many results, this is the largest table by storage.
 3. **HANA connection is not pooled** — every `withDb(fn)` opens/closes a new connection. Fine for low traffic, may matter at scale.
 4. **`_questionSetCache` is per-process** — if you ever scale to `instances: > 1` in `manifest.yml`, writes from instance A won't invalidate the cache on instance B.
-5. **Anthropic proctoring sends raw webcam JPEGs to Anthropic** — make sure your data processing agreement covers this. Image is in `image/jpeg` at quality 0.65, dimensions ≤ 320×240, 12s timeout.
+5. **Anthropic proctoring sends raw webcam JPEGs to Anthropic** — see the [Proctoring data flow](#proctoring-data-flow) section for the full chain. Make sure your data processing agreement covers this. Image is in `image/jpeg` at quality 0.65, dimensions ≤ 320×240, 12s timeout.
 6. **`/api/bootstrap` returns 410** by design. Don't add code that depends on it.
 7. **Code format is `[A-Z2-9]{6}`** — no `I`, `L`, `O`, `0`, `1` to avoid visual confusion. Keep that in mind for any code generation.
 8. **Multi-select grading is exact-match**: must select every correct option, no partial credit. Document this if the user asks.
@@ -180,6 +180,61 @@ Reads HANA vars from `.env` or `--env-file`. Sets `APP_REVISION` from `git rev-p
 5. **Zero PRACTICE results in 242** — feature implemented but never used. Confirm with stakeholders if it's still in scope, otherwise document as "deferred".
 6. **Audit log silent in August** — last entry 2026-07-23, zero events in August. No `admin_login_failed` either, so the BTP app may not be reachable (possibly due to DBADMIN password rotation). Cross-check with `cf logs itil4-evalapp --recent` once env is fixed.
 7. **DBADMIN password rotated 2026-08-18** — `.env` in this repo is **stale** (still has the original `WelcomeWelcome1.` which is no longer valid). Live BTP app status is **unknown** and out of scope to fix from this repo. The new password is held by the operator — do not commit it.
+
+## Proctoring data flow
+
+When `PROCTOR_ENABLED=true` on a question set, candidates go through a tech
+check (`getUserMedia` for webcam, `getDisplayMedia` for screen) and then
+are continuously monitored while the exam is in progress.
+
+### What is captured (locally in the browser)
+
+- **Webcam video stream** — `MediaStream` from `getUserMedia({ video: { width: 320, height: 240 } })`. Never uploaded as a stream.
+- **Screen share video stream** — `MediaStream` from `getDisplayMedia({ video: { displaySurface: 'monitor' } })`. Never uploaded as a stream.
+- **Per-proctor-check JPEG** — every 28s (`CFG.webcamIntervalS`), one frame is drawn to a hidden canvas, encoded as `image/jpeg` at quality `0.65`, and ≤ 320×240 px.
+
+### What leaves the browser
+
+Only the per-check JPEG and only to the server endpoint
+`POST /api/proctor/check`. The server immediately forwards the JPEG to
+Anthropic's `messages` API with a strict prompt asking for a JSON
+`{flag, reason}` verdict (no face, second person, phone/notes, looking
+away). The flag and reason return to the client; the JPEG is not
+persisted server-side.
+
+### Anthropic's data exposure
+
+- The webcam JPEG is sent **with the candidate's face and any PII visible
+  on their desk** to Anthropic under whatever data-processing agreement
+  the operator has with Anthropic.
+- API key is `ANTHROPIC_API_KEY` env var; never in code or logs.
+- 12-second timeout per call. 90 calls/min/code-IP rate limit.
+- If `ANTHROPIC_API_KEY` is missing, the endpoint returns
+  `{ enabled: false, flag: false, reason: null }` and no image is sent.
+
+### What is persisted
+
+- **Incidents** appended to `S.incidents` in browser state and serialized
+  into `EXAM_SESSIONS.SESSION_JSON` via `/api/progress`. Each entry is
+  `{ time, type, detail }`. Types: `tab_switch`, `focus_lost`,
+  `focus_returned`, `possible_screenshot`, `screenshot_attempt`,
+  `right_click`, `shortcut`, `ai_flag`, `screen_stopped`.
+- **Final incident count** ends up in `EXAM_RESULTS.INCIDENT_COUNT` and
+  in `RESULT_JSON.incidentCount` / `RESULT_JSON.incidents[]`.
+- **No image** is ever stored in HANA. Only the boolean flag and short
+  reason text from Anthropic are kept.
+
+### Compliance notes
+
+- The webcam JPEG route is opt-in: a question set can disable proctoring
+  entirely with `PROCTOR_ENABLED=false` (`PATCH /api/admin/question-sets/:id/config`).
+- Candidates see a consent screen with the bullet "Webcam images are
+  analysed for proctoring only. No answer key is stored in the browser"
+  before enabling monitoring.
+- For a copy of the Anthropic prompt and the exact server code, see
+  `server.js` around line 1586 (`/api/proctor/check`) and `client-app.js`
+  around line 888 (`startProctor`, `proctor`).
+
 
 ## Cleanup log (2026-08-18)
 
