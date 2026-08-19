@@ -245,3 +245,173 @@ test('end-to-end: real RSA-2048 sign + verify end-to-end', () => {
   // The scope strip should give us 'admin' (highest priority)
   assert.equal(roleFromClaims(claims), 'admin');
 });
+
+// ---------------------------------------------------------------------------
+// buildAuthorizeUrl
+// ---------------------------------------------------------------------------
+
+const { buildAuthorizeUrl, exchangeCodeForToken, generateState } = require('../shared/xsuaa.js');
+
+test('buildAuthorizeUrl: includes response_type, client_id, redirect_uri, state', () => {
+  const xsuaa = {
+    url: 'https://sapacademy.authentication.us10.hana.ondemand.com',
+    clientid: 'sb-academy-cf-cs-itil4-evalapp!t11367'
+  };
+  const url = buildAuthorizeUrl(xsuaa, 'https://app.example.com/oauth/callback', 'abc123');
+  const u = new URL(url);
+  assert.equal(u.origin, 'https://sapacademy.authentication.us10.hana.ondemand.com');
+  assert.equal(u.pathname, '/oauth/authorize');
+  assert.equal(u.searchParams.get('response_type'), 'code');
+  assert.equal(u.searchParams.get('client_id'), 'sb-academy-cf-cs-itil4-evalapp!t11367');
+  assert.equal(u.searchParams.get('redirect_uri'), 'https://app.example.com/oauth/callback');
+  assert.equal(u.searchParams.get('state'), 'abc123');
+});
+
+test('buildAuthorizeUrl: strips trailing slash from xsuaa.url', () => {
+  const xsuaa = {
+    url: 'https://example.com/',
+    clientid: 'cid'
+  };
+  const url = buildAuthorizeUrl(xsuaa, 'https://app/cb', 's');
+  assert.equal(new URL(url).origin, 'https://example.com');
+});
+
+test('buildAuthorizeUrl: throws on missing xsuaa fields', () => {
+  assert.throws(() => buildAuthorizeUrl(null, 'https://x/cb', 's'), /incomplete/);
+  assert.throws(() => buildAuthorizeUrl({ url: 'https://x' }, 'https://x/cb', 's'), /incomplete/);
+  assert.throws(() => buildAuthorizeUrl({ url: 'https://x', clientid: 'c' }, null, 's'), /redirectUri/);
+});
+
+test('buildAuthorizeUrl: uses empty state when not provided', () => {
+  const xsuaa = { url: 'https://x.example', clientid: 'c' };
+  const url = buildAuthorizeUrl(xsuaa, 'https://app/cb');
+  assert.equal(new URL(url).searchParams.get('state'), '');
+});
+
+// ---------------------------------------------------------------------------
+// generateState
+// ---------------------------------------------------------------------------
+
+test('generateState: returns a 32-byte-base64url string', () => {
+  const s = generateState();
+  assert.equal(typeof s, 'string');
+  // base64url: A-Z, a-z, 0-9, -, _ (no padding)
+  assert.match(s, /^[A-Za-z0-9_-]+$/);
+  // 32 bytes -> 43 chars (without padding)
+  assert.equal(s.length, 43);
+});
+
+test('generateState: returns a unique value each call', () => {
+  const a = generateState();
+  const b = generateState();
+  assert.notEqual(a, b);
+});
+
+// ---------------------------------------------------------------------------
+// exchangeCodeForToken
+// ---------------------------------------------------------------------------
+
+test('exchangeCodeForToken: posts to /oauth/token with Basic auth and form body', async () => {
+  const xsuaa = {
+    url: 'https://sap.example.com',
+    clientid: 'my-client',
+    clientsecret: 'my-secret'
+  };
+  let captured = null;
+  const fakeExecutor = (opts, body, cb) => {
+    captured = { opts, body };
+    cb(null, 200, JSON.stringify({ access_token: 'tok-abc', token_type: 'bearer', expires_in: 3600 }));
+  };
+  const result = await exchangeCodeForToken(xsuaa, 'code-xyz', 'https://app/cb', fakeExecutor);
+  assert.ok(result);
+  assert.equal(result.access_token, 'tok-abc');
+  assert.equal(captured.opts.method, 'POST');
+  assert.equal(captured.opts.hostname, 'sap.example.com');
+  assert.equal(captured.opts.path, '/oauth/token');
+  // Basic auth header
+  const expectedAuth = 'Basic ' + Buffer.from('my-client:my-secret').toString('base64');
+  assert.equal(captured.opts.headers.Authorization, expectedAuth);
+  // Form body
+  assert.match(captured.body, /grant_type=authorization_code/);
+  assert.match(captured.body, /code=code-xyz/);
+  assert.match(captured.body, /redirect_uri=https%3A%2F%2Fapp%2Fcb/);
+  assert.equal(captured.opts.headers['Content-Type'], 'application/x-www-form-urlencoded');
+});
+
+test('exchangeCodeForToken: returns null on network error', async () => {
+  const xsuaa = { url: 'https://x', clientid: 'c', clientsecret: 's' };
+  const fakeExecutor = (_opts, _body, cb) => cb(new Error('ECONNREFUSED'));
+  const result = await exchangeCodeForToken(xsuaa, 'c', 'https://x/cb', fakeExecutor);
+  assert.equal(result, null);
+});
+
+test('exchangeCodeForToken: returns null on non-2xx status', async () => {
+  const xsuaa = { url: 'https://x', clientid: 'c', clientsecret: 's' };
+  const fakeExecutor = (_opts, _body, cb) => cb(null, 400, '{"error":"invalid_grant"}');
+  const result = await exchangeCodeForToken(xsuaa, 'c', 'https://x/cb', fakeExecutor);
+  assert.equal(result, null);
+});
+
+test('exchangeCodeForToken: returns null on malformed JSON', async () => {
+  const xsuaa = { url: 'https://x', clientid: 'c', clientsecret: 's' };
+  const fakeExecutor = (_opts, _body, cb) => cb(null, 200, 'not json');
+  const result = await exchangeCodeForToken(xsuaa, 'c', 'https://x/cb', fakeExecutor);
+  assert.equal(result, null);
+});
+
+test('exchangeCodeForToken: returns null on missing xsuaa fields', async () => {
+  const result = await exchangeCodeForToken({}, 'c', 'r', () => {});
+  assert.equal(result, null);
+  const result2 = await exchangeCodeForToken({ url: 'x' }, 'c', 'r', () => {});
+  assert.equal(result2, null);
+});
+
+test('exchangeCodeForToken: returns null on missing code', async () => {
+  const xsuaa = { url: 'https://x', clientid: 'c', clientsecret: 's' };
+  const result = await exchangeCodeForToken(xsuaa, '', 'https://x/cb', () => {});
+  assert.equal(result, null);
+  const result2 = await exchangeCodeForToken(xsuaa, null, 'https://x/cb', () => {});
+  assert.equal(result2, null);
+});
+
+// ---------------------------------------------------------------------------
+// parseCookieHeader
+// ---------------------------------------------------------------------------
+
+const { parseCookieHeader } = require('../shared/xsuaa.js');
+
+test('parseCookieHeader: returns {} for null/empty/non-string', () => {
+  assert.deepEqual(parseCookieHeader(null), {});
+  assert.deepEqual(parseCookieHeader(undefined), {});
+  assert.deepEqual(parseCookieHeader(''), {});
+  assert.deepEqual(parseCookieHeader(123), {});
+});
+
+test('parseCookieHeader: parses a single cookie', () => {
+  assert.deepEqual(parseCookieHeader('xsuaa_jwt=abc'), { xsuaa_jwt: 'abc' });
+});
+
+test('parseCookieHeader: parses multiple cookies separated by "; "', () => {
+  const cookies = parseCookieHeader('xsuaa_jwt=abc; xsuaa_state=xyz; Path=/');
+  assert.equal(cookies.xsuaa_jwt, 'abc');
+  assert.equal(cookies.xsuaa_state, 'xyz');
+  assert.equal(cookies.Path, '/');
+});
+
+test('parseCookieHeader: URL-decodes values', () => {
+  // "hello world" -> "hello%20world"
+  assert.deepEqual(parseCookieHeader('foo=hello%20world'), { foo: 'hello world' });
+});
+
+test('parseCookieHeader: handles tokens with "=" inside the value', () => {
+  // First '=' is the split; the rest is the value.
+  assert.deepEqual(parseCookieHeader('foo=a=b=c'), { foo: 'a=b=c' });
+});
+
+test('parseCookieHeader: skips empty keys', () => {
+  assert.deepEqual(parseCookieHeader('=novalue; foo=bar'), { foo: 'bar' });
+});
+
+test('parseCookieHeader: ignores malformed segments (no =)', () => {
+  assert.deepEqual(parseCookieHeader('garbage; foo=bar'), { foo: 'bar' });
+});

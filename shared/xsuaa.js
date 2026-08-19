@@ -136,12 +136,128 @@ function roleFromClaims(claims) {
   return mapScopesToRole(scopes);
 }
 
+// ---------------------------------------------------------------------------
+// OAuth 2.0 authorization-code flow helpers
+// ---------------------------------------------------------------------------
+
+// Build the XSUAA /oauth/authorize URL. Caller must pass a fully-qualified
+// redirectUri that matches the one registered in xs-security.json (XSUAA
+// checks it byte-for-byte).
+//
+//   xsuaa         { url, clientid } from readXsuaaFromVcap
+//   redirectUri   e.g. 'https://app.example.com/oauth/callback'
+//   state         random opaque string for CSRF protection
+function buildAuthorizeUrl(xsuaa, redirectUri, state) {
+  if (!xsuaa || !xsuaa.url || !xsuaa.clientid) {
+    throw new Error('buildAuthorizeUrl: xsuaa config is incomplete');
+  }
+  if (!redirectUri || typeof redirectUri !== 'string') {
+    throw new Error('buildAuthorizeUrl: redirectUri is required');
+  }
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id: xsuaa.clientid,
+    redirect_uri: redirectUri,
+    state: state || ''
+  });
+  return `${xsuaa.url.replace(/\/$/, '')}/oauth/authorize?${params.toString()}`;
+}
+
+// Exchange an authorization code for an access token. Returns the parsed
+// JSON body on success, or null on any error (network, non-2xx, malformed
+// JSON). Caller is responsible for handling the response.
+//
+// Pure: this function accepts an `executor` (a function that takes a URL,
+// options, and a callback) so tests can inject a fake HTTP caller. The
+// default executor uses the global `https` module. XSUAA's /oauth/token
+// endpoint requires application/x-www-form-urlencoded with grant_type and
+// HTTP Basic auth using clientid:clientsecret.
+function exchangeCodeForToken(xsuaa, code, redirectUri, executor) {
+  if (!xsuaa || !xsuaa.clientid || !xsuaa.clientsecret) {
+    return Promise.resolve(null);
+  }
+  if (!code || typeof code !== 'string') {
+    return Promise.resolve(null);
+  }
+  const url = new URL(`${xsuaa.url.replace(/\/$/, '')}/oauth/token`);
+  const auth = Buffer.from(`${xsuaa.clientid}:${xsuaa.clientsecret}`).toString('base64');
+  const body = new URLSearchParams({
+    grant_type: 'authorization_code',
+    code,
+    redirect_uri: redirectUri || ''
+  }).toString();
+  const opts = {
+    method: 'POST',
+    hostname: url.hostname,
+    port: url.port || 443,
+    path: url.pathname,
+    headers: {
+      'Authorization': `Basic ${auth}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Content-Length': Buffer.byteLength(body)
+    }
+  };
+  const exec = executor || defaultHttpsPost;
+  return new Promise((resolve) => {
+    exec(opts, body, (err, statusCode, rawBody) => {
+      if (err) return resolve(null);
+      if (statusCode < 200 || statusCode >= 300) return resolve(null);
+      let parsed;
+      try { parsed = JSON.parse(rawBody); } catch (_e) { return resolve(null); }
+      resolve(parsed);
+    });
+  });
+}
+
+// Default HTTPS executor using the global `https` module. Exposed for
+// tests via a setter.
+let _httpsImpl = null;
+function _setHttpsForTests(mod) { _httpsImpl = mod; }
+function defaultHttpsPost(opts, body, cb) {
+  const https = _httpsImpl || require('https');
+  const req = https.request(opts, (res) => {
+    const chunks = [];
+    res.on('data', (c) => chunks.push(c));
+    res.on('end', () => cb(null, res.statusCode, Buffer.concat(chunks).toString('utf8')));
+  });
+  req.on('error', (err) => cb(err));
+  req.write(body);
+  req.end();
+}
+
+// Generate a random opaque state string for CSRF protection on the
+// authorize redirect. 32 bytes of random data, base64url-encoded.
+function generateState() {
+  return crypto.randomBytes(32).toString('base64url');
+}
+
+// Parse a Cookie header into a plain object. No URL-encoding of values
+// beyond the standard decodeURIComponent. Returns {} on missing/empty.
+function parseCookieHeader(header) {
+  const out = {};
+  if (!header || typeof header !== 'string') return out;
+  for (const part of header.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx < 0) continue;
+    const k = part.slice(0, idx).trim();
+    const v = part.slice(idx + 1).trim();
+    if (!k) continue;
+    try { out[k] = decodeURIComponent(v); } catch (_e) { out[k] = v; }
+  }
+  return out;
+}
+
 module.exports = {
   readXsuaaFromVcap,
   getXsuaaConfig,
   verifyXsuaaJwt,
   mapScopesToRole,
   roleFromClaims,
+  buildAuthorizeUrl,
+  exchangeCodeForToken,
+  generateState,
+  parseCookieHeader,
+  _setHttpsForTests,
   // Exported for tests
   KNOWN_ROLES,
   ROLE_PRIORITY

@@ -42,7 +42,11 @@ const {
 const {
   getXsuaaConfig,
   verifyXsuaaJwt,
-  roleFromClaims
+  roleFromClaims,
+  buildAuthorizeUrl,
+  exchangeCodeForToken,
+  generateState,
+  parseCookieHeader
 } = require('./shared/xsuaa.js');
 const {
   getPool,
@@ -554,18 +558,39 @@ async function getAdminTokenNotBefore(conn) {
 // valid JWT signed by the XSUAA verification key, derive the role from
 // the scope claim. Falls through to the legacy SHA-256 token path
 // otherwise, so local dev (no XSUAA bound) keeps working.
+//
+// Also accepts a JWT from the `xsuaa_jwt` cookie — that's what the
+// /oauth/callback endpoint sets after a successful code exchange.
 function tryXsuaaAuth(req) {
+  // 1. Authorization: Bearer <jwt> (API clients)
   const auth = String(req.headers.authorization || '').trim();
-  if (!auth.startsWith('Bearer ')) return null;
-  const token = auth.slice(7).trim();
-  if (!token) return null;
-  const xsuaa = getXsuaaConfig();
-  if (!xsuaa) return null;
-  const claims = verifyXsuaaJwt(token, xsuaa);
-  if (!claims) return null;
-  const role = roleFromClaims(claims);
-  if (!role) return null;
-  return { role, sub: claims.sub || null };
+  if (auth.startsWith('Bearer ')) {
+    const token = auth.slice(7).trim();
+    if (token) {
+      const xsuaa = getXsuaaConfig();
+      if (xsuaa) {
+        const claims = verifyXsuaaJwt(token, xsuaa);
+        if (claims) {
+          const role = roleFromClaims(claims);
+          if (role) return { role, sub: claims.sub || null };
+        }
+      }
+    }
+  }
+  // 2. xsuaa_jwt cookie (browser flow via /oauth/callback)
+  const cookies = parseCookieHeader(req.headers.cookie);
+  const cookieToken = cookies['xsuaa_jwt'];
+  if (cookieToken) {
+    const xsuaa = getXsuaaConfig();
+    if (xsuaa) {
+      const claims = verifyXsuaaJwt(cookieToken, xsuaa);
+      if (claims) {
+        const role = roleFromClaims(claims);
+        if (role) return { role, sub: claims.sub || null };
+      }
+    }
+  }
+  return null;
 }
 
 async function requireAdmin(req, res, next) {
@@ -1893,6 +1918,112 @@ app.post('/api/admin/results/verify-signature', requireAdmin, requirePermission(
   const expected = signPayload(payload);
   res.json({ ok: true, valid: expected === signature, expected });
 });
+
+// ---------------------------------------------------------------------------
+// Auth methods + OAuth 2.0 authorization-code flow
+// ---------------------------------------------------------------------------
+
+// Returns which auth methods the SPA can offer the admin. Public — no
+// credentials are exposed here, just the list of available mechanisms.
+app.get('/api/admin/auth-methods', (_req, res) => {
+  const xsuaa = getXsuaaConfig();
+  const hasPassword = Boolean(ADMIN_HASH || MANAGER_HASH || REVIEWER_HASH || CONTENT_EDITOR_HASH);
+  res.json({
+    password: hasPassword,
+    xsuaa: xsuaa
+      ? {
+          enabled: true,
+          authorizeUrl: '/oauth/login',
+          xsappname: xsuaa.xsappname || null
+        }
+      : { enabled: false }
+  });
+});
+
+// Returns the current admin's identity (or 401 if not authenticated).
+// Useful for the SPA to bootstrap after an OAuth callback that set a
+// cookie — the SPA calls /api/admin/me on page load, and if it returns
+// 200, the admin is signed in.
+app.get('/api/admin/me', (req, res) => {
+  const xsuaaAuth = tryXsuaaAuth(req);
+  if (xsuaaAuth) {
+    return res.json({
+      ok: true,
+      role: xsuaaAuth.role,
+      sub: xsuaaAuth.sub || null,
+      authMethod: 'xsuaa'
+    });
+  }
+  const token = String(req.headers['x-admin-token'] || '').trim();
+  const parsed = parseAdminToken(token);
+  if (parsed) {
+    return res.json({ ok: true, role: parsed.role, sub: null, authMethod: 'token' });
+  }
+  res.status(401).json({ ok: false, error: 'unauthorized' });
+});
+
+// Start the OAuth authorization-code flow. 302s to XSUAA's authorize
+// endpoint with a random opaque state. The state is round-tripped to
+// /oauth/callback to defend against CSRF.
+app.get('/oauth/login', (req, res) => {
+  const xsuaa = getXsuaaConfig();
+  if (!xsuaa) {
+    return res.status(503).json({ error: 'xsuaa_not_bound' });
+  }
+  const state = generateState();
+  const redirectUri = buildOAuthRedirectUri(req);
+  const url = buildAuthorizeUrl(xsuaa, redirectUri, state);
+  // Stash the state in a short-lived cookie so the callback can verify.
+  res.setHeader('Set-Cookie',
+    `xsuaa_state=${encodeURIComponent(state)}; Path=/; Max-Age=600; HttpOnly; SameSite=Lax${req.secure ? '; Secure' : ''}`);
+  res.redirect(302, url);
+});
+
+// XSUAA redirects the user back here with ?code=...&state=...
+// We verify state, exchange the code for an access token, set it in
+// an httpOnly cookie, and redirect to the SPA root.
+app.get('/oauth/callback', async (req, res) => {
+  const xsuaa = getXsuaaConfig();
+  if (!xsuaa) return res.status(503).json({ error: 'xsuaa_not_bound' });
+  const code = String(req.query.code || '');
+  const state = String(req.query.state || '');
+  if (!code) return res.status(400).json({ error: 'missing_code' });
+  const cookies = parseCookieHeader(req.headers.cookie);
+  const expectedState = cookies['xsuaa_state'];
+  if (!expectedState || !state || expectedState !== state) {
+    appLog('warn', 'oauth_state_mismatch', { requestId: req.requestId });
+    return res.status(400).json({ error: 'state_mismatch' });
+  }
+  const redirectUri = buildOAuthRedirectUri(req);
+  const tokenResp = await exchangeCodeForToken(xsuaa, code, redirectUri);
+  if (!tokenResp || !tokenResp.access_token) {
+    appLog('error', 'oauth_token_exchange_failed', { requestId: req.requestId });
+    return res.status(502).json({ error: 'token_exchange_failed' });
+  }
+  // Set the JWT in an httpOnly cookie. Max-Age from the token's
+  // expires_in (default 1h if absent).
+  const maxAge = Math.max(60, Number(tokenResp.expires_in || 3600));
+  const setCookie = [
+    `xsuaa_jwt=${encodeURIComponent(tokenResp.access_token)}`,
+    'Path=/',
+    `Max-Age=${maxAge}`,
+    'HttpOnly',
+    'SameSite=Lax',
+    req.secure ? 'Secure' : ''
+  ].filter(Boolean).join('; ');
+  res.setHeader('Set-Cookie', setCookie);
+  appLog('info', 'oauth_login_success', { requestId: req.requestId });
+  res.redirect(302, '/?auth=ok');
+});
+
+// Build the absolute redirect_uri to send to XSUAA. Must match the one
+// registered in xs-security.json exactly.
+function buildOAuthRedirectUri(req) {
+  // Trust X-Forwarded-Proto / X-Forwarded-Host from CF router.
+  const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
+  const host = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
+  return `${proto}://${host}/oauth/callback`;
+}
 
 app.post('/api/admin/login', (req, res) => {
   if (!ADMIN_HASH && !MANAGER_HASH) return res.status(503).json({ ok: false, error: 'admin_not_configured' });
