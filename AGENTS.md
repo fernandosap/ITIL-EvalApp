@@ -135,6 +135,7 @@ Unique index: `UX_QITEMS_SET_QINDEX` on `QUESTION_SET_QUESTIONS(QUESTION_SET_ID,
 | `EXAM_NAME`, `EXAM_DURATION_SECS`, `EXAM_PASS_PCT`, `EXAM_ACTIVE`, `PROCTOR_ENABLED` | optional | Defaults: 45min, 80%, true, true |
 | `STALE_SESSION_MINUTES` | optional | Default 30. Used by sweeper and admin status. |
 | `AUTO_CLEAR_STALE_SESSIONS`, `STALE_SESSION_SWEEP_MINUTES` | optional | Default true / 10 |
+| `HANA_POOL_SIZE`, `HANA_POOL_PING_CHECK`, `HANA_POOL_TTL_SECONDS` | optional | Defaults 0 / true / 300. When `HANA_POOL_SIZE > 0`, `withDb` uses a pool. See gotcha #3. |
 | `SLOW_QUERY_MS`, `SLOW_REQUEST_MS` | optional | Default 400 / 1200. Logs slow ops. |
 | `STARTUP_STRICT` | optional | `true` in current `.env`. If true, missing required config throws on boot. |
 | `APP_REVISION`, `APP_DEPLOYED_AT` | build | Set by `deploy_btp.sh` from git + date. |
@@ -160,7 +161,7 @@ Reads HANA vars from `.env` or `--env-file`. Sets `APP_REVISION` from `git rev-p
 
 1. **`normalizeExamTitle` and `roleCan` are duplicated** in `server.js` and `client-app.js`. Change in both places. Candidates: extract to a shared file loaded by both.
 2. **Result JSON contains everything**: stem, options, given, expected — per question, per result. NCLOB. With many results, this is the largest table by storage.
-3. **HANA connection is not pooled** — every `withDb(fn)` opens/closes a new connection. Fine for low traffic, may matter at scale.
+3. **HANA connection pool is opt-in via `HANA_POOL_SIZE`** — set to `0` (or unset, default) for the original open/close behavior. When `> 0`, `shared/db-pool.js` lazy-creates a `hana.createPool(connOpts, poolOpts)` and `withDb` acquires from it. **Use the callback form of `pool.getConnection(cb)`** — the sync form throws "maxConnectedOrPool limit has been reached" on burst. When the pool IS exhausted (internal queue depth limit), `withDb` falls back to opening a fresh non-pooled conn so the request still succeeds (logged as `pool_exhausted_fallback`). Speedup observed: cold 157ms → warm 37ms on `/api/health` with `HANA_POOL_SIZE=5`. 100 concurrent on a 5-slot pool = 100/100 OK, max 2.4s.
 4. **`_questionSetCache` is per-process** — if you ever scale to `instances: > 1` in `manifest.yml`, writes from instance A won't invalidate the cache on instance B.
 5. **Anthropic proctoring sends raw webcam JPEGs to Anthropic** — see the [Proctoring data flow](#proctoring-data-flow) section for the full chain. Make sure your data processing agreement covers this. Image is in `image/jpeg` at quality 0.65, dimensions ≤ 320×240, 12s timeout.
 6. **`/api/bootstrap` returns 410** by design. Don't add code that depends on it.
