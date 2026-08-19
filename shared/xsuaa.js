@@ -85,10 +85,25 @@ function verifyXsuaaJwt(token, xsuaa, nowSeconds = Math.floor(Date.now() / 1000)
   // Standard claims checks
   if (typeof payload.exp === 'number' && nowSeconds >= payload.exp) return null;
   if (typeof payload.nbf === 'number' && nowSeconds < payload.nbf) return null;
-  if (xsuaa.xsappname && payload.aud) {
-    // aud can be a string or array; check any match
-    const auds = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
-    if (!auds.includes(xsuaa.xsappname) && !auds.includes('*')) return null;
+  // Audience: REQUIRED (do not accept tokens that omit aud). aud can
+  // be a string or array; we accept any match. The wildcard '*' is
+  // honored for tokens issued by a tenant without an xsappname set
+  // (e.g. a test IdP) but is uncommon in production XSUAA tokens.
+  if (!xsuaa.xsappname) return null;
+  if (!payload.aud) return null;
+  const auds = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
+  if (!auds.includes(xsuaa.xsappname) && !auds.includes('*')) return null;
+  // Issuer: REQUIRED when the XSUAA config exposes one. XSUAA issues
+  // tokens with `iss` set to the tenant URL (e.g.
+  // "https://<tenant>.authentication.us10.hana.ondemand.com"). Without
+  // an explicit iss check, a token signed by some other XSUAA tenant
+  // that happens to share the same xsappname + verification key (e.g.
+  // during a key rotation or in a misconfigured sub-account) would be
+  // accepted. We derive the expected issuer from xsuaa.url.
+  if (xsuaa.url) {
+    const expectedIss = String(xsuaa.url).replace(/\/+$/, '');
+    const iss = String(payload.iss || '').replace(/\/+$/, '');
+    if (!iss || iss !== expectedIss) return null;
   }
   return payload;
 }

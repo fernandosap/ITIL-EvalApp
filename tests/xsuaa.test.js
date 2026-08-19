@@ -223,6 +223,89 @@ test('verifyXsuaaJwt: accepts a token with aud=array including xsappname', () =>
   assert.deepEqual(claims.aud, ['other-app!t1', 'app!t1', 'yet-another']);
 });
 
+test('verifyXsuaaJwt: rejects a token with no aud claim when xsappname is configured', () => {
+  // Defense in depth: a token without aud is ambiguous about who the
+  // audience is. Don't accept it just because the signature is valid.
+  const { publicKey, privateKey } = makeKeyPair();
+  const xsuaa = { verificationkey: publicKey, xsappname: 'app!t1' };
+  const now = Math.floor(Date.now() / 1000);
+  const token = signJwt(privateKey, { exp: now + 3600, scope: 'app!t1.admin' });
+  assert.equal(verifyXsuaaJwt(token, xsuaa, now), null);
+});
+
+test('verifyXsuaaJwt: rejects a token with a non-matching aud', () => {
+  const { publicKey, privateKey } = makeKeyPair();
+  const xsuaa = { verificationkey: publicKey, xsappname: 'app!t1' };
+  const now = Math.floor(Date.now() / 1000);
+  const token = signJwt(privateKey, { exp: now + 3600, aud: 'other-app!t2' });
+  assert.equal(verifyXsuaaJwt(token, xsuaa, now), null);
+});
+
+test('verifyXsuaaJwt: rejects a token with a wrong iss when xsuaa.url is configured', () => {
+  // An XSUAA binding in BTP always exposes `url`; that's the canonical
+  // issuer. A token issued by some other tenant (e.g. a leaked signing
+  // key, or a misconfigured sub-account) MUST be rejected.
+  const { publicKey, privateKey } = makeKeyPair();
+  const xsuaa = {
+    verificationkey: publicKey,
+    xsappname: 'app!t1',
+    url: 'https://sapacademy.authentication.us10.hana.ondemand.com'
+  };
+  const now = Math.floor(Date.now() / 1000);
+  const token = signJwt(privateKey, {
+    iss: 'https://attacker.example.com',
+    aud: 'app!t1',
+    exp: now + 3600
+  });
+  assert.equal(verifyXsuaaJwt(token, xsuaa, now), null);
+});
+
+test('verifyXsuaaJwt: accepts a token with a matching iss (trailing slash tolerated)', () => {
+  const { publicKey, privateKey } = makeKeyPair();
+  const xsuaa = {
+    verificationkey: publicKey,
+    xsappname: 'app!t1',
+    url: 'https://sapacademy.authentication.us10.hana.ondemand.com'
+  };
+  const now = Math.floor(Date.now() / 1000);
+  // Some IdPs include a trailing slash on iss. We strip both sides
+  // before comparing.
+  const token = signJwt(privateKey, {
+    iss: 'https://sapacademy.authentication.us10.hana.ondemand.com/',
+    aud: 'app!t1',
+    exp: now + 3600
+  });
+  const claims = verifyXsuaaJwt(token, xsuaa, now);
+  assert.ok(claims);
+});
+
+test('verifyXsuaaJwt: rejects a token with no iss when xsuaa.url is configured', () => {
+  const { publicKey, privateKey } = makeKeyPair();
+  const xsuaa = {
+    verificationkey: publicKey,
+    xsappname: 'app!t1',
+    url: 'https://sapacademy.authentication.us10.hana.ondemand.com'
+  };
+  const now = Math.floor(Date.now() / 1000);
+  const token = signJwt(privateKey, { aud: 'app!t1', exp: now + 3600 });
+  assert.equal(verifyXsuaaJwt(token, xsuaa, now), null);
+});
+
+test('verifyXsuaaJwt: skips iss check when xsuaa.url is missing (defensive for non-prod IdPs)', () => {
+  // Some test IdPs / local dev setups don't expose `url`. Don't break
+  // those — but DO require aud in that case (the previous default).
+  const { publicKey, privateKey } = makeKeyPair();
+  const xsuaa = { verificationkey: publicKey, xsappname: 'app!t1' };
+  const now = Math.floor(Date.now() / 1000);
+  const token = signJwt(privateKey, {
+    iss: 'https://anywhere.example.com',
+    aud: 'app!t1',
+    exp: now + 3600
+  });
+  const claims = verifyXsuaaJwt(token, xsuaa, now);
+  assert.ok(claims, 'when xsuaa.url is absent, iss is not enforced');
+});
+
 // ---------------------------------------------------------------------------
 // End-to-end: sign with a real key, verify with the public key
 // ---------------------------------------------------------------------------

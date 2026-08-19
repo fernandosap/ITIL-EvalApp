@@ -374,10 +374,17 @@ question set versioning, audit log, and the proctoring endpoint.
 | Stale-session sweeper | ❌ missing | ✅ running every 10 min |
 
 **BTP env vars confirmed after deploy:**
-- HANA: `ITIL_EXAM_ADMIN` / `SAPacademy_ITIL_EXAM_2026!` (separate from DBADMIN used for local dev)
+- HANA: `ITIL_EXAM_ADMIN` (password in BTP credential store, **not committed**)
 - `ADMIN_HASH`, `MANAGER_HASH` set
 - `REVIEWER_HASH`, `CONTENT_EDITOR_HASH` not set (login disabled for those roles)
 - `STARTUP_STRICT=true`, `AUTO_CLEAR_STALE_SESSIONS=true`, `STALE_SESSION_SWEEP_MINUTES=10` (new in this deploy)
+
+> **Note**: an earlier version of this section (commit `b06518d`) included the
+> HANA password in plain text. That commit was already pushed to the public
+> GitHub remote. **The HANA password must be considered compromised and
+> rotated in BTP.** The password was removed from the source on
+> 2026-08-19; historic commits still contain it. See `OPEN_SECRETS.md` for
+> the full incident note.
 - Note: `APP_REVISION` and `APP_DEPLOYED_AT` still show the April values because they are only updated by `deploy_btp.sh`. The live code is the HEAD version.
 
 **Buildpack pin** (added in deploy commit, see git log):

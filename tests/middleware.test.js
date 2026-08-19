@@ -161,16 +161,41 @@ test('requireAdminRole: 403 when role is not admin (admin-only path)', () => {
   m.requireAdminRole('admin')(req, res, () => { nextCalled = true; });
   assert.equal(nextCalled, false);
   assert.equal(res._status, 403);
-  assert.equal(res._body.error, 'admin_role_required');
+  assert.equal(res._body.error, 'role_required');
+  assert.equal(res._body.requiredRole, 'admin');
 });
 
-test('requireAdminRole: non-admin role passes through (only `admin` is strict)', () => {
+test('requireAdminRole: passes through when role matches (e.g. manager path)', () => {
+  // The footgun fix: previously requireAdminRole('manager') was a no-op
+  // for any non-admin role. Now it actually enforces the role match.
   const m = createAuthMiddleware(makeDeps());
   const req = { adminRole: 'manager' };
   const res = makeRes();
   let nextCalled = false;
   m.requireAdminRole('manager')(req, res, () => { nextCalled = true; });
   assert.equal(nextCalled, true);
+});
+
+test('requireAdminRole: 403 when caller is admin but role required is manager', () => {
+  const m = createAuthMiddleware(makeDeps());
+  const req = { adminRole: 'admin' };
+  const res = makeRes();
+  let nextCalled = false;
+  m.requireAdminRole('manager')(req, res, () => { nextCalled = true; });
+  assert.equal(nextCalled, false);
+  assert.equal(res._status, 403);
+  assert.equal(res._body.error, 'role_required');
+  assert.equal(res._body.requiredRole, 'manager');
+});
+
+test('requireAdminRole: 403 when adminRole is missing entirely', () => {
+  const m = createAuthMiddleware(makeDeps());
+  const req = {};
+  const res = makeRes();
+  let nextCalled = false;
+  m.requireAdminRole('admin')(req, res, () => { nextCalled = true; });
+  assert.equal(nextCalled, false);
+  assert.equal(res._status, 403);
 });
 
 test('requirePermission: passes through when role has the permission', () => {
