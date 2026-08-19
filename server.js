@@ -31,6 +31,8 @@ function loadDotEnv(filePath) {
 
 loadDotEnv(path.join(__dirname, '.env'));
 
+const { normalizeExamTitle, hasPermission } = require('./shared/constants.js');
+
 const app = express();
 app.set('trust proxy', 1);
 const PORT = process.env.PORT || 3000;
@@ -376,15 +378,6 @@ function startupSummary() {
   };
 }
 
-function normalizeExamTitle(value) {
-  const text = String(value || '').trim();
-  if (!text) return 'Academy Exam App';
-  if (/^ITIL\b/i.test(text)) return 'Academy Exam App';
-  if (/\bSAP\s+Basis\s+Exam\b/i.test(text)) return 'Academy Exam Platform';
-  if (/\bBasis\s+Exam\b/i.test(text)) return 'Academy Exam Platform';
-  return text;
-}
-
 function getClientIp(req) {
   if (req.ip) return String(req.ip);
   const xfwd = req.headers['x-forwarded-for'];
@@ -557,51 +550,6 @@ function requireAdminRole(role) {
     }
     next();
   };
-}
-
-const ROLE_PERMISSIONS = {
-  admin: new Set(['*']),
-  manager: new Set([
-    'dashboard:read',
-    'codes:read',
-    'codes:generate',
-    'codes:assign',
-    'codes:note',
-    'results:read',
-    'results:export',
-    'analytics:read',
-    'audit:read',
-    'notifications:read',
-    'sessions:read'
-  ]),
-  reviewer: new Set([
-    'dashboard:read',
-    'codes:read',
-    'results:read',
-    'results:export',
-    'analytics:read',
-    'audit:read',
-    'audit:export',
-    'notifications:read',
-    'compliance:read'
-  ]),
-  content_editor: new Set([
-    'dashboard:read',
-    'codes:read',
-    'analytics:read',
-    'notifications:read',
-    'content:read',
-    'content:write',
-    'content:publish',
-    'imports:write',
-    'imports:rollback',
-    'results:export'
-  ])
-};
-
-function hasPermission(role, permission) {
-  const set = ROLE_PERMISSIONS[role] || new Set();
-  return set.has('*') || set.has(permission);
 }
 
 function requirePermission(permission) {
@@ -3639,6 +3587,10 @@ app.get('/client-app.js', (_req, res) => {
   res.type('application/javascript').sendFile(CLIENT_APP_PATH);
 });
 
+app.get('/shared/constants.js', (_req, res) => {
+  res.type('application/javascript').sendFile(path.join(__dirname, 'shared', 'constants.js'));
+});
+
 app.get('/favicon.svg', (_req, res) => {
   res.type('image/svg+xml').sendFile(FAVICON_PATH);
 });
@@ -3650,6 +3602,7 @@ app.get('/', (_req, res) => {
 app.get('*', (req, res, next) => {
   if (req.path.startsWith('/api/')) return next();
   if (req.path === '/client-app.js' && fs.existsSync(CLIENT_APP_PATH)) return res.type('application/javascript').sendFile(CLIENT_APP_PATH);
+  if (req.path === '/shared/constants.js' && fs.existsSync(path.join(__dirname, 'shared', 'constants.js'))) return res.type('application/javascript').sendFile(path.join(__dirname, 'shared', 'constants.js'));
   if (req.path === '/favicon.svg' && fs.existsSync(FAVICON_PATH)) return res.type('image/svg+xml').sendFile(FAVICON_PATH);
   if (fs.existsSync(INDEX_PATH)) return res.sendFile(INDEX_PATH);
   return res.status(404).send('Not found');

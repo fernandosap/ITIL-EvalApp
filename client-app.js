@@ -95,24 +95,13 @@ function brandLockup(title, subtitle = 'Academy assessment workspace') {
     </div>
   </div>`;
 }
+// Shared between server and client; see /shared/constants.js.
+// Local delegates so existing call sites in this file keep working.
 function normalizeExamTitle(value) {
-  const text = String(value || '').trim();
-  if (!text) return 'Academy Exam App';
-  if (/^ITIL\b/i.test(text)) return 'Academy Exam App';
-  if (/\bSAP\s+Basis\s+Exam\b/i.test(text)) return 'Academy Exam Platform';
-  if (/\bBasis\s+Exam\b/i.test(text)) return 'Academy Exam Platform';
-  return text;
+  return window.SharedConstants.normalizeExamTitle(value);
 }
 function roleCan(permission) {
-  const role = String(_adminRole || 'admin');
-  const perms = {
-    admin: ['*'],
-    manager: ['dashboard:read', 'codes:read', 'codes:generate', 'codes:assign', 'codes:note', 'results:read', 'results:export', 'analytics:read', 'audit:read', 'notifications:read', 'sessions:read'],
-    reviewer: ['dashboard:read', 'codes:read', 'results:read', 'results:export', 'analytics:read', 'audit:read', 'audit:export', 'notifications:read', 'compliance:read'],
-    content_editor: ['dashboard:read', 'codes:read', 'analytics:read', 'notifications:read', 'content:read', 'content:write', 'content:publish', 'imports:write', 'imports:rollback', 'results:export']
-  };
-  const set = perms[role] || [];
-  return set.includes('*') || set.includes(permission);
+  return window.SharedConstants.hasPermission(String(_adminRole || 'admin'), permission);
 }
 function pendingKey(code) {
   return `academy_exam_pending_${String(code || '').trim().toUpperCase()}`;
