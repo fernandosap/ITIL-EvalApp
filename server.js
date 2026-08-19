@@ -199,13 +199,29 @@ async function withDb(fn) {
   // open/close a fresh connection per call (original behavior).
   // getPool() is SYNC; acquireConn() is ASYNC (uses the callback form
   // so the pool queues requests when all slots are in use).
+  // Fallback: if the pool is exhausted (e.g. burst load), open a fresh
+  // non-pooled connection instead of failing.
   const pool = getPool();
-  const conn = pool ? await acquireConn(pool) : dbConnect();
+  let conn;
+  let fromPool = false;
+  if (pool) {
+    try {
+      conn = await acquireConn(pool);
+      fromPool = true;
+    } catch (err) {
+      const msg = String((err && err.message) || err);
+      if (!/maxConnectedOrPool/i.test(msg)) throw err;
+      appLog('warn', 'pool_exhausted_fallback', { message: msg });
+      conn = dbConnect();
+    }
+  } else {
+    conn = dbConnect();
+  }
   try {
     await execQuery(conn, `SET SCHEMA "${HANA_SCHEMA}"`);
     return await fn(conn);
   } finally {
-    if (pool) releaseConn(pool, conn);
+    if (fromPool) releaseConn(pool, conn);
     else closeConn(conn);
   }
 }
