@@ -9,6 +9,7 @@
     "check:env": "node scripts/check-env.mjs",
     "test:smoke": "node scripts/smoke-test.mjs",
     "test": "node --test tests/*.test.js",
+    "precommit": "bash .githooks/pre-commit",
     "inspect:hana": "node scripts/inspect-hana.mjs"
   },
   "engines": {
