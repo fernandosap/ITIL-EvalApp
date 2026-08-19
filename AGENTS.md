@@ -208,3 +208,16 @@ Operations executed in prod HANA (`be84eee8-9540-4517-be90-a3267f32084a.hna1.pro
 Use the `scripts/inspect-hana.mjs` tool. It requires DBADMIN creds, runs only
 SELECT statements, and dumps the full schema + aggregates to JSON. Re-run after
 any schema change to detect drift.
+
+```bash
+# Use the .env password (default for local dev)
+npm run inspect:hana
+
+# Override the password (e.g. after a rotation)
+HANA_PASSWORD='<new-password>' npm run inspect:hana
+```
+
+The tool emits JSON with: tables, columns per table, optional-column presence
+checks, row counts, APP_SETTINGS keys, QUESTION_SETS aggregate, EXAM_RESULTS
+aggregate by mode/PASS, ACCESS_CODES by status, EXAM_SESSIONS stale count, and
+ADMIN_AUDIT_LOG by month. Never log or print row-level candidate data.
