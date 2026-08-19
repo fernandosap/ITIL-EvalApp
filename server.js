@@ -3637,7 +3637,10 @@ module.exports = {
   normalizeExamTitle,
   validateQuestionUploadEntries,
   startupSummary,
-  getSweeperStatus
+  getSweeperStatus,
+  signPayload,
+  buildSignedEnvelope,
+  getSigningSecret
 };
 
 if (require.main === module) {

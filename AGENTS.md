@@ -345,7 +345,7 @@ without any extra config.
 ## Open items / TODO
 
 - [x] Investigate stale-session sweeper health → **NOT a code bug, deployment drift.** BTP runs `a0dae34` (2026-03-31) but the sweeper was added in `e843506` (2026-06-06). Fix = deploy HEAD once `HANA_PASSWORD` is rotated in BTP. Also hardened: per-tick log, `GET /api/admin/sweeper-status` endpoint, `isStuck` flag for silent crashes.
-- [ ] Decide on PRACTICE feature scope (0 uses in 242 results)
+- [x] Decide on PRACTICE feature scope (0 uses in 242 results) → **Keep.** The feature is fully implemented (EXAM_MODE column, SHOW_CORRECT_ANSWERS, COUNTS_TOWARD_RESULTS, dedicated UI affordances in `client-app.js`, admin config dialog, results filtering, analytics split). Zero uses means admins haven't created a PRACTICE question set yet, not that the feature is dead. Documented in `client-app.js` (config dialog), `server.js` (config endpoint), and the HANA schema.
 - [ ] Investigate audit log silence in August (likely tied to BTP app health post-password-rotation)
 - [ ] Update BTP env var `HANA_PASSWORD` to match the new prod password (out of scope for this repo)
 - [ ] Consider pooling HANA connections
