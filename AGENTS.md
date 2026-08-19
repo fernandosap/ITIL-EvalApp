@@ -314,6 +314,34 @@ credentials (and the user explicitly excluded password rotation from
 this session), the right approach is to use the values that are already
 working in BTP, not the local dev defaults.
 
+## Authentication
+
+The app supports two admin auth mechanisms. The server picks one based on
+what's configured at startup.
+
+### Mechanism 1: SHA-256 role hashes (default / local dev)
+
+`ADMIN_HASH`, `MANAGER_HASH`, `REVIEWER_HASH`, `CONTENT_EDITOR_HASH` env vars
+each hold a 64-char SHA-256 hex of the role's password. Login at
+`POST /api/admin/login` sends the SHA-256 hash; server compares. Disabled
+when the corresponding env var is empty. This is what runs in local dev
+(no XSUAA bound).
+
+### Mechanism 2: XSUAA OAuth (BTP / prod)
+
+The BTP XSUAA service `itil-evalapp-xsuaa` is bound to the app. The
+config in `xs-security.json` declares 4 scopes
+(`$XSAPPNAME.admin`, `.manager`, `.reviewer`, `.content_editor`) and a
+role template that puts those scopes into the access token. Admin
+endpoints accept a Bearer token (Authorization: Bearer <jwt>); the
+server validates against the XSUAA `verificationkey` from
+`VCAP_SERVICES` and maps the granted scopes to the internal role.
+
+The two mechanisms coexist: if `process.env.VCAP_SERVICES` contains an
+xsuaa binding, the server uses Bearer auth; otherwise it falls back to
+the SHA-256 hash. This means local dev (no XSUAA bound) keeps working
+without any extra config.
+
 ## Open items / TODO
 
 - [x] Investigate stale-session sweeper health → **NOT a code bug, deployment drift.** BTP runs `a0dae34` (2026-03-31) but the sweeper was added in `e843506` (2026-06-06). Fix = deploy HEAD once `HANA_PASSWORD` is rotated in BTP. Also hardened: per-tick log, `GET /api/admin/sweeper-status` endpoint, `isStuck` flag for silent crashes.

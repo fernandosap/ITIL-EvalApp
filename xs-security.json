@@ -1,0 +1,23 @@
+{
+  "xsappname": "academy-cf-cs-itil4-evalapp",
+  "description": "Academy Exam App (ITIL EvalApp) — admin OAuth",
+  "scopeList": [
+    { "name": "$XSAPPNAME.admin", "description": "Full administrative access" },
+    { "name": "$XSAPPNAME.manager", "description": "Code and result management" },
+    { "name": "$XSAPPNAME.reviewer", "description": "Audit and compliance review" },
+    { "name": "$XSAPPNAME.content_editor", "description": "Question bank editing" }
+  ],
+  "roleTemplateList": [
+    {
+      "name": "Token-Attribute",
+      "description": "Scope embedded in the access token",
+      "scopeReferences": ["$XSAPPNAME.admin", "$XSAPPNAME.manager", "$XSAPPNAME.reviewer", "$XSAPPNAME.content_editor"]
+    }
+  ],
+  "oauth2Configuration": {
+    "redirectUris": ["https://academycd-evalapp.cfapps.us10.hana.ondemand.com/oauth/callback"],
+    "tokenValidity": 3600,
+    "refreshTokenValidity": 86400,
+    "grantTypes": ["authorization_code", "client_credentials", "refresh_token"]
+  }
+}
