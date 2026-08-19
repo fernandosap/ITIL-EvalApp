@@ -1,4 +1,13 @@
 // HANA connection pool, opt-in via HANA_POOL_SIZE env var.
+//
+// IMPORTANT — @sap/hana-client pool API is fully synchronous:
+//   const pool    = hana.createPool(connOpts, poolOpts);   // sync, returns ConnectionPool
+//   const conn    = pool.getConnection();                  // sync, returns Connection
+//   conn.disconnect();                                     // returns conn to pool (or closes)
+//
+// There is no `pool.releaseConnection`. The pool reclaims connections
+// when `conn.disconnect()` is called. `pool.clear(fn?)` closes everything.
+//
 // When HANA_POOL_SIZE is unset or 0, callers should fall back to opening
 // a fresh connection per request (the original behavior of withDb()).
 // When HANA_POOL_SIZE > 0, callers can use acquireConn()/releaseConn()
@@ -33,55 +42,56 @@ function readConnConfig(env = process.env) {
 let _pool = null;
 let _poolConfigHash = null;
 
-// Lazy init. Returns a promise that resolves to the pool, or null if
-// pooling is disabled. Re-creates the pool if config has changed since
-// the last call (so changing HANA_POOL_SIZE picks up on next request).
+// Lazy init. Returns a pool, or null if pooling is disabled.
+// Re-creates the pool if config has changed since the last call (so
+// changing HANA_POOL_SIZE picks up on next request).
+//
+// SYNC: @sap/hana-client's createPool is synchronous. The previous
+// implementation wrapped it in a Promise + callback, which hangs forever
+// because the lib never invokes the callback.
 function getPool(env = process.env) {
   const poolOpts = readPoolConfig(env);
-  if (!poolOpts) return Promise.resolve(null);
+  if (!poolOpts) return null;
   const connOpts = readConnConfig(env);
   const configHash = JSON.stringify({ p: poolOpts, c: connOpts });
-  if (_pool && _poolConfigHash === configHash) return Promise.resolve(_pool);
+  if (_pool && _poolConfigHash === configHash) return _pool;
   if (_pool) {
     // Config changed — close old pool, create new one.
     const oldPool = _pool;
     _pool = null;
     _poolConfigHash = null;
-    clearPool(oldPool).catch(() => { /* swallow close errors */ });
+    try { oldPool.clear(); } catch (_e) { /* swallow close errors */ }
   }
-  return new Promise((resolve, reject) => {
-    hana.createPool(Object.assign({}, connOpts, { pool: poolOpts }), (err, pool) => {
-      if (err) return reject(err);
-      _pool = pool;
-      _poolConfigHash = configHash;
-      resolve(pool);
-    });
-  });
+  // SYNC API: createPool(connOpts, poolOpts) returns ConnectionPool directly.
+  _pool = hana.createPool(connOpts, poolOpts);
+  _poolConfigHash = configHash;
+  return _pool;
 }
 
+// SYNC: pool.getConnection() returns Connection directly. May throw if
+// the pool can't allocate (e.g. all conns in use and no waiting slot).
 function acquireConn(pool) {
-  return new Promise((resolve, reject) => {
-    pool.getConnection((err, conn) => err ? reject(err) : resolve(conn));
-  });
+  if (!pool) throw new Error('acquireConn: pool is required');
+  return pool.getConnection();
 }
 
+// SYNC: for pooled connections, disconnect() returns the conn to the
+// pool. For non-pooled connections, disconnect() actually closes the
+// underlying socket. We always call disconnect() because the same call
+// is correct in both cases.
 function releaseConn(pool, conn) {
-  return new Promise((resolve) => {
-    // Per the @sap/hana-client docs: if releaseConnection returns false,
-    // the connection is already broken and will be discarded by the pool.
-    pool.releaseConnection(conn, () => resolve());
-  });
+  if (!conn) return;
+  try { conn.disconnect(); } catch (_e) { /* ignore */ }
 }
 
 function clearPool(pool) {
-  return new Promise((resolve) => {
-    if (!pool || typeof pool.clear !== 'function') return resolve();
-    pool.clear(() => resolve());
-  });
+  if (!pool || typeof pool.clear !== 'function') return;
+  try { pool.clear(); } catch (_e) { /* swallow */ }
 }
 
 // For tests: reset the module-level state so each test starts clean.
 function _resetForTests() {
+  if (_pool) clearPool(_pool);
   _pool = null;
   _poolConfigHash = null;
 }

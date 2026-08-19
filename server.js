@@ -197,16 +197,17 @@ function closeConn(conn) {
 async function withDb(fn) {
   // Opt-in pool: if HANA_POOL_SIZE > 0, acquire from pool. Otherwise,
   // open/close a fresh connection per call (original behavior).
-  const pool = await getPool();
-  const conn = pool
-    ? await acquireConn(pool)
-    : dbConnect();
+  // @sap/hana-client pool API is SYNC: getPool()/acquireConn() return
+  // immediately. releaseConn() / closeConn() are no-ops on async side;
+  // they call conn.disconnect() which the driver handles internally.
+  const pool = getPool();
+  const conn = pool ? acquireConn(pool) : dbConnect();
   try {
     await execQuery(conn, `SET SCHEMA "${HANA_SCHEMA}"`);
     return await fn(conn);
   } finally {
-    if (pool) await releaseConn(pool, conn);
-    else await closeConn(conn);
+    if (pool) releaseConn(pool, conn);
+    else closeConn(conn);
   }
 }
 
