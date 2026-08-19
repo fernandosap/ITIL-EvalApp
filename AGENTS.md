@@ -13,32 +13,72 @@ codes, and review results.
 - **Public hostname** is hard-coded in `manifest.yml` and `deploy_btp.sh` (override via `ROUTE_HOST`)
 - **App name in CF**: `itil4-evalapp`
 - **Production revision pinned in `.env`**: `a0dae34-dirty` (April 11, 2026 — note: `.env` is local dev only; CF env vars are authoritative)
-- **HEAD commit at inspection time**: `e843506` — "feat(app): expand admin workflows and resilient exam flow"
+- **HEAD commit at inspection time**: `651dc02` — "fix(server): serve /client/*.js modules for the refactored SPA"
 
 ## Stack
 
 - Node 20 (engines pinned in `package.json`)
 - Express 4.21
 - `@sap/hana-client` 2.28 (lockfile target 2.25 — minor drift, OK)
-- Vanilla JS frontend (no bundler, no framework) — `client-app.js` is the SPA, served from `index.html`
+- Vanilla JS frontend (no bundler, no framework) — see the
+  `client/` directory for the SPA, served as plain `<script>` tags
+  from `index.html`
 - SAP HANA Cloud, schema `ITIL_EXAM`
 - Anthropic API for proctor image analysis (`claude-sonnet-4-20250514`)
 
 ## File map
 
+### Server + shared (Node)
+
 | File | Lines | Role |
 |---|---:|---|
-| `server.js` | 3,709 | API + admin + HANA queries + token signing + metrics |
-| `client-app.js` | 2,855 | SPA (candidate + admin), HTML rendered via `innerHTML` |
-| `index.html` | 383 | Shell, all CSS inline, hidden Netlify form (legacy, harmless) |
+| `server.js` | ~3,800 | API + admin + HANA queries + token signing + metrics |
+| `shared/constants.js` | 80 | UMD — `normalizeExamTitle` + `ROLE_PERMISSIONS` + `hasPermission` |
+| `shared/scoring.js` | 120 | `makePRNG`, `seededShuffle`, `buildOrdering`, `pickQuestionsForSession`, `gradeExamFromSession` |
+| `shared/xsuaa.js` | ~270 | XSUAA helpers: VCAP parsing, JWT verify (RS256, no `@sap/xssec`), scope→role, `buildAuthorizeUrl`, `exchangeCodeForToken`, `parseCookieHeader` |
+| `shared/db-pool.js` | ~120 | Opt-in HANA connection pool via `HANA_POOL_SIZE` |
+| `index.html` | ~400 | Shell, all CSS inline. Loads `client/*.js` in strict order. |
 | `migrations/*.sql` | 369 total | 7 idempotent migrations, all currently applied in prod |
 | `scripts/check-env.mjs` | 65 | Validates required env vars before deploy |
 | `scripts/smoke-test.mjs` | 299 | Boots server, hits HANA real, exercises admin login + code generation |
-| `deploy_btp.sh` | 278 | `cf push` with env-file + SSO support |
-| `Staticfile` | 87 | CF static buildpack config (gzip on) |
+| `scripts/inspect-hana.mjs` | ~175 | Read-only schema/data dump (overridable via `HANA_PASSWORD=`) |
+| `tests/*.test.js` | ~1,600 | 117 unit tests, runs in ~500ms |
+| `deploy_btp.sh` | 278 | `cf push` with env-file + SSO support (currently bypassed — see Deployment status) |
 | `manifest.yml` | 577 | CF app manifest with `((...))` placeholders for env vars |
 | `favicon.svg` | 26 | Brand mark (blue/teal gradient) |
 | `.cfignore` | 41 | Excludes `.git/`, `.gitignore`, `.DS_Store`, `node_modules/` |
+| `.githooks/pre-commit` | ~90 | Replaces CI: `npm test` + secret scan + `node --check` on every JS file |
+
+### Client SPA (browser)
+
+The SPA is split into 9 modules. Each is a UMD IIFE that attaches to
+`window.IE.<name>`. They share state via `window.S`, `window._adminToken`,
+etc. (declared in `client/state.js`).
+
+| File | Bytes | Role |
+|---|---:|---|
+| `client/util.js` | 8K | Pure DOM/API helpers: `$`, `render`, `modal`, `apiJson`, `_esc`, `fmt`, `_sha256`, `setSavePill`, `normalizeExamTitle`, `roleCan` |
+| `client/state.js` | 8.5K | Globals (`S`, `_adminToken`, `_adminRows`, etc.) + state mutators: `saveProgress`, `queueProgressSave`, `replayPendingActions`, `fetchStatus`, `logIncident`, `isOnline`, `connectivityBanner`, `proctorEnabled` |
+| `client/code-entry.js` | 16K | Pre-exam flow: `showCodeEntry`, `handleCodeSubmit`, `showConsent`, `handleConsentNext`, `showTechCheck`, `reqWebcam`, `reqScreen`, `startExam` |
+| `client/exam.js` | 23K | In-exam: `renderQ`, `goToQ`, `prevQ`, `nextQ`, `pick`, `trySubmit`, `startTimer`, `updateTimer`, `submitExam`, `showResultsFromRecord`, `downloadResultSummary`, `statusChip`. Also registers global keydown/contextmenu/selectstart security listeners. |
+| `client/proctor.js` | 5K | Proctoring: `setupSecurity`, `teardownSecurity`, `onBlur`, `onFocus`, `onVisChange`, `startProctor`, `proctor`, `refreshConnectivityState` |
+| `client/admin-auth.js` | 6K | Login/logout: `showAdminLogin`, `doLogin`, `tryBootstrapFromCookie`, `logoutAdmin`, `revokeAdminSessions` |
+| `client/admin-codes.js` | 44K | Admin dashboard: `showAdmin` (the big one — loads 5 endpoints, renders the full console) + per-row actions (`deleteCode`, `bulkDeleteCodes`, `saveNote`, `resetCode`, `generateCodes`, etc.) + exports (`downloadExport`, `downloadAuditExport`, `downloadSignedResultSummary`) |
+| `client/admin-question-sets.js` | 53K | Exam set management: `createQuestionSet`, `configQuestionSet`, `activateQuestionSet`, `publishQuestionSet`, `archiveQuestionSet`, `deleteQuestionSet`, `exportQuestionSet`, `cloneQuestionSet`, `rollbackImportedSet` + CSV upload (`parseQuestionCsv`, `analyzeQuestionUpload`, `previewUploadedQuestionSet`, `submitUploadedQuestionSet`) + question/section editor (`openQuestionSet`, `showQuestionEditor`, `editSectionPrompt`, etc.) + per-set analytics (`showQuestionSetAnalytics`) |
+| `client/main.js` | 5K | Entry point: re-exports ~60 onclick handlers onto `window.*` and runs `DOMContentLoaded` |
+
+**Load order** (in `index.html`, strict):
+
+```
+shared/constants.js → client/util.js → client/state.js →
+client/code-entry.js → client/exam.js → client/proctor.js →
+client/admin-auth.js → client/admin-codes.js →
+client/admin-question-sets.js → client/main.js
+```
+
+`client/state.js` must run before the others because it defines the
+shared globals. `client/main.js` runs last because it depends on every
+`window.IE.*` namespace being populated.
 
 ## HANA schema (actual, post-migration)
 
@@ -91,7 +131,7 @@ Unique index: `UX_QITEMS_SET_QINDEX` on `QUESTION_SET_QUESTIONS(QUESTION_SET_ID,
 - `POST /api/proctor/check` — send webcam JPEG to Anthropic (rate-limited)
 - `GET /api/health`, `GET /api/status` — public health/config
 - `GET /api/bootstrap` — **410 Gone by design** (intentionally disabled for security)
-- `GET /`, `/client-app.js`, `/favicon.svg` — static shell
+- `GET /`, `/client/*.js`, `/shared/constants.js`, `/favicon.svg` — static shell (regex route on `/^\/client\/[A-Za-z0-9_-]+\.js$/`, with path-traversal check)
 
 ### Admin (4 roles: admin / manager / reviewer / content_editor)
 - `POST /api/admin/login`, `/logout`, `/sessions/revoke-all`
@@ -146,7 +186,7 @@ fallback when XSUAA is not bound.
 ### Common
 
 - **Rate limits**: validate 10/10min/IP, admin login 8/15min/IP, proctor 90/min/code-IP.
-- **Permissions** are per-role, per-action (`codes:read`, `content:write`, etc.). Full list in `ROLE_PERMISSIONS` in `server.js` and mirrored in `roleCan` in `client-app.js`.
+- **Permissions** are per-role, per-action (`codes:read`, `content:write`, etc.). Full list in `ROLE_PERMISSIONS` in `shared/constants.js` (single source of truth, mirrored in `server.js` and `client/util.js`).
 
 ## Env vars
 
@@ -184,7 +224,7 @@ Reads HANA vars from `.env` or `--env-file`. Sets `APP_REVISION` from `git rev-p
 
 ## Gotchas (read these before changing anything)
 
-1. **`normalizeExamTitle` and `roleCan` are duplicated** in `server.js` and `client-app.js`. Change in both places. Candidates: extract to a shared file loaded by both.
+1. **`normalizeExamTitle` and `roleCan` live in `shared/constants.js`** (UMD — used as CommonJS on the server and as `window.SharedConstants` in the browser). `server.js` requires them directly; `client/util.js` defines thin delegates (`function normalizeExamTitle(v) { return window.SharedConstants.normalizeExamTitle(v); }`) so existing call sites keep working. Change in **one place only**: `shared/constants.js`. If you add a new helper, put it there too.
 2. **Result JSON contains everything**: stem, options, given, expected — per question, per result. NCLOB. With many results, this is the largest table by storage.
 3. **HANA connection pool is opt-in via `HANA_POOL_SIZE`** — set to `0` (or unset, default) for the original open/close behavior. When `> 0`, `shared/db-pool.js` lazy-creates a `hana.createPool(connOpts, poolOpts)` and `withDb` acquires from it. **Use the callback form of `pool.getConnection(cb)`** — the sync form throws "maxConnectedOrPool limit has been reached" on burst. When the pool IS exhausted (internal queue depth limit), `withDb` falls back to opening a fresh non-pooled conn so the request still succeeds (logged as `pool_exhausted_fallback`). Speedup observed: cold 157ms → warm 37ms on `/api/health` with `HANA_POOL_SIZE=5`. 100 concurrent on a 5-slot pool = 100/100 OK, max 2.4s.
 4. **`_questionSetCache` is per-process** — if you ever scale to `instances: > 1` in `manifest.yml`, writes from instance A won't invalidate the cache on instance B.
@@ -259,8 +299,8 @@ persisted server-side.
   analysed for proctoring only. No answer key is stored in the browser"
   before enabling monitoring.
 - For a copy of the Anthropic prompt and the exact server code, see
-  `server.js` around line 1586 (`/api/proctor/check`) and `client-app.js`
-  around line 888 (`startProctor`, `proctor`).
+  `server.js` around line 1586 (`/api/proctor/check`) and `client/proctor.js`
+  (`startProctor`, `proctor`).
 
 
 ## Cleanup log (2026-08-18)
@@ -371,13 +411,14 @@ without any extra config.
 ## Open items / TODO
 
 - [x] Investigate stale-session sweeper health → **NOT a code bug, deployment drift.** BTP runs `a0dae34` (2026-03-31) but the sweeper was added in `e843506` (2026-06-06). Fix = deploy HEAD once `HANA_PASSWORD` is rotated in BTP. Also hardened: per-tick log, `GET /api/admin/sweeper-status` endpoint, `isStuck` flag for silent crashes.
-- [x] Decide on PRACTICE feature scope (0 uses in 242 results) → **Keep.** The feature is fully implemented (EXAM_MODE column, SHOW_CORRECT_ANSWERS, COUNTS_TOWARD_RESULTS, dedicated UI affordances in `client-app.js`, admin config dialog, results filtering, analytics split). Zero uses means admins haven't created a PRACTICE question set yet, not that the feature is dead. Documented in `client-app.js` (config dialog), `server.js` (config endpoint), and the HANA schema.
+- [x] Decide on PRACTICE feature scope (0 uses in 242 results) → **Keep.** The feature is fully implemented (EXAM_MODE column, SHOW_CORRECT_ANSWERS, COUNTS_TOWARD_RESULTS, dedicated UI affordances in `client/admin-question-sets.js`, admin config dialog, results filtering, analytics split). Zero uses means admins haven't created a PRACTICE question set yet, not that the feature is dead. Documented in the config dialog (`client/admin-question-sets.js` `configQuestionSet`), the server config endpoint, and the HANA schema.
+- [x] Pool HANA connections → opt-in via `HANA_POOL_SIZE`, see gotcha #3.
+- [x] Dedupe `normalizeExamTitle` and `roleCan` → now in `shared/constants.js` (UMD), used by both server and client. See gotcha #1.
+- [x] Document Anthropic proctoring data flow → see "Proctoring data flow" section above.
 - [ ] Investigate audit log silence in August (likely tied to BTP app health post-password-rotation)
 - [ ] Update BTP env var `HANA_PASSWORD` to match the new prod password (out of scope for this repo)
-- [ ] Consider pooling HANA connections
-- [ ] Consider deduping `normalizeExamTitle` and `roleCan` client/server
-- [ ] Document Anthropic proctoring data flow in this file
 - [ ] Move BTP creds out of `cf set-env` into a credential store (out of scope for this repo)
+- [ ] Convert `onclick="X()"` handlers to `data-action="X"` event delegation (eliminates the `window.X = X` re-export list in `client/main.js`)
 
 ## Inspecting HANA (read-only)
 
