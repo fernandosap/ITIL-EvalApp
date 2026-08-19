@@ -39,6 +39,11 @@ const {
   pickQuestionsForSession,
   gradeExamFromSession
 } = require('./shared/scoring.js');
+const {
+  getXsuaaConfig,
+  verifyXsuaaJwt,
+  roleFromClaims
+} = require('./shared/xsuaa.js');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -518,10 +523,45 @@ async function getAdminTokenNotBefore(conn) {
   return value;
 }
 
+// Try Bearer auth first when XSUAA is bound. If the request carries a
+// valid JWT signed by the XSUAA verification key, derive the role from
+// the scope claim. Falls through to the legacy SHA-256 token path
+// otherwise, so local dev (no XSUAA bound) keeps working.
+function tryXsuaaAuth(req) {
+  const auth = String(req.headers.authorization || '').trim();
+  if (!auth.startsWith('Bearer ')) return null;
+  const token = auth.slice(7).trim();
+  if (!token) return null;
+  const xsuaa = getXsuaaConfig();
+  if (!xsuaa) return null;
+  const claims = verifyXsuaaJwt(token, xsuaa);
+  if (!claims) return null;
+  const role = roleFromClaims(claims);
+  if (!role) return null;
+  return { role, sub: claims.sub || null };
+}
+
 async function requireAdmin(req, res, next) {
+  // XSUAA Bearer token (when VCAP_SERVICES has the xsuaa binding)
+  const xsuaaAuth = tryXsuaaAuth(req);
+  if (xsuaaAuth) {
+    req.adminRole = xsuaaAuth.role;
+    req.adminSubject = xsuaaAuth.sub;
+    req.authMethod = 'xsuaa';
+    return next();
+  }
+
+  // Legacy SHA-256 token path (local dev or until XSUAA is rolled out to all admins)
   const token = String(req.headers['x-admin-token'] || '').trim();
   const parsed = parseAdminToken(token);
-  if (!parsed) return res.status(401).json({ error: 'unauthorized' });
+  if (!parsed) {
+    return res.status(401).json({
+      error: 'unauthorized',
+      hint: getXsuaaConfig()
+        ? 'Provide an Authorization: Bearer <jwt> from the bound XSUAA service.'
+        : 'Provide X-Admin-Token (SHA-256 role token) or bind XSUAA.'
+    });
+  }
   try {
     const revokedBefore = HAS_DB_CONFIG
       ? await withDb(async (conn) => getAdminTokenNotBefore(conn))
@@ -530,6 +570,7 @@ async function requireAdmin(req, res, next) {
       return res.status(401).json({ error: 'session_revoked' });
     }
     req.adminRole = parsed.role;
+    req.authMethod = 'token';
     next();
   } catch (err) {
     appLog('error', 'admin_auth_failed', { requestId: req.requestId, message: err.message });
