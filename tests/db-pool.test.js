@@ -86,12 +86,22 @@ function fakePoolObj(connId = 1) {
     _gets: [],
     clear() { this._cleared = true; }
   };
-  pool.getConnection = function () {
+  // The real @sap/hana-client supports both SYNC and CALLBACK forms of
+  // getConnection. acquireConn uses the callback form so the pool can
+  // queue requests when all slots are in use. The fake below also
+  // supports both forms: a no-arg call returns the conn directly
+  // (legacy behavior — kept for tests that exercise that path), and a
+  // call with a callback invokes the callback on the next tick.
+  pool.getConnection = function (cb) {
     const conn = {
       _id: connId,
       _disconnects: 0,
       disconnect() { this._disconnects += 1; pool._gets.push(this); }
     };
+    if (typeof cb === 'function') {
+      setImmediate(() => cb(null, conn));
+      return;
+    }
     return conn;
   };
   return pool;
@@ -331,13 +341,29 @@ test('getPool: re-creates the pool when HANA_POOL_SIZE changes', () => {
   } finally { restore(); }
 });
 
-test('acquireConn: returns pool.getConnection() result synchronously', () => {
+test('acquireConn: returns a Promise that resolves to pool.getConnection() result', () => {
   const dbPool = loadDbPoolWithFakeHana();
   const pool = fakePoolObj();
-  const conn = dbPool.acquireConn(pool);
-  assert.ok(conn);
-  assert.equal(conn._id, 1);
-  assert.equal(typeof conn.then, 'undefined', 'acquireConn must be SYNC');
+  const result = dbPool.acquireConn(pool);
+  assert.ok(result instanceof Promise, 'acquireConn must return a Promise (queues when full)');
+  return result.then((conn) => {
+    assert.ok(conn);
+    assert.equal(conn._id, 1);
+  });
+});
+
+test('acquireConn: rejects when the pool callback errors (e.g. queue exhausted)', () => {
+  const dbPool = loadDbPoolWithFakeHana();
+  // Pool whose getConnection synchronously invokes the callback with an error.
+  const errPool = {
+    getConnection(cb) { cb(new Error('maxConnectedOrPool limit has been reached')); }
+  };
+  return dbPool.acquireConn(errPool).then(
+    () => { throw new Error('should have rejected'); },
+    (err) => {
+      assert.match(String(err.message), /maxConnectedOrPool/);
+    }
+  );
 });
 
 test('acquireConn: throws when pool is null', () => {

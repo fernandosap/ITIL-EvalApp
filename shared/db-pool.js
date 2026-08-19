@@ -1,8 +1,9 @@
 // HANA connection pool, opt-in via HANA_POOL_SIZE env var.
 //
-// IMPORTANT — @sap/hana-client pool API is fully synchronous:
-//   const pool    = hana.createPool(connOpts, poolOpts);   // sync, returns ConnectionPool
-//   const conn    = pool.getConnection();                  // sync, returns Connection
+// IMPORTANT — @sap/hana-client pool API:
+//   const pool    = hana.createPool(connOpts, poolOpts);   // SYNC, returns ConnectionPool
+//   const conn    = pool.getConnection();                  // SYNC, throws if full
+//   const conn    = pool.getConnection(cb);                // ASYNC, QUEUES if full — preferred
 //   conn.disconnect();                                     // returns conn to pool (or closes)
 //
 // There is no `pool.releaseConnection`. The pool reclaims connections
@@ -12,6 +13,10 @@
 // a fresh connection per request (the original behavior of withDb()).
 // When HANA_POOL_SIZE > 0, callers can use acquireConn()/releaseConn()
 // to reuse a pool of connections.
+//
+// Concurrency: getPool() is sync; acquireConn() is async (uses the
+// callback form so the pool queues requests when all slots are busy,
+// instead of throwing "maxConnectedOrPool limit has been reached").
 'use strict';
 
 const hana = require('@sap/hana-client');
@@ -68,11 +73,19 @@ function getPool(env = process.env) {
   return _pool;
 }
 
-// SYNC: pool.getConnection() returns Connection directly. May throw if
-// the pool can't allocate (e.g. all conns in use and no waiting slot).
+// ASYNC: use the callback form so the pool can queue requests when all
+// slots are in use. The SYNC form `pool.getConnection()` throws
+// "maxConnectedOrPool limit has been reached" under load. The callback
+// form blocks (in event-loop terms) until a slot opens, so a 10-concurrent
+// burst on a 5-slot pool queues instead of 500-ing.
 function acquireConn(pool) {
   if (!pool) throw new Error('acquireConn: pool is required');
-  return pool.getConnection();
+  return new Promise((resolve, reject) => {
+    pool.getConnection((err, conn) => {
+      if (err) return reject(err);
+      resolve(conn);
+    });
+  });
 }
 
 // SYNC: for pooled connections, disconnect() returns the conn to the
