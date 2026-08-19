@@ -32,6 +32,13 @@ function loadDotEnv(filePath) {
 loadDotEnv(path.join(__dirname, '.env'));
 
 const { normalizeExamTitle, hasPermission } = require('./shared/constants.js');
+const {
+  makePRNG,
+  seededShuffle,
+  buildOrdering,
+  pickQuestionsForSession,
+  gradeExamFromSession
+} = require('./shared/scoring.js');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -396,31 +403,6 @@ function getExamTokenSecret() {
       EXAM_NAME || ''
     ].join('|'))
     .digest('hex');
-}
-
-function makePRNG(seed) {
-  let s = 0;
-  for (let i = 0; i < seed.length; i++) s = (Math.imul(s, 31) + seed.charCodeAt(i)) >>> 0;
-  return function prng() {
-    s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
-    return s / 4294967296;
-  };
-}
-
-function seededShuffle(arr, rng) {
-  const out = [...arr];
-  for (let i = out.length - 1; i > 0; i--) {
-    const j = Math.floor(rng() * (i + 1));
-    [out[i], out[j]] = [out[j], out[i]];
-  }
-  return out;
-}
-
-function buildOrdering(questions, code) {
-  const rng = makePRNG(code);
-  const qOrder = seededShuffle(questions.map((_, idx) => idx), rng);
-  const optOrders = qOrder.map((qIdx) => seededShuffle(questions[qIdx].opts.map((_, idx) => idx), rng));
-  return { qOrder, optOrders };
 }
 
 function createExamToken(code, nonce, expiry) {
@@ -1013,57 +995,6 @@ async function cloneQuestionSetWithChildren(conn, sourceId, overrides = {}) {
   return loadQuestionSet(conn, newSetId, { allowEmpty: true });
 }
 
-function pickQuestionsForSession(questionSet, code) {
-  const allQuestions = Array.isArray(questionSet?.questions) ? [...questionSet.questions] : [];
-  if (!allQuestions.length) throw new Error('Question set is empty.');
-
-  const requested = questionSet.numQuestions == null ? allQuestions.length : Number(questionSet.numQuestions);
-  const targetCount = Math.max(1, Math.min(Number.isFinite(requested) ? requested : allQuestions.length, allQuestions.length));
-  if (targetCount >= allQuestions.length) {
-    return allQuestions.sort((a, b) => a.questionIndex - b.questionIndex);
-  }
-
-  const rng = makePRNG(`${code}:${questionSet.id}`);
-  const hasSectionQuotas = allQuestions.some((q) => q.sectionId != null && q.sectionDrawCount != null);
-  if (!hasSectionQuotas) {
-    return seededShuffle(allQuestions, rng)
-      .slice(0, targetCount)
-      .sort((a, b) => a.questionIndex - b.questionIndex);
-  }
-
-  const chosen = [];
-  const used = new Set();
-  const bySection = new Map();
-
-  for (const question of allQuestions) {
-    const key = question.sectionId == null ? '__unsectioned__' : String(question.sectionId);
-    if (!bySection.has(key)) bySection.set(key, []);
-    bySection.get(key).push(question);
-  }
-
-  for (const [key, items] of bySection.entries()) {
-    const quota = key === '__unsectioned__' ? null : items[0].sectionDrawCount;
-    if (quota == null) continue;
-    const pickCount = Math.max(0, Math.min(Number(quota) || 0, items.length, targetCount - chosen.length));
-    const sample = seededShuffle(items, rng).slice(0, pickCount);
-    for (const q of sample) {
-      chosen.push(q);
-      used.add(q.questionId);
-    }
-    if (chosen.length >= targetCount) break;
-  }
-
-  if (chosen.length < targetCount) {
-    const remaining = allQuestions.filter((q) => !used.has(q.questionId));
-    const fill = seededShuffle(remaining, rng).slice(0, targetCount - chosen.length);
-    chosen.push(...fill);
-  }
-
-  return chosen
-    .slice(0, targetCount)
-    .sort((a, b) => a.questionIndex - b.questionIndex);
-}
-
 function buildExamConfigForSet(questionSet, totalOverride = null, examEnabled = EXAM_ACTIVE) {
   const total = totalOverride == null
     ? (questionSet.numQuestions == null ? Number(questionSet.totalQuestions || 0) : Math.min(Number(questionSet.numQuestions || 0), Number(questionSet.totalQuestions || 0)))
@@ -1456,79 +1387,6 @@ async function updateCodeStatus(conn, code, status, result = null) {
       WHERE ACCESS_CODE = ?`,
     [status, summary.score, summary.pct, summary.pass, code]
   );
-}
-
-function gradeExamFromSession(session, answers) {
-  const answerKey = Array.isArray(session.answerKey) ? session.answerKey : [];
-  let score = 0;
-  const questionResults = [];
-  const sectionMap = new Map();
-
-  session.qOrder.forEach((questionIdx, displayIdx) => {
-    const displaySelection = Array.isArray(answers[displayIdx]) ? answers[displayIdx].map(Number) : [];
-    const optionOrder = session.optOrders[displayIdx];
-    const originalSelection = displaySelection
-      .filter((idx) => Number.isInteger(idx) && idx >= 0 && idx < optionOrder.length)
-      .map((idx) => optionOrder[idx])
-      .sort((a, b) => a - b);
-    const expected = (answerKey[questionIdx] || []).slice().sort((a, b) => a - b);
-    const correct = originalSelection.join(',') === expected.join(',');
-    if (correct) score += 1;
-    const question = session.questions?.[questionIdx];
-    const displayOptions = Array.isArray(optionOrder)
-      ? optionOrder.map((idx) => String(question?.opts?.[idx] || ''))
-      : (question?.opts || []).map((opt) => String(opt));
-    const toDisplayIndexes = (originalIndexes) => originalIndexes
-      .map((originalIdx) => optionOrder.findIndex((idx) => idx === originalIdx))
-      .filter((idx) => idx >= 0)
-      .sort((a, b) => a - b);
-    questionResults.push({
-      displayIdx,
-      questionIndex: question?.questionIndex ?? questionIdx,
-      questionId: question?.questionId ?? null,
-      correct,
-      given: originalSelection,
-      expected,
-      givenDisplay: toDisplayIndexes(originalSelection),
-      expectedDisplay: toDisplayIndexes(expected),
-      stem: question?.stem || '',
-      note: question?.note || null,
-      opts: Array.isArray(question?.opts) ? question.opts.map((opt) => String(opt)) : [],
-      displayOptions,
-      multi: Boolean(question?.multi),
-      sectionId: question?.sectionId ?? null,
-      sectionName: question?.sectionName || ''
-    });
-    if (question?.sectionId != null) {
-      const key = String(question.sectionId);
-      if (!sectionMap.has(key)) {
-        sectionMap.set(key, {
-          sectionId: question.sectionId,
-          name: question.sectionName || 'Section',
-          displayOrder: Number(question.sectionOrder || 0),
-          correct: 0,
-          total: 0
-        });
-      }
-      const section = sectionMap.get(key);
-      section.total += 1;
-      if (correct) section.correct += 1;
-    }
-  });
-
-  const total = Number(session.total || session.questions?.length || 0);
-  const pct = Math.round((score / total) * 100);
-  const pass = pct >= Number(session.passPct || 80);
-  const sectionResults = [...sectionMap.values()]
-    .sort((a, b) => a.displayOrder - b.displayOrder)
-    .map((section) => ({
-      sectionId: section.sectionId,
-      name: section.name,
-      correct: section.correct,
-      total: section.total,
-      pct: section.total ? Math.round((section.correct / section.total) * 100) : 0
-    }));
-  return { score, total, pct, pass, questionResults, sectionResults };
 }
 
 app.post('/api/proctor/check', requireExamSession, async (req, res) => {
