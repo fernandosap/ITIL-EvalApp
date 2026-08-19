@@ -754,7 +754,7 @@ async function getExamEnabled(conn) {
 }
 
 function normalizeQuestionSetRow(row) {
-  const examMode = String(row.EXAM_MODE || 'GRADED').toUpperCase() === 'PRACTICE' ? 'PRACTICE' : 'GRADED';
+  const examMode = String(row.EXAM_MODE || EXAM_MODE.GRADED).toUpperCase() === EXAM_MODE.PRACTICE ? EXAM_MODE.PRACTICE : EXAM_MODE.GRADED;
   return {
     id: Number(row.QUESTION_SET_ID),
     name: normalizeExamTitle(row.NAME || 'Exam'),
@@ -764,12 +764,12 @@ function normalizeQuestionSetRow(row) {
     passPct: Number(row.PASS_PCT || 80),
     proctorEnabled: row.PROCTOR_ENABLED == null ? true : Boolean(row.PROCTOR_ENABLED),
     examMode,
-    showCorrectAnswers: row.SHOW_CORRECT_ANSWERS == null ? examMode === 'PRACTICE' : Boolean(row.SHOW_CORRECT_ANSWERS),
-    countsTowardResults: row.COUNTS_TOWARD_RESULTS == null ? examMode !== 'PRACTICE' : Boolean(row.COUNTS_TOWARD_RESULTS),
+    showCorrectAnswers: row.SHOW_CORRECT_ANSWERS == null ? examMode === EXAM_MODE.PRACTICE : Boolean(row.SHOW_CORRECT_ANSWERS),
+    countsTowardResults: row.COUNTS_TOWARD_RESULTS == null ? examMode !== EXAM_MODE.PRACTICE : Boolean(row.COUNTS_TOWARD_RESULTS),
     numQuestions: row.NUM_QUESTIONS == null ? null : Number(row.NUM_QUESTIONS),
     versionGroupId: row.VERSION_GROUP_ID == null ? Number(row.QUESTION_SET_ID) : Number(row.VERSION_GROUP_ID),
     versionNumber: row.VERSION_NUMBER == null ? 1 : Number(row.VERSION_NUMBER),
-    lifecycleStatus: String(row.LIFECYCLE_STATUS || 'PUBLISHED').toUpperCase(),
+    lifecycleStatus: String(row.LIFECYCLE_STATUS || QUESTION_SET_LIFECYCLE.PUBLISHED).toUpperCase(),
     parentQuestionSetId: row.PARENT_QUESTION_SET_ID == null ? null : Number(row.PARENT_QUESTION_SET_ID),
     importSource: row.IMPORT_SOURCE || '',
     createdAt: row.CREATED_AT ? new Date(row.CREATED_AT).toISOString() : null,
@@ -783,13 +783,13 @@ async function getQuestionSetRows(conn, options = {}) {
   const hasVersionColumns = await hasQuestionSetVersionColumns(conn);
   const modeSelect = hasModeColumns
     ? 'qs.EXAM_MODE, qs.SHOW_CORRECT_ANSWERS, qs.COUNTS_TOWARD_RESULTS,'
-    : `'GRADED' AS EXAM_MODE, FALSE AS SHOW_CORRECT_ANSWERS, TRUE AS COUNTS_TOWARD_RESULTS,`;
+    : `'${EXAM_MODE.GRADED}' AS EXAM_MODE, FALSE AS SHOW_CORRECT_ANSWERS, TRUE AS COUNTS_TOWARD_RESULTS,`;
   const modeGroup = hasModeColumns
     ? 'qs.EXAM_MODE, qs.SHOW_CORRECT_ANSWERS, qs.COUNTS_TOWARD_RESULTS,'
     : '';
   const modeSelectPlain = hasModeColumns
     ? 'EXAM_MODE, SHOW_CORRECT_ANSWERS, COUNTS_TOWARD_RESULTS,'
-    : `'GRADED' AS EXAM_MODE, FALSE AS SHOW_CORRECT_ANSWERS, TRUE AS COUNTS_TOWARD_RESULTS,`;
+    : `'${EXAM_MODE.GRADED}' AS EXAM_MODE, FALSE AS SHOW_CORRECT_ANSWERS, TRUE AS COUNTS_TOWARD_RESULTS,`;
   const versionSelect = hasVersionColumns
     ? 'qs.VERSION_GROUP_ID, qs.VERSION_NUMBER, qs.LIFECYCLE_STATUS, qs.PARENT_QUESTION_SET_ID, qs.IMPORT_SOURCE,'
     : 'qs.QUESTION_SET_ID AS VERSION_GROUP_ID, 1 AS VERSION_NUMBER, \'PUBLISHED\' AS LIFECYCLE_STATUS, NULL AS PARENT_QUESTION_SET_ID, NULL AS IMPORT_SOURCE,';
@@ -835,7 +835,7 @@ async function getActiveQuestionSetRow(conn) {
   const hasVersionColumns = await hasQuestionSetVersionColumns(conn);
   const modeSelect = hasModeColumns
     ? 'EXAM_MODE, SHOW_CORRECT_ANSWERS, COUNTS_TOWARD_RESULTS,'
-    : `'GRADED' AS EXAM_MODE, FALSE AS SHOW_CORRECT_ANSWERS, TRUE AS COUNTS_TOWARD_RESULTS,`;
+    : `'${EXAM_MODE.GRADED}' AS EXAM_MODE, FALSE AS SHOW_CORRECT_ANSWERS, TRUE AS COUNTS_TOWARD_RESULTS,`;
   const versionSelect = hasVersionColumns
     ? 'VERSION_GROUP_ID, VERSION_NUMBER, LIFECYCLE_STATUS, PARENT_QUESTION_SET_ID, IMPORT_SOURCE,'
     : 'QUESTION_SET_ID AS VERSION_GROUP_ID, 1 AS VERSION_NUMBER, \'PUBLISHED\' AS LIFECYCLE_STATUS, NULL AS PARENT_QUESTION_SET_ID, NULL AS IMPORT_SOURCE,';
@@ -887,7 +887,7 @@ async function loadQuestionSet(conn, questionSetId, options = {}) {
   const hasVersionColumns = await hasQuestionSetVersionColumns(conn);
   const modeSelect = hasModeColumns
     ? 'EXAM_MODE, SHOW_CORRECT_ANSWERS, COUNTS_TOWARD_RESULTS,'
-    : `'GRADED' AS EXAM_MODE, FALSE AS SHOW_CORRECT_ANSWERS, TRUE AS COUNTS_TOWARD_RESULTS,`;
+    : `'${EXAM_MODE.GRADED}' AS EXAM_MODE, FALSE AS SHOW_CORRECT_ANSWERS, TRUE AS COUNTS_TOWARD_RESULTS,`;
   const versionSelect = hasVersionColumns
     ? 'VERSION_GROUP_ID, VERSION_NUMBER, LIFECYCLE_STATUS, PARENT_QUESTION_SET_ID, IMPORT_SOURCE,'
     : 'QUESTION_SET_ID AS VERSION_GROUP_ID, 1 AS VERSION_NUMBER, \'PUBLISHED\' AS LIFECYCLE_STATUS, NULL AS PARENT_QUESTION_SET_ID, NULL AS IMPORT_SOURCE,';
@@ -1001,13 +1001,13 @@ async function cloneQuestionSetWithChildren(conn, sourceId, overrides = {}) {
         source.durationMinutes || 45,
         source.passPct || 80,
         source.proctorEnabled !== false ? 1 : 0,
-        source.examMode || 'GRADED',
+        source.examMode || EXAM_MODE.GRADED,
         source.showCorrectAnswers === true ? 1 : 0,
         source.countsTowardResults !== false ? 1 : 0,
         source.numQuestions,
         source.versionGroupId || source.id,
         nextVersion,
-        String(overrides.lifecycleStatus || 'DRAFT').toUpperCase(),
+        String(overrides.lifecycleStatus || QUESTION_SET_LIFECYCLE.DRAFT).toUpperCase(),
         source.id,
         overrides.importSource || source.importSource || null
       ]
@@ -1024,7 +1024,7 @@ async function cloneQuestionSetWithChildren(conn, sourceId, overrides = {}) {
         source.durationMinutes || 45,
         source.passPct || 80,
         source.proctorEnabled !== false ? 1 : 0,
-        source.examMode || 'GRADED',
+        source.examMode || EXAM_MODE.GRADED,
         source.showCorrectAnswers === true ? 1 : 0,
         source.countsTowardResults !== false ? 1 : 0,
         source.numQuestions
@@ -1084,8 +1084,8 @@ function buildExamConfigForSet(questionSet, totalOverride = null, examEnabled = 
     passScore: Math.ceil(total * passPct / 100),
     total,
     proctorEnabled: questionSet.proctorEnabled !== false,
-    examMode: questionSet.examMode || 'GRADED',
-    isPractice: questionSet.examMode === 'PRACTICE',
+    examMode: questionSet.examMode || EXAM_MODE.GRADED,
+    isPractice: questionSet.examMode === EXAM_MODE.PRACTICE,
     showCorrectAnswers: questionSet.showCorrectAnswers === true,
     countsTowardResults: questionSet.countsTowardResults !== false
   };
@@ -1373,7 +1373,7 @@ async function getResultRecord(conn, code) {
 
 function sanitizeCandidateResult(result) {
   if (!result || typeof result !== 'object') return result;
-  const isPractice = result.examMode === 'PRACTICE' || result.isPractice === true;
+  const isPractice = result.examMode === EXAM_MODE.PRACTICE || result.isPractice === true;
   const showCorrectAnswers = isPractice && result.showCorrectAnswers === true;
   const safe = {
     ...result,
@@ -1780,8 +1780,8 @@ app.post('/api/submit', requireExamSession, async (req, res) => {
       code,
       questionSetId: session.questionSetId,
       questionSetName: session.questionSetName,
-      examMode: session.examMode || 'GRADED',
-      isPractice: session.examMode === 'PRACTICE',
+      examMode: session.examMode || EXAM_MODE.GRADED,
+      isPractice: session.examMode === EXAM_MODE.PRACTICE,
       showCorrectAnswers: session.showCorrectAnswers === true,
       countsTowardResults: session.countsTowardResults !== false,
       score: result.score,
@@ -1837,7 +1837,7 @@ app.get('/api/admin/results/:code/signed-summary', requireAdmin, requirePermissi
         code,
         questionSetId: result.questionSetId ?? null,
         questionSetName: normalizeExamTitle(result.questionSetName || ''),
-        examMode: result.examMode || 'GRADED',
+        examMode: result.examMode || EXAM_MODE.GRADED,
         score: result.score ?? null,
         total: result.total ?? null,
         pct: result.pct ?? null,
@@ -2112,7 +2112,7 @@ app.get('/api/admin/codes', requireAdmin, requirePermission('codes:read'), async
         questionSetName: normalizeExamTitle(r.QUESTION_SET_NAME || ''),
         questionSetActive: r.QUESTION_SET_ACTIVE == null ? false : Boolean(r.QUESTION_SET_ACTIVE),
         examMode: parsedResult?.examMode || '',
-        isPractice: parsedResult?.examMode === 'PRACTICE' || parsedResult?.isPractice === true,
+        isPractice: parsedResult?.examMode === EXAM_MODE.PRACTICE || parsedResult?.isPractice === true,
         countsTowardResults
       };
     });
@@ -2400,7 +2400,7 @@ app.get('/api/admin/question-sets/:id/analytics', requireAdmin, async (req, res)
             pct: Number.isFinite(pct) ? pct : null,
             pass: row.PASS == null ? Boolean(result.pass) : Boolean(row.PASS),
             durationSecs: Number.isFinite(durationSecs) ? durationSecs : null,
-            examMode: result.examMode || questionSet.examMode || 'GRADED',
+            examMode: result.examMode || questionSet.examMode || EXAM_MODE.GRADED,
             questionResults: Array.isArray(result.questionResults) ? result.questionResults : [],
             sectionResults: Array.isArray(result.sectionResults) ? result.sectionResults : [],
             submittedAt: row.SUBMITTED_AT ? new Date(row.SUBMITTED_AT).toISOString() : result.submittedAt || null
@@ -2470,14 +2470,14 @@ app.get('/api/admin/question-sets/:id/analytics', requireAdmin, async (req, res)
           id: questionSet.id,
           name: questionSet.name,
           examMode: questionSet.examMode,
-          isPractice: questionSet.examMode === 'PRACTICE',
+          isPractice: questionSet.examMode === EXAM_MODE.PRACTICE,
           questionCount: questionSet.totalQuestions
         },
         summary: {
           attempts: attempts.length,
           completed: completed.length,
-          gradedAttempts: attempts.filter((item) => item.examMode !== 'PRACTICE').length,
-          practiceAttempts: attempts.filter((item) => item.examMode === 'PRACTICE').length,
+          gradedAttempts: attempts.filter((item) => item.examMode !== EXAM_MODE.PRACTICE).length,
+          practiceAttempts: attempts.filter((item) => item.examMode === EXAM_MODE.PRACTICE).length,
           averageScore: completed.length ? Number((completed.reduce((sum, item) => sum + item.score, 0) / completed.length).toFixed(1)) : null,
           averagePct: avg(pctValues),
           passRate: completed.length ? Math.round((completed.filter((item) => item.pass).length / completed.length) * 100) : null,
@@ -2533,7 +2533,7 @@ app.get('/api/admin/analytics/overview', requireAdmin, requirePermission('analyt
           total: Number(row.TOTAL ?? result.total ?? 0),
           pass: row.PASS == null ? Boolean(result.pass) : Boolean(row.PASS),
           durationSecs: Number(row.DURATION_SECS ?? result.durationSecs ?? 0),
-          examMode: result.examMode || 'GRADED',
+          examMode: result.examMode || EXAM_MODE.GRADED,
           sectionResults: Array.isArray(result.sectionResults) ? result.sectionResults : [],
           submittedAt: row.SUBMITTED_AT ? new Date(row.SUBMITTED_AT).toISOString() : null
         };
@@ -2929,7 +2929,7 @@ app.post('/api/admin/question-sets/:id/clone', requireAdmin, requirePermission('
     const cloned = await withDb(async (conn) => {
       const questionSet = await cloneQuestionSetWithChildren(conn, id, {
         name: req.body?.name,
-        lifecycleStatus: 'DRAFT',
+        lifecycleStatus: QUESTION_SET_LIFECYCLE.DRAFT,
         importSource: 'clone'
       });
       await writeAdminAudit(conn, {
@@ -2957,7 +2957,7 @@ app.post('/api/admin/question-sets/:id/publish', requireAdmin, requirePermission
         await execQuery(
           conn,
           `UPDATE QUESTION_SETS
-              SET LIFECYCLE_STATUS = CASE WHEN QUESTION_SET_ID = ? THEN 'PUBLISHED' ELSE CASE WHEN VERSION_GROUP_ID = ? THEN 'ARCHIVED' ELSE LIFECYCLE_STATUS END END,
+              SET LIFECYCLE_STATUS = CASE WHEN QUESTION_SET_ID = ? THEN '${QUESTION_SET_LIFECYCLE.PUBLISHED}' ELSE CASE WHEN VERSION_GROUP_ID = ? THEN '${QUESTION_SET_LIFECYCLE.ARCHIVED}' ELSE LIFECYCLE_STATUS END END,
                   UPDATED_AT = CURRENT_UTCTIMESTAMP
             WHERE QUESTION_SET_ID = ? OR VERSION_GROUP_ID = ?`,
           [id, groupId, id, groupId]
@@ -2985,7 +2985,7 @@ app.post('/api/admin/question-sets/:id/archive', requireAdmin, requirePermission
       if (!rows.length) throw new Error('question_set_not_found');
       if (Boolean(rows[0].IS_ACTIVE)) throw new Error('cannot_archive_active_set');
       if (await hasQuestionSetVersionColumns(conn)) {
-        await execQuery(conn, `UPDATE QUESTION_SETS SET LIFECYCLE_STATUS = 'ARCHIVED', UPDATED_AT = CURRENT_UTCTIMESTAMP WHERE QUESTION_SET_ID = ?`, [id]);
+        await execQuery(conn, `UPDATE QUESTION_SETS SET LIFECYCLE_STATUS = '${QUESTION_SET_LIFECYCLE.ARCHIVED}', UPDATED_AT = CURRENT_UTCTIMESTAMP WHERE QUESTION_SET_ID = ?`, [id]);
       }
       await writeAdminAudit(conn, {
         action: 'admin_question_set_archived',
@@ -3031,7 +3031,7 @@ app.post('/api/admin/question-sets', requireAdmin, requirePermission('content:wr
           conn,
           `INSERT INTO QUESTION_SETS
             (NAME, DESCRIPTION, IS_ACTIVE, DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, EXAM_MODE, SHOW_CORRECT_ANSWERS, COUNTS_TOWARD_RESULTS, NUM_QUESTIONS, VERSION_GROUP_ID, VERSION_NUMBER, LIFECYCLE_STATUS, PARENT_QUESTION_SET_ID, IMPORT_SOURCE, CREATED_AT, UPDATED_AT)
-           VALUES (?, ?, FALSE, 45, 80, TRUE, 'GRADED', FALSE, TRUE, NULL, NULL, 1, 'DRAFT', NULL, 'manual', CURRENT_UTCTIMESTAMP, CURRENT_UTCTIMESTAMP)`,
+           VALUES (?, ?, FALSE, 45, 80, TRUE, '${EXAM_MODE.GRADED}', FALSE, TRUE, NULL, NULL, 1, '${QUESTION_SET_LIFECYCLE.DRAFT}', NULL, 'manual', CURRENT_UTCTIMESTAMP, CURRENT_UTCTIMESTAMP)`,
           [name, description || null]
         );
       } else {
@@ -3079,9 +3079,9 @@ app.post('/api/admin/question-sets/:id/config', requireAdmin, requirePermission(
   const durationMinutes = Math.max(1, Math.min(Number(req.body?.durationMinutes) || 45, 240));
   const passPct = Math.max(1, Math.min(Number(req.body?.passPct) || 80, 100));
   const proctorEnabled = req.body?.proctorEnabled !== false;
-  const examMode = String(req.body?.examMode || 'GRADED').toUpperCase() === 'PRACTICE' ? 'PRACTICE' : 'GRADED';
-  const showCorrectAnswers = examMode === 'PRACTICE' && req.body?.showCorrectAnswers !== false;
-  const countsTowardResults = examMode === 'PRACTICE' ? false : req.body?.countsTowardResults !== false;
+  const examMode = String(req.body?.examMode || EXAM_MODE.GRADED).toUpperCase() === EXAM_MODE.PRACTICE ? EXAM_MODE.PRACTICE : EXAM_MODE.GRADED;
+  const showCorrectAnswers = examMode === EXAM_MODE.PRACTICE && req.body?.showCorrectAnswers !== false;
+  const countsTowardResults = examMode === EXAM_MODE.PRACTICE ? false : req.body?.countsTowardResults !== false;
   const numQuestionsRaw = req.body?.numQuestions;
   const numQuestions = numQuestionsRaw == null || numQuestionsRaw === '' ? null : Math.max(1, Number(numQuestionsRaw));
   if (!name) return res.status(400).json({ error: 'name_required' });
@@ -3156,7 +3156,7 @@ app.post('/api/admin/question-sets/:id/activate', requireAdmin, requirePermissio
         await execQuery(
           conn,
           `UPDATE QUESTION_SETS
-              SET LIFECYCLE_STATUS = CASE WHEN QUESTION_SET_ID = ? THEN 'PUBLISHED' WHEN VERSION_GROUP_ID = ? THEN 'ARCHIVED' ELSE LIFECYCLE_STATUS END,
+              SET LIFECYCLE_STATUS = CASE WHEN QUESTION_SET_ID = ? THEN '${QUESTION_SET_LIFECYCLE.PUBLISHED}' WHEN VERSION_GROUP_ID = ? THEN '${QUESTION_SET_LIFECYCLE.ARCHIVED}' ELSE LIFECYCLE_STATUS END,
                   UPDATED_AT = CURRENT_UTCTIMESTAMP
             WHERE QUESTION_SET_ID = ? OR VERSION_GROUP_ID = ?`,
           [id, versionGroupId, id, versionGroupId]
@@ -3485,7 +3485,7 @@ app.post('/api/admin/question-sets/upload', requireAdmin, requirePermission('imp
           conn,
           `INSERT INTO QUESTION_SETS
             (NAME, DESCRIPTION, IS_ACTIVE, DURATION_MINUTES, PASS_PCT, PROCTOR_ENABLED, EXAM_MODE, SHOW_CORRECT_ANSWERS, COUNTS_TOWARD_RESULTS, NUM_QUESTIONS, VERSION_GROUP_ID, VERSION_NUMBER, LIFECYCLE_STATUS, PARENT_QUESTION_SET_ID, IMPORT_SOURCE, CREATED_AT, UPDATED_AT)
-           VALUES (?, ?, FALSE, 45, 80, TRUE, 'GRADED', FALSE, TRUE, NULL, NULL, 1, 'DRAFT', NULL, 'csv_upload', CURRENT_UTCTIMESTAMP, CURRENT_UTCTIMESTAMP)`,
+           VALUES (?, ?, FALSE, 45, 80, TRUE, '${EXAM_MODE.GRADED}', FALSE, TRUE, NULL, NULL, 1, '${QUESTION_SET_LIFECYCLE.DRAFT}', NULL, 'csv_upload', CURRENT_UTCTIMESTAMP, CURRENT_UTCTIMESTAMP)`,
           [name, description || null]
         );
       } else {
@@ -3594,10 +3594,10 @@ app.get('/api/admin/export.csv', requireAdmin, requirePermission('results:export
         clauses.push('c.STATUS = ?');
         params.push(statusFilter);
       }
-      if (modeFilter === 'PRACTICE') {
-        clauses.push(`COALESCE(JSON_VALUE(r.RESULT_JSON, '$.examMode'), 'GRADED') = 'PRACTICE'`);
-      } else if (modeFilter === 'GRADED') {
-        clauses.push(`COALESCE(JSON_VALUE(r.RESULT_JSON, '$.examMode'), 'GRADED') = 'GRADED'`);
+      if (modeFilter === EXAM_MODE.PRACTICE) {
+        clauses.push(`COALESCE(JSON_VALUE(r.RESULT_JSON, '$.examMode'), '${EXAM_MODE.GRADED}') = '${EXAM_MODE.PRACTICE}'`);
+      } else if (modeFilter === EXAM_MODE.GRADED) {
+        clauses.push(`COALESCE(JSON_VALUE(r.RESULT_JSON, '$.examMode'), '${EXAM_MODE.GRADED}') = '${EXAM_MODE.GRADED}'`);
       }
       if (dateFrom) {
         clauses.push('r.SUBMITTED_AT >= ?');
@@ -3625,7 +3625,7 @@ app.get('/api/admin/export.csv', requireAdmin, requirePermission('results:export
     for (const r of rows) {
       const parsedResult = parseJsonOrNull(r.RESULT_JSON);
       const countsTowardResults = parsedResult?.countsTowardResults !== false;
-      const mode = parsedResult?.examMode === 'PRACTICE' ? 'Practice' : 'Graded';
+      const mode = parsedResult?.examMode === EXAM_MODE.PRACTICE ? 'Practice' : 'Graded';
       const resultLabel = !countsTowardResults || r.PASS === null || r.PASS === undefined ? '' : (r.PASS ? 'PASS' : 'FAIL');
       const duration = r.DURATION_SECS == null ? '' : `${Math.floor(r.DURATION_SECS / 60)}m ${String(r.DURATION_SECS % 60).padStart(2, '0')}s`;
       lines.push([
