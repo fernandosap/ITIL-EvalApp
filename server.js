@@ -329,16 +329,23 @@ function getSigningKeyMap() {
   return signing.getSigningContext().keyMap;
 }
 
-// Runtime: sign a raw payload (HMAC of payload only — used for
-// legacy "just-the-payload" signing paths and ad-hoc signatures).
-// Delegates to the cached context so the operator's warnings fire
-// exactly once, not per request.
+// Runtime: HMAC of payload only (v1 format). Used for the legacy
+// /verify-signature endpoint contract `{ payload, signature }`,
+// which predates the v2 envelope format. The result is a raw
+// hex string, NOT an envelope.
+//
+// Why keep this even though we're on v2 now: callers built
+// against the old endpoint expect a payload-only HMAC, and the
+// /verify-signature handler still receives `{ payload, signature }`
+// pairs (no envelope). Removing signPayload would break that
+// compat path; the dedicated signLegacyPayload() method on the
+// context makes the intent explicit.
 function signPayload(payload) {
-  return signing.getSigningContext().sign(payload).signature;
+  return signing.getSigningContext().signLegacyPayload(payload);
 }
 
 // Runtime: build a v2 signed envelope. Delegates to the cached
-// context.
+// context. This is the primary signer — use it for new code.
 function buildSignedEnvelopeLocal(payload) {
   return signing.getSigningContext().sign(payload);
 }

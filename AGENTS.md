@@ -252,8 +252,8 @@ fallback when XSUAA is not bound.
 ### ⚠️ Password handling (current state)
 
 - The `.env` file in this repo is **stale** (the original `DBADMIN_DEV_PASSWORD` value, last deploy April 11). The literal value is not reproduced here — refer to `OPEN_SECRETS.md` for context.
-- HANA's DBADMIN password was rotated on 2026-08-18. The new password is held by the operator (not committed in this repo).
-- The **live BTP app's `HANA_PASSWORD` env var is now mismatched** and the app is in a degraded state until `cf set-env` is run.
+- HANA's local-dev DBADMIN password was rotated on 2026-08-18 (separate from the production BTP `ITIL_EXAM_ADMIN` user). The new dev password is held by the operator (not committed in this repo).
+- The production BTP `ITIL_EXAM_ADMIN` user password was also rotated on 2026-08-18 and the new value is held by the operator in the BTP credential store.
 - **Out of scope for this project to touch**: BTP env var updates, secret rotation policy, credential store migration.
 
 ## Deploy
