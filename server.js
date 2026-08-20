@@ -1962,9 +1962,16 @@ app.post('/api/admin/results/verify-signature', requireAdmin, requirePermission(
   const payload = body.payload;
   const signature = String(body.signature || '');
   if (!payload || !signature) return res.status(400).json({ error: 'payload_and_signature_required' });
-  // Legacy shape: just check the current key.
-  const expected = signPayload(payload);
-  res.json({ ok: true, valid: expected === signature, matchedKid: getSigningKeyMap().current });
+  // Legacy shape: try the FULL key ring (current → previous →
+  // legacy) so historical raw signatures still verify across
+  // key rotation. Re-signing with the current key alone would
+  // break historical signatures after a rotation.
+  const matched = verifyLegacyPayload(payload, signature, getSigningKeyMap());
+  res.json({
+    ok: true,
+    valid: matched !== null,
+    matchedKid: matched ? matched.kid : null
+  });
 });
 
 // ---------------------------------------------------------------------------

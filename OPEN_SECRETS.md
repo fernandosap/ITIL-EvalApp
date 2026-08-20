@@ -41,38 +41,15 @@ Format:
   commit `13e156b` and removed again in the follow-up; the historic
   commit still contains it.
 - **Public?**: yes (the GitHub repo is public)
-- **Status**: open — **the secret must be rotated in BTP ASAP**
-- **Action for the operator**:
-  1. **Rotate the password in BTP first.** In SAP BTP Cockpit →
-     HANA Cloud → your instance → "Reset Administrator Password"
-     for the `ITIL_EXAM_ADMIN` user. Pick a new strong password
-     and store it in the BTP credential store (NOT a new
-     `cf set-env` plain-text value).
-  2. Verify the new password works by hitting
-     `https://academycd-evalapp.cfapps.us10.hana.ondemand.com/api/health`
-     after the rotation propagates (~30s typically).
-  3. **Investigate potential compromise via the HANA audit trail,
-     not via `cf logs`.** The leaked credential is a direct HANA
-     user, not an application-layer one. `cf logs itil4-evalapp`
-     shows app-layer traffic and would not capture a direct HANA
-     connection. The relevant investigation surface is the HANA
-     Cloud audit log for the `ITIL_EXAM_ADMIN` user:
-       - SAP BTP Cockpit → HANA Cloud → your instance → "Audit
-         Trail" / "Security" tab.
+- **Status**: rotated — **`HANA_ITIL_EXAM_ADMIN_PASSWORD` was rotated in BTP on 2026-08-18** (per operator confirmation). The new value is held by the operator in the BTP credential store. The literal value of the OLD password still exists in commit `b06518d` (and briefly in `13e156b`) but has no operational value going forward.
+- **Remaining work** (post-rotation, in priority order):
+  1. **Audit the leak window.** Investigate the HANA Cloud audit trail for `ITIL_EXAM_ADMIN` connections between 2026-08-18 (the leak) and the rotation time. Look for connection attempts from non-CF source IPs. The CF egress IP range is documented; everything else is suspect. (This is the actual remaining operational work — the rotation itself is done.)
+       - SAP BTP Cockpit → HANA Cloud → your instance → "Audit Trail" / "Security" tab.
        - Or: connect as DBADMIN and query
          `SELECT * FROM SYS.AUDIT_LOG WHERE USER_NAME = 'ITIL_EXAM_ADMIN'
          AND EVENT_TIMESTAMP > '2026-08-18' ORDER BY EVENT_TIMESTAMP DESC;`
-       - Look for connection attempts from non-CF source IPs in
-         the window between 2026-08-18 (the leak) and the rotation
-         time. The CF egress IP range is documented; everything
-         else is suspect.
-  4. **Optional but low priority: rewrite git history.** Once the
-     secret is rotated, the literal value has no operational value,
-     so the urgency drops. If you want full hygiene later, use
-     `git filter-repo --invert-paths --path AGENTS.md` (or
-     `git filter-repo --replace-text expressions.txt` with the
-     secret in `expressions.txt`) + force-push. Coordinate before
-     doing it because changing commit SHAs breaks any clone/fork.
+  2. **Optional but low priority: rewrite git history.** The old secret is rotated, so urgency is gone. If you want full hygiene later, use `git filter-repo --invert-paths --path AGENTS.md` (or `git filter-repo --replace-text expressions.txt` with the secret in `expressions.txt`) + force-push. Coordinate before doing it because changing commit SHAs breaks any clone/fork.
+  3. **Optional: enable branch protection on `main`** (GitHub-side, Settings → Branches → main → Require PR + disallow force push). The pre-commit secret scanner caught the re-introduction in `13e156b` immediately; a server-side gate is a second line of defense.
 - **Mitigation in code**:
   - The offending line was removed from `AGENTS.md` on 2026-08-19
     (commit `13e156b`).
