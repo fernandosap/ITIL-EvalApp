@@ -294,32 +294,67 @@ function getLegacySigningSecret() {
 
 // Versioned signing key map.
 //
-// Env vars (in priority order):
-//   RESULT_SIGNING_KEY          — required for new envelopes. 32+ chars.
-//   RESULT_SIGNING_KEY_PREVIOUS — optional, for rotation. 32+ chars.
+// Env vars:
+//   RESULT_SIGNING_KEY_ID         — stable identifier for the active key
+//                                   (e.g. "v2", "prod-2026-08"). 1-64 chars.
+//   RESULT_SIGNING_KEY            — the active secret (32+ chars).
+//   RESULT_SIGNING_KEY_PREVIOUS_ID  — stable identifier for the previous
+//                                     key (optional, for rotation).
+//   RESULT_SIGNING_KEY_PREVIOUS     — the previous secret (optional).
 //
 // The shape returned matches what lib/responses.js's
 // buildSignedEnvelope / verifySignedEnvelope expect:
-//   { current: 'v1', keys: { v1: '...', v2: '...', legacy: '...' } }
+//   { current: '<id>', keys: { <id>: '...', <prevId>: '...', legacy: '...' } }
 //
-// If RESULT_SIGNING_KEY is not set, falls back to the legacy
-// derived secret under the 'legacy' kid (so old deploys without
-// the new env var keep working). A warning is logged.
+// CRITICAL: key IDs are STABLE across rotations. The current key
+// might be `v2` after a rotation, but the previous key is still
+// `v1` — never re-assigned. This is what makes rotation work: an
+// envelope signed with `kid=v1` will keep verifying after the
+// operator promotes a new key, as long as the previous key + its
+// id are still configured.
+//
+// If only RESULT_SIGNING_KEY_ID/KEY is set (no previous), only one
+// kid is active. If neither is set, the app falls back to the
+// legacy derived secret under the 'legacy' kid (a warning is
+// logged) — this is for backward compatibility with envelopes
+// signed before the versioned key system was introduced.
 function getSigningKeyMap() {
   const keys = {};
-  const current = process.env.RESULT_SIGNING_KEY || '';
-  const previous = process.env.RESULT_SIGNING_KEY_PREVIOUS || '';
-  if (current) keys.v1 = String(current);
-  if (previous) keys.v2 = String(previous);
-  keys.legacy = getLegacySigningSecret();
-  // Decide the primary for new signs. If RESULT_SIGNING_KEY is set,
-  // use it; otherwise fall back to legacy (with a warning).
-  if (current) {
-    return { current: 'v1', keys };
+  const currentId = (process.env.RESULT_SIGNING_KEY_ID || '').trim();
+  const currentSecret = process.env.RESULT_SIGNING_KEY || '';
+  const previousId = (process.env.RESULT_SIGNING_KEY_PREVIOUS_ID || '').trim();
+  const previousSecret = process.env.RESULT_SIGNING_KEY_PREVIOUS || '';
+  if (currentId) {
+    if (!currentSecret) {
+      appLog('warn', 'result_signing_key_id_without_secret', {
+        hint: `RESULT_SIGNING_KEY_ID is set (${currentId}) but RESULT_SIGNING_KEY is empty. Ignoring the id.`
+      });
+    } else {
+      keys[currentId] = String(currentSecret);
+    }
   }
-  appLog('warn', 'result_signing_key_missing', {
-    hint: 'RESULT_SIGNING_KEY env var is not set. Falling back to legacy derived secret. New envelopes will use kid=legacy.'
-  });
+  if (previousId) {
+    if (!previousSecret) {
+      appLog('warn', 'result_signing_key_previous_id_without_secret', {
+        hint: `RESULT_SIGNING_KEY_PREVIOUS_ID is set (${previousId}) but RESULT_SIGNING_KEY_PREVIOUS is empty. Ignoring the id.`
+      });
+    } else {
+      keys[previousId] = String(previousSecret);
+    }
+  }
+  keys.legacy = getLegacySigningSecret();
+  if (currentId && currentSecret) {
+    return { current: currentId, keys };
+  }
+  if (currentSecret && !currentId) {
+    appLog('warn', 'result_signing_key_id_missing', {
+      hint: 'RESULT_SIGNING_KEY is set but RESULT_SIGNING_KEY_ID is not. Cannot determine a stable kid. Falling back to legacy.'
+    });
+  } else if (!currentSecret) {
+    appLog('warn', 'result_signing_key_missing', {
+      hint: 'RESULT_SIGNING_KEY env var is not set. Falling back to legacy derived secret. New envelopes will use kid=legacy.'
+    });
+  }
   return { current: 'legacy', keys };
 }
 

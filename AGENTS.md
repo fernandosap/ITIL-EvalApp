@@ -240,8 +240,10 @@ fallback when XSUAA is not bound.
 | `STALE_SESSION_MINUTES` | optional | Default 30. Used by sweeper and admin status. |
 | `AUTO_CLEAR_STALE_SESSIONS`, `STALE_SESSION_SWEEP_MINUTES` | optional | Default true / 10 |
 | `HANA_POOL_SIZE`, `HANA_POOL_PING_CHECK`, `HANA_POOL_TTL_SECONDS` | optional | Defaults 0 / true / 300. When `HANA_POOL_SIZE > 0`, `withDb` uses a pool. See gotcha #3. |
-| `RESULT_SIGNING_KEY` | recommended | 32+ char secret for new signed result summaries. When set, new envelopes use `kid=v1`. When unset, falls back to the legacy derived secret (logs a warning). |
-| `RESULT_SIGNING_KEY_PREVIOUS` | optional | Previous key during rotation. Envelopes signed with `kid=v2` keep verifying. |
+| `RESULT_SIGNING_KEY_ID` | recommended (with `RESULT_SIGNING_KEY`) | Stable identifier for the active signing key (e.g. `"v2"`, `"prod-2026-08"`). 1-64 chars. The value of this env var is what shows up in the `kid` field of every new signed envelope. **Do not change it during a rotation** — pick a new value for the new key instead. |
+| `RESULT_SIGNING_KEY` | recommended | 32+ char secret for the active signing key. When set with `RESULT_SIGNING_KEY_ID`, new envelopes use that kid. When unset, falls back to the legacy derived secret (logs a warning). |
+| `RESULT_SIGNING_KEY_PREVIOUS_ID` | optional | Stable identifier for the previous signing key during rotation. Must keep the SAME value the previous deployment used for that key. |
+| `RESULT_SIGNING_KEY_PREVIOUS` | optional | Previous secret. Kept during rotation so old envelopes still verify. |
 | `SLOW_QUERY_MS`, `SLOW_REQUEST_MS` | optional | Default 400 / 1200. Logs slow ops. |
 | `STARTUP_STRICT` | optional | `true` in current `.env`. If true, missing required config throws on boot. |
 | `APP_REVISION`, `APP_DEPLOYED_AT` | build | Set by `deploy_btp.sh` from git + date. |
@@ -282,7 +284,11 @@ Reads HANA vars from `.env` or `--env-file`. Sets `APP_REVISION` from `git rev-p
 15. **`/api/admin/me` is the canonical role probe** for the client. It works for any role (admin, manager, reviewer, content_editor) because it doesn't require a specific permission, only valid auth. Don't fall back to reading `data.role` from `/api/admin/codes` for the cookie-based XSUAA flow — codes requires `codes:read` which reviewers don't have.
 16. **`lib/audit.js` is a self-contained module** that owns the audit log + its metrics. Server.js just calls `tryWriteAdminAudit()` and exposes `audit.getMetrics()` in `/api/admin/metrics`. The metrics track `attempts / writes / skippedNoTable / skippedNoDb / failures / lastFailureAt / lastFailureMessage / auditTablePresent` so a quietly broken audit log (table dropped, HANA outage) is visible in metrics instead of being silently swallowed.
 17. **String literals for roles / code statuses / lifecycle / exam modes / audit actions** are in `shared/constants.js` (`ROLES`, `CODE_STATUS`, `QUESTION_SET_LIFECYCLE`, `EXAM_MODE`, `AUDIT_ACTION`). Use the constants, not raw strings — `grep " 'admin'"` should ideally be empty in the codebase.
-18. **Result-signing key is now versioned** — `getSigningKeyMap()` returns `{ current, keys: { v1, v2, legacy } }`. New envelopes carry a `kid`. To rotate, set `RESULT_SIGNING_KEY` (new) and `RESULT_SIGNING_KEY_PREVIOUS` (old) — both kids verify. Without `RESULT_SIGNING_KEY` set, the app falls back to the legacy derived secret and logs a warning. Historical envelopes (no `kid`) still verify via the `legacy` slot.
+18. **Result-signing key is now versioned with STABLE key IDs** — `getSigningKeyMap()` returns `{ current, keys }` where `current` is the operator-supplied `RESULT_SIGNING_KEY_ID` (e.g. `"v2"`) and `keys` is a map of `{ <id>: <secret>, ..., legacy: <derived> }`. **Key IDs are stable across rotations** — pick a new id for a new key, never re-use an old id for a new secret. The kid field on every envelope is the id, and the verifier looks up `keys[envelope.kid]`. Rotation procedure:
+    1. Deploy 1: set `RESULT_SIGNING_KEY_ID=v1`, `RESULT_SIGNING_KEY=<secret1>`. New envelopes get `kid=v1`.
+    2. Rotate: set `RESULT_SIGNING_KEY_ID=v2`, `RESULT_SIGNING_KEY=<secret2>`, `RESULT_SIGNING_KEY_PREVIOUS_ID=v1`, `RESULT_SIGNING_KEY_PREVIOUS=<secret1>`. New envelopes get `kid=v2`; old envelopes (`kid=v1`) still verify because `keys["v1"]` still points to `<secret1>`.
+    3. Drop the old key: remove the `*_PREVIOUS*` env vars. `keys["v1"]` is gone; old `kid=v1` envelopes now fail.
+    The earlier implementation hard-coded `current → v1` and `previous → v2`, which broke rotation in the same way. The fix and the e2e test are in `tests/signing-key-rotation.test.js`.
 
 ## HANA findings (Fase 0, 2026-08-18)
 
@@ -552,6 +558,7 @@ another origin).
 - [ ] Sweeper end-to-end test (real HANA stale session cleared by sweeper) — deferred to next session, requires CI infra.
 - [ ] JSDOM-light tests for client renderers (`renderQ`, `showAdmin`, `showResultsFromRecord`) — deferred, no test deps added.
 - [ ] Route split (deferred — multi-day effort, deserves its own session).
+- [ ] **Branch protection on `main`** (operator action, GitHub-side): after the secret-leak incident in commit `b06518d`, the next operator should enable at least "Require pull request before merging" + "Do not allow force pushes" on `main` (Settings → Branches → main → Branch protection rules). The pre-commit hook catches secrets locally, but a server-side gate is the second line of defense. GitHub also offers free secret scanning + push protection for public repos — worth turning on. The repo is currently `protected: false` (`gh api repos/fernandosap/ITIL-EvalApp/branches/main/protection` returns 404).
 
 ## Open security debt
 
@@ -572,14 +579,17 @@ HANA audit trail (NOT `cf logs`) for any connections from
 non-CF source IPs in the window between 2026-08-18 and the
 rotation time.
 
-### 2. Migrate to Node 22 LTS + cflinuxfs5 ✅ DONE (commit `28c77f5`)
+### 2. Migrate to Node 22 LTS ✅ DONE (commit `28c77f5`); cflinuxfs5 ⏳ PENDING
 
 Node 22 LTS (`22.22.2`) is now live in BTP. `engines.node` is
 `22.x`, buildpack pin is `nodejs_buildpack#v1.9.2` (which
-removes EOL Node 20 and ships 22.22.2). The buildpack is still
-on `cflinuxfs4`; the cflinuxfs5 default kicks in Feb 2027 per
-SAP, so we'll do that migration as a separate commit when the
-timing is right (not urgent yet).
+removes EOL Node 20 and ships 22.22.2). **The buildpack is
+still on `cflinuxfs4`**; the cflinuxfs5 default kicks in
+Feb 2027 per SAP. The stack migration is a separate piece of
+work — needs a newer buildpack that supports cflinuxfs5 (not
+yet in the v1.9.x line as of this writing) and a `cf push
+--stack cflinuxfs5` re-deploy. Will revisit when SAP publishes
+a cflinuxfs5-capable buildpack version.
 
 ### 3. HANA TLS certificate validation ✅ DONE (commit `9bdfe27`)
 
@@ -590,19 +600,23 @@ Node's default trust store, so no `sslTrustStore` is needed.
 `/api/health` returns 200 with `db: connected` end-to-end
 through the validated TLS connection.
 
-### 4. Versioned result-signing key ✅ DONE (commit pending)
+### 4. Versioned result-signing key ✅ DONE (commit `5014841`, **hardened** in current commit)
 
-`getSigningKeyMap()` returns a keyMap with `current` + `keys`
-shape. The envelope format now includes `kid`. New envelopes
-use the `current` kid; the verifier tries the envelope's kid
-first, then falls back to `legacy` (the old derived secret)
-for backwards compatibility with envelopes signed before this
-commit. Operators can rotate by setting `RESULT_SIGNING_KEY`
-(new) and `RESULT_SIGNING_KEY_PREVIOUS` (old) — both kids
-verify in the transition window. The fallback-to-legacy
-warning is logged at boot if `RESULT_SIGNING_KEY` is not set,
-so a future operator notices. The new env vars are documented
-in the env-var table above.
+`getSigningKeyMap()` returns `{ current, keys }` where `current`
+is the operator-supplied `RESULT_SIGNING_KEY_ID` and `keys`
+maps each id to its secret. **Key IDs are stable across
+rotations** — pick a new id for a new key, never re-use an
+old id for a new secret (the earlier `current → v1` /
+`previous → v2` design was buggy and is documented in gotcha
+#18). Envelope format includes `kid`; the verifier looks up
+`keys[envelope.kid]`. Without any `RESULT_SIGNING_KEY*` env
+vars set, the app falls back to the legacy derived secret
+under the `legacy` kid and logs a warning at boot. Rotation
+procedure and env-var names are documented in the env-var
+table above and in gotcha #18. The `tests/signing-key-rotation.test.js`
+e2e test simulates two deployments via real env-var changes
+and verifies that an envelope signed in deploy-1 still
+verifies in deploy-2.
 
 ### 5. Replace custom XSUAA JWT verifier with `@sap/xssec` — Investigated, deferred (P2)
 
