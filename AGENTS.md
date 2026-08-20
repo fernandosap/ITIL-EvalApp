@@ -604,17 +604,59 @@ warning is logged at boot if `RESULT_SIGNING_KEY` is not set,
 so a future operator notices. The new env vars are documented
 in the env-var table above.
 
-### 5. Replace custom XSUAA JWT verifier with `@sap/xssec` (P2)
+### 5. Replace custom XSUAA JWT verifier with `@sap/xssec` — Investigated, deferred (P2)
 
-The current verifier in `shared/xsuaa.js` is ~270 LOC of
-hand-rolled RS256 + `exp` / `nbf` / `aud` / `iss` / scope checks.
-SAP's `@sap/xssec` is the supported library for this and tracks
-XSUAA protocol changes (new claims, rotation semantics, etc.) for
-us. Migration is straightforward: add the dep, replace
-`verifyXsuaaJwt()` with the xssec equivalent, keep the same
-return shape, and update the 44 unit tests. Carrying a
-custom verifier in a production codebase is risk that grows
-over time as XSUAA evolves.
+**Status**: investigated 2026-08-19, **not migrated**.
+
+**Reason**: `@sap/xssec` 4.x is designed around `createSecurityContext`
+which always goes through an HTTP call to the XSUAA JWKS endpoint
+(`<xsuaa-url>/token_keys`) to look up the signing key by the JWT
+header's `kid`. That model assumes tokens are issued by the real
+XSUAA service and discoverable via JWKS. Our current verifier
+in `shared/xsuaa.js` validates the signature directly against the
+`verificationkey` from the service binding, which is a different
+operating model (offline, no JWKS roundtrip, works with any RS256
+token whose signing key we know).
+
+Trying to swap to xssec:
+- Breaks the 44 existing `tests/xsuaa.test.js` (they generate
+  local RSA-2048 keypairs, sign with them, and pass the public
+  key as `verificationkey`. xssec's `createSecurityContext`
+  refuses these because the `kid` is not in a JWKS it can fetch).
+- Adds operational coupling: every running instance now needs
+  network access to the XSUAA `/token_keys` endpoint to validate
+  a single token. That endpoint is sometimes behind the same
+  auth boundary the token itself is trying to satisfy, creating
+  a chicken-and-egg problem during a misconfiguration.
+- Adds 2 transitive deps (`debug`, `jwt-decode`) for a feature
+  we already have.
+
+**Functional parity** between our custom verifier and xssec:
+- ✅ RS256 signature (both)
+- ✅ `exp` / `nbf` (both — we just added explicit `nbf` handling
+  in commit `f1f4b34`/the session before; xssec always handled it)
+- ✅ `aud` matching the binding's `xsappname` (both, required
+  in our verifier since session hardening)
+- ✅ `iss` matching the binding's tenant URL (both, optional
+  in xssec but enforced by us)
+- ❌ Proof token validation (xssec only, not used by us)
+- ❌ JWKS-based key rotation (xssec only, our `verificationkey`
+  is static for the lifetime of the binding)
+
+**When this becomes worth re-evaluating**:
+- XSUAA rolls out a token-format change we don't know about (e.g.
+  a new mandatory claim or a new `alg`). xssec would track it;
+  our custom verifier would silently reject everything.
+- We need proof-token validation (currently not used; would
+  matter if XSUAA started emitting proof tokens by default).
+- The XSUAA service starts refusing tokens that don't go through
+  JWKS lookup (currently it doesn't, but this is SAP's direction).
+
+Until one of those triggers, the custom verifier is a smaller
+attack surface than the official lib for our specific use case
+(single tenant, static verification key, no proof tokens). If
+you need to revisit, the investigation notes above should make
+the migration plan clear.
 
 ## Inspecting HANA (read-only)
 
