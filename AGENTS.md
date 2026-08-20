@@ -284,11 +284,19 @@ Reads HANA vars from `.env` or `--env-file`. Sets `APP_REVISION` from `git rev-p
 15. **`/api/admin/me` is the canonical role probe** for the client. It works for any role (admin, manager, reviewer, content_editor) because it doesn't require a specific permission, only valid auth. Don't fall back to reading `data.role` from `/api/admin/codes` for the cookie-based XSUAA flow — codes requires `codes:read` which reviewers don't have.
 16. **`lib/audit.js` is a self-contained module** that owns the audit log + its metrics. Server.js just calls `tryWriteAdminAudit()` and exposes `audit.getMetrics()` in `/api/admin/metrics`. The metrics track `attempts / writes / skippedNoTable / skippedNoDb / failures / lastFailureAt / lastFailureMessage / auditTablePresent` so a quietly broken audit log (table dropped, HANA outage) is visible in metrics instead of being silently swallowed.
 17. **String literals for roles / code statuses / lifecycle / exam modes / audit actions** are in `shared/constants.js` (`ROLES`, `CODE_STATUS`, `QUESTION_SET_LIFECYCLE`, `EXAM_MODE`, `AUDIT_ACTION`). Use the constants, not raw strings — `grep " 'admin'"` should ideally be empty in the codebase.
-18. **Result-signing key is now versioned with STABLE key IDs** — `getSigningKeyMap()` returns `{ current, keys }` where `current` is the operator-supplied `RESULT_SIGNING_KEY_ID` (e.g. `"v2"`) and `keys` is a map of `{ <id>: <secret>, ..., legacy: <derived> }`. **Key IDs are stable across rotations** — pick a new id for a new key, never re-use an old id for a new secret. The kid field on every envelope is the id, and the verifier looks up `keys[envelope.kid]`. Rotation procedure:
+18. **Result-signing key is now versioned with STABLE key IDs** — `getSigningKeyMap()` returns `{ current, keys }` where `current` is the operator-supplied `RESULT_SIGNING_KEY_ID` (e.g. `"v2"`) and `keys` is a null-prototype object `{ <id>: <secret>, ..., legacy: <derived> }`. **Key IDs are stable across rotations** — pick a new id for a new key, never re-use an old id for a new secret. The kid field on every envelope is the id, and the verifier looks up `keys[envelope.kid]`. Rotation procedure:
     1. Deploy 1: set `RESULT_SIGNING_KEY_ID=v1`, `RESULT_SIGNING_KEY=<secret1>`. New envelopes get `kid=v1`.
     2. Rotate: set `RESULT_SIGNING_KEY_ID=v2`, `RESULT_SIGNING_KEY=<secret2>`, `RESULT_SIGNING_KEY_PREVIOUS_ID=v1`, `RESULT_SIGNING_KEY_PREVIOUS=<secret1>`. New envelopes get `kid=v2`; old envelopes (`kid=v1`) still verify because `keys["v1"]` still points to `<secret1>`.
     3. Drop the old key: remove the `*_PREVIOUS*` env vars. `keys["v1"]` is gone; old `kid=v1` envelopes now fail.
-    The earlier implementation hard-coded `current → v1` and `previous → v2`, which broke rotation in the same way. The fix and the e2e test are in `tests/signing-key-rotation.test.js`.
+
+    **Validation rules** (applied every call; hard-fail on boot in `STARTUP_STRICT` mode if the operator has set invalid config):
+    - `kid` must match `/^[A-Za-z0-9._-]{1,64}$/`. No whitespace, no slashes, no NUL.
+    - `legacy` is reserved — operators may NOT use it as `RESULT_SIGNING_KEY_ID` (the slot is always populated by the derived secret, so a user-set `"legacy"` would be silently overwritten).
+    - `RESULT_SIGNING_KEY_ID` and `RESULT_SIGNING_KEY_PREVIOUS_ID` must differ (otherwise `keys["v2"]` would be silently overwritten by the previous secret).
+    - Secrets must be ≥ 32 chars. Generate with `crypto.randomBytes(32).toString('base64')` for ~44 chars.
+    - ID and secret must be set together (id without secret, or secret without id, is a typo and is rejected).
+
+    The earlier implementation hard-coded `current → v1` and `previous → v2`, which broke rotation. The fix and the e2e tests are in `tests/signing-key-rotation.test.js` (9 hardening tests in addition to the 6 rotation tests).
 
 ## HANA findings (Fase 0, 2026-08-18)
 
@@ -600,23 +608,37 @@ Node's default trust store, so no `sslTrustStore` is needed.
 `/api/health` returns 200 with `db: connected` end-to-end
 through the validated TLS connection.
 
-### 4. Versioned result-signing key ✅ DONE (commit `5014841`, **hardened** in current commit)
+### 4. Versioned result-signing key ✅ DONE (commits `5014841`, `fa63250`, **hardened** in current commit)
 
 `getSigningKeyMap()` returns `{ current, keys }` where `current`
 is the operator-supplied `RESULT_SIGNING_KEY_ID` and `keys`
-maps each id to its secret. **Key IDs are stable across
-rotations** — pick a new id for a new key, never re-use an
-old id for a new secret (the earlier `current → v1` /
-`previous → v2` design was buggy and is documented in gotcha
-#18). Envelope format includes `kid`; the verifier looks up
+is a null-prototype object mapping each id to its secret.
+**Key IDs are stable across rotations** — pick a new id for
+a new key, never re-use an old id for a new secret. Envelope
+format includes `kid`; the verifier looks up
 `keys[envelope.kid]`. Without any `RESULT_SIGNING_KEY*` env
 vars set, the app falls back to the legacy derived secret
-under the `legacy` kid and logs a warning at boot. Rotation
-procedure and env-var names are documented in the env-var
-table above and in gotcha #18. The `tests/signing-key-rotation.test.js`
-e2e test simulates two deployments via real env-var changes
-and verifies that an envelope signed in deploy-1 still
-verifies in deploy-2.
+under the `legacy` kid and logs a warning at boot.
+
+Validation (current commit): kid must match
+`/^[A-Za-z0-9._-]{1,64}$/`; secrets must be ≥ 32 chars;
+`legacy` is reserved; current/previous ids must differ; ID
+and secret must be set together. In `STARTUP_STRICT` mode,
+misconfiguration throws on the first call to
+`getSigningKeyMap()` (which happens at boot via the first
+signed result). With `STARTUP_STRICT` off, invalid config
+logs a warning and falls back to legacy. The fallback path
+for "no operator config at all" (clean env) is the same in
+both modes — STARTUP_STRICT only catches the
+"operator-touched-but-invalid" case, not the
+"operator-never-touched" case.
+
+Production status (as of 2026-08-19): the BTP `cf env itil4-evalapp`
+output does NOT include any of the four `RESULT_SIGNING_KEY*`
+env vars. The app in production is therefore still using the
+`legacy` kid (the derived secret). Migrating to a dedicated
+key is a follow-up operator action — see branch-protection
+TODO in `Open items` for the related operational hardening.
 
 ### 5. Replace custom XSUAA JWT verifier with `@sap/xssec` — Investigated, deferred (P2)
 

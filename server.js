@@ -296,7 +296,8 @@ function getLegacySigningSecret() {
 //
 // Env vars:
 //   RESULT_SIGNING_KEY_ID         — stable identifier for the active key
-//                                   (e.g. "v2", "prod-2026-08"). 1-64 chars.
+//                                   (e.g. "v2", "prod-2026-08"). 1-64 chars,
+//                                   [A-Za-z0-9._-] only.
 //   RESULT_SIGNING_KEY            — the active secret (32+ chars).
 //   RESULT_SIGNING_KEY_PREVIOUS_ID  — stable identifier for the previous
 //                                     key (optional, for rotation).
@@ -313,49 +314,130 @@ function getLegacySigningSecret() {
 // operator promotes a new key, as long as the previous key + its
 // id are still configured.
 //
-// If only RESULT_SIGNING_KEY_ID/KEY is set (no previous), only one
-// kid is active. If neither is set, the app falls back to the
-// legacy derived secret under the 'legacy' kid (a warning is
-// logged) — this is for backward compatibility with envelopes
-// signed before the versioned key system was introduced.
+// Validation rules (applied on every call; in STARTUP_STRICT mode
+// invalid config throws on boot):
+//   - kid must match /^[A-Za-z0-9._-]{1,64}$/
+//   - 'legacy' is a reserved id; operators may not use it
+//   - currentId and previousId must differ
+//   - secrets must be at least 32 chars
+//   - if RESULT_SIGNING_KEY_ID is set, RESULT_SIGNING_KEY must be set
+//   - if RESULT_SIGNING_KEY_PREVIOUS_ID is set, RESULT_SIGNING_KEY_PREVIOUS must be set
+//
+// If none of the above is satisfied, the app falls back to the
+// legacy derived secret under the 'legacy' kid — for backward
+// compatibility with envelopes signed before the versioned key
+// system was introduced. The fallback is logged.
+const SIGNING_KID_FORMAT = /^[A-Za-z0-9._-]{1,64}$/;
+const SIGNING_KID_RESERVED = 'legacy';
+const SIGNING_SECRET_MIN_LENGTH = 32;
+
+function validateSigningKid(value, fieldName) {
+  if (value && !SIGNING_KID_FORMAT.test(value)) {
+    throw new Error(
+      `${fieldName}="${value}" is invalid. Kids must match ${SIGNING_KID_FORMAT} (1-64 chars, [A-Za-z0-9._-]).`
+    );
+  }
+  if (value === SIGNING_KID_RESERVED) {
+    throw new Error(
+      `${fieldName}="${SIGNING_KID_RESERVED}" is reserved for the legacy derived secret. Pick a different id.`
+    );
+  }
+}
+
+function validateSigningSecret(value, fieldName) {
+  if (value && value.length < SIGNING_SECRET_MIN_LENGTH) {
+    throw new Error(
+      `${fieldName} must be at least ${SIGNING_SECRET_MIN_LENGTH} chars (got ${value.length}). Generate a stronger secret.`
+    );
+  }
+}
+
 function getSigningKeyMap() {
-  const keys = {};
-  const currentId = (process.env.RESULT_SIGNING_KEY_ID || '').trim();
+  // Object.create(null) so a kid of '__proto__' / 'constructor' /
+  // 'hasOwnProperty' can't shadow built-ins. We control the key
+  // format but defense in depth is cheap.
+  const keys = Object.create(null);
+
+  // Read raw env vars. We do NOT trim() — whitespace in a kid is a
+  // typo and should fail validation, not silently become a valid id.
+  const currentId = (process.env.RESULT_SIGNING_KEY_ID || '');
   const currentSecret = process.env.RESULT_SIGNING_KEY || '';
-  const previousId = (process.env.RESULT_SIGNING_KEY_PREVIOUS_ID || '').trim();
+  const previousId = (process.env.RESULT_SIGNING_KEY_PREVIOUS_ID || '');
   const previousSecret = process.env.RESULT_SIGNING_KEY_PREVIOUS || '';
+
+  // Hard-validate the configuration. When STARTUP_STRICT is on
+  // and the operator has set any signing env var, misconfiguration
+  // should fail startup rather than silently fall back. When
+  // STARTUP_STRICT is off, we log a warning and fall back.
+  const operatorTouchedSigningConfig = Boolean(
+    currentId || currentSecret || previousId || previousSecret
+  );
+  const errors = [];
   if (currentId) {
-    if (!currentSecret) {
-      appLog('warn', 'result_signing_key_id_without_secret', {
-        hint: `RESULT_SIGNING_KEY_ID is set (${currentId}) but RESULT_SIGNING_KEY is empty. Ignoring the id.`
-      });
-    } else {
-      keys[currentId] = String(currentSecret);
-    }
+    try { validateSigningKid(currentId, 'RESULT_SIGNING_KEY_ID'); }
+    catch (e) { errors.push(e.message); }
   }
   if (previousId) {
-    if (!previousSecret) {
-      appLog('warn', 'result_signing_key_previous_id_without_secret', {
-        hint: `RESULT_SIGNING_KEY_PREVIOUS_ID is set (${previousId}) but RESULT_SIGNING_KEY_PREVIOUS is empty. Ignoring the id.`
-      });
-    } else {
-      keys[previousId] = String(previousSecret);
-    }
+    try { validateSigningKid(previousId, 'RESULT_SIGNING_KEY_PREVIOUS_ID'); }
+    catch (e) { errors.push(e.message); }
   }
-  keys.legacy = getLegacySigningSecret();
-  if (currentId && currentSecret) {
+  if (currentId && previousId && currentId === previousId) {
+    errors.push(
+      `RESULT_SIGNING_KEY_ID (${currentId}) and RESULT_SIGNING_KEY_PREVIOUS_ID (${previousId}) are the same. ` +
+      `Use distinct ids so rotation actually moves traffic to the new key.`
+    );
+  }
+  if (currentSecret) {
+    try { validateSigningSecret(currentSecret, 'RESULT_SIGNING_KEY'); }
+    catch (e) { errors.push(e.message); }
+  }
+  if (previousSecret) {
+    try { validateSigningSecret(previousSecret, 'RESULT_SIGNING_KEY_PREVIOUS'); }
+    catch (e) { errors.push(e.message); }
+  }
+  if (currentId && !currentSecret) {
+    errors.push('RESULT_SIGNING_KEY_ID is set but RESULT_SIGNING_KEY is empty.');
+  }
+  if (previousId && !previousSecret) {
+    errors.push('RESULT_SIGNING_KEY_PREVIOUS_ID is set but RESULT_SIGNING_KEY_PREVIOUS is empty.');
+  }
+
+  if (errors.length) {
+    const msg = `Result signing key configuration is invalid:\n  - ${errors.join('\n  - ')}`;
+    if (STARTUP_STRICT && operatorTouchedSigningConfig) {
+      throw new Error(msg);
+    }
+    appLog('warn', 'result_signing_key_invalid', { errors });
+  }
+
+  // If validation passed, build the map. If anything was wrong
+  // and we got here (STARTUP_STRICT off), we fall back to legacy.
+  const currentValid = currentId && currentSecret && errors.length === 0;
+  const previousValid = previousId && previousSecret && errors.length === 0;
+
+  if (currentValid) keys[currentId] = String(currentSecret);
+  if (previousValid) keys[previousId] = String(previousSecret);
+
+  // legacy slot is always populated (for backwards compat with
+  // envelopes signed before the versioned system was introduced).
+  keys[SIGNING_KID_RESERVED] = getLegacySigningSecret();
+
+  if (currentValid) {
     return { current: currentId, keys };
   }
-  if (currentSecret && !currentId) {
-    appLog('warn', 'result_signing_key_id_missing', {
-      hint: 'RESULT_SIGNING_KEY is set but RESULT_SIGNING_KEY_ID is not. Cannot determine a stable kid. Falling back to legacy.'
+
+  // No usable current key. Fall back to legacy. We log a warning
+  // here so a future operator notices their config isn't taking.
+  if (operatorTouchedSigningConfig) {
+    appLog('warn', 'result_signing_key_unusable', {
+      hint: 'Signing key env vars are set but not usable (see prior warnings). Falling back to legacy derived secret.'
     });
-  } else if (!currentSecret) {
+  } else {
     appLog('warn', 'result_signing_key_missing', {
       hint: 'RESULT_SIGNING_KEY env var is not set. Falling back to legacy derived secret. New envelopes will use kid=legacy.'
     });
   }
-  return { current: 'legacy', keys };
+  return { current: SIGNING_KID_RESERVED, keys };
 }
 
 // Signed-envelope helpers are now in lib/responses.js. Local thin
