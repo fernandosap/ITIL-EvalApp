@@ -244,6 +244,7 @@ fallback when XSUAA is not bound.
 | `RESULT_SIGNING_KEY` | recommended | 32+ char secret for the active signing key. When set with `RESULT_SIGNING_KEY_ID`, new envelopes use that kid. When unset, falls back to the legacy derived secret (logs a warning). |
 | `RESULT_SIGNING_KEY_PREVIOUS_ID` | optional | Stable identifier for the previous signing key during rotation. Must keep the SAME value the previous deployment used for that key. |
 | `RESULT_SIGNING_KEY_PREVIOUS` | optional | Previous secret. Kept during rotation so old envelopes still verify. |
+| `RESULT_SIGNING_LEGACY_KEY` | recommended (in BTP) | The explicit secret to use for the `legacy` kid. If unset, the legacy secret is derived from `HANA_PASSWORD` + role hashes + `APP_REVISION` — which **silently changes** when any of those env vars rotates, breaking verification of historical envelopes. **Set this ONCE** (the value of the derived secret before your next env rotation) and never change it. |
 | `SLOW_QUERY_MS`, `SLOW_REQUEST_MS` | optional | Default 400 / 1200. Logs slow ops. |
 | `STARTUP_STRICT` | optional | `true` in current `.env`. If true, missing required config throws on boot. |
 | `APP_REVISION`, `APP_DEPLOYED_AT` | build | Set by `deploy_btp.sh` from git + date. |
@@ -284,33 +285,29 @@ Reads HANA vars from `.env` or `--env-file`. Sets `APP_REVISION` from `git rev-p
 15. **`/api/admin/me` is the canonical role probe** for the client. It works for any role (admin, manager, reviewer, content_editor) because it doesn't require a specific permission, only valid auth. Don't fall back to reading `data.role` from `/api/admin/codes` for the cookie-based XSUAA flow — codes requires `codes:read` which reviewers don't have.
 16. **`lib/audit.js` is a self-contained module** that owns the audit log + its metrics. Server.js just calls `tryWriteAdminAudit()` and exposes `audit.getMetrics()` in `/api/admin/metrics`. The metrics track `attempts / writes / skippedNoTable / skippedNoDb / failures / lastFailureAt / lastFailureMessage / auditTablePresent` so a quietly broken audit log (table dropped, HANA outage) is visible in metrics instead of being silently swallowed.
 17. **String literals for roles / code statuses / lifecycle / exam modes / audit actions** are in `shared/constants.js` (`ROLES`, `CODE_STATUS`, `QUESTION_SET_LIFECYCLE`, `EXAM_MODE`, `AUDIT_ACTION`). Use the constants, not raw strings — `grep " 'admin'"` should ideally be empty in the codebase.
-18. **Result-signing key is now versioned with STABLE key IDs** — `getSigningKeyMap()` returns `{ current, keys }` where `current` is the operator-supplied `RESULT_SIGNING_KEY_ID` (e.g. `"v2"`) and `keys` is a null-prototype object `{ <id>: <secret>, ..., legacy: <derived> }`. **Key IDs are stable across rotations** — pick a new id for a new key, never re-use an old id for a new secret. The kid field on every envelope is the id, and the verifier looks up `keys[envelope.kid]`. Rotation procedure:
-    1. Deploy 1: set `RESULT_SIGNING_KEY_ID=v1`, `RESULT_SIGNING_KEY=<secret1>`. New envelopes get `kid=v1`.
-    2. Rotate: set `RESULT_SIGNING_KEY_ID=v2`, `RESULT_SIGNING_KEY=<secret2>`, `RESULT_SIGNING_KEY_PREVIOUS_ID=v1`, `RESULT_SIGNING_KEY_PREVIOUS=<secret1>`. New envelopes get `kid=v2`; old envelopes (`kid=v1`) still verify because `keys["v1"]` still points to `<secret1>`.
+18. **Result-signing key is now versioned with STABLE key IDs, a v2 envelope format, a cached SigningContext, and a freezable legacy secret.** Three layered improvements:
+
+    **(A) Stable key IDs + freezable legacy secret** (commits `fa63250` + `1f0991f` + `171813a`): `RESULT_SIGNING_KEY_ID` is operator-supplied and stable across rotations. The `keys` map is `{ <id>: <secret>, ..., legacy: <secret-from-LEGACY_KEY-or-derived> }`. The `legacy` slot is filled from `RESULT_SIGNING_LEGACY_KEY` if set, otherwise derived from `HANA_PASSWORD | ADMIN_HASH | MANAGER_HASH | REVIEWER_HASH | CONTENT_EDITOR_HASH | APP_REVISION`. **Set `RESULT_SIGNING_LEGACY_KEY` once you have historical envelopes you want to keep verifying** — otherwise a rotation of any of those env vars will silently invalidate the derived legacy secret and break historical verification.
+
+    Rotation procedure:
+    1. Deploy 1: set `RESULT_SIGNING_KEY_ID=v1`, `RESULT_SIGNING_KEY=<secret1>`. New envelopes get `kid=v1`. Optionally also set `RESULT_SIGNING_LEGACY_KEY=<sha256-of-current-derived-secret>` to freeze the historical key.
+    2. Rotate: set `RESULT_SIGNING_KEY_ID=v2`, `RESULT_SIGNING_KEY=<secret2>`, `RESULT_SIGNING_KEY_PREVIOUS_ID=v1`, `RESULT_SIGNING_KEY_PREVIOUS=<secret1>`. New envelopes get `kid=v2`; old envelopes (`kid=v1`) still verify.
     3. Drop the old key: remove the `*_PREVIOUS*` env vars. `keys["v1"]` is gone; old `kid=v1` envelopes now fail.
+
+    **(B) v2 envelope format** (commit `<current>`): the HMAC input is now `JSON.stringify({ version: 2, algorithm, kid, payload })` instead of just `payload`. A tampered envelope header (changed `kid`, `algorithm`, or `version`) cannot verify under any key, because the canonical input is bound to the envelope's own fields. v1 envelopes (no `version` field, signature over `payload` only) still verify for back-compat.
+
+    **(C) Cached SigningContext** (commit `<current>`): `lib/signing-context.js` builds the signing context once per env snapshot and reuses it. No more re-parsing 4 env vars on every sign/verify; no more re-computing the derived secret on every request; warnings are truly one-shot. Runtime path is `signing.getSigningContext().sign(payload)` — no env reads, no validation, no log noise. The previous `getSigningKeyMap()` inline is now a thin wrapper around the cached context (kept for back-compat with internal call sites).
 
     **Validation rules** (applied at parse time; misconfiguration surfaces in `startupSummary().errors` and blocks the HTTP listener from opening in `STARTUP_STRICT` mode):
     - `kid` must match `/^[A-Za-z0-9._-]{1,64}$/`. No whitespace, no slashes, no NUL.
-    - `legacy` is reserved — operators may NOT use it as `RESULT_SIGNING_KEY_ID` (the slot is always populated by the derived secret, so a user-set `"legacy"` would be silently overwritten).
-    - `RESULT_SIGNING_KEY_ID` and `RESULT_SIGNING_KEY_PREVIOUS_ID` must differ (otherwise `keys["v2"]` would be silently overwritten by the previous secret).
+    - `legacy` is reserved — operators may NOT use it as `RESULT_SIGNING_KEY_ID`.
+    - `RESULT_SIGNING_KEY_ID` and `RESULT_SIGNING_KEY_PREVIOUS_ID` must differ.
     - Secrets must be ≥ 32 chars. Generate with `crypto.randomBytes(32).toString('base64')` for ~44 chars.
-    - ID and secret must be set TOGETHER (both directions checked):
-      - `currentId && !currentSecret` → reject (typo)
-      - `currentSecret && !currentId` → reject (typo)
-      - same for previousId/previousSecret
-    - **A previous key without a current key is rejected** — the "previous" is what we're rotating AWAY from, so there must be a current to rotate TO. Without this check the startup summary would report `signingKeyValid=true` while the runtime silently fell back to legacy.
-    - The validation runs in `parseSigningConfig` + `validateSigningConfig`
-      (pure, exported for tests). `getSigningKeyMap()` is the
-      silent runtime wrapper that always returns a usable keyMap
-      (legacy fallback if invalid). The startup path reads the
-      same config and lists errors in `startupSummary().errors`;
-      `startServer()` throws if `summary.errors.length` is non-zero
-      (i.e. STARTUP_STRICT is the natural behavior of `startServer`).
-      **`getSigningKeyMap()` itself never throws and safely falls
-      back to `legacy`** — invalid config is caught at boot, not
-      on first use.
+    - ID and secret must be set TOGETHER (both directions checked).
+    - A previous key without a current key is rejected (orphan previous).
+    - The validation runs in `parseSigningConfig` + `validateSigningConfig` (pure, exported for tests). `getSigningKeyMap()` and `signing.getSigningContext()` are silent runtime wrappers that always return a usable keyMap (legacy fallback if invalid). The startup path reads the same config and lists errors in `startupSummary().errors`; `startServer()` throws if `summary.errors.length` is non-zero.
 
-    The earlier implementation hard-coded `current → v1` and `previous → v2`, which broke rotation. The fix and the e2e tests are in `tests/signing-key-rotation.test.js` (21 tests covering rotation, edge-case validation, and startup-time surfacing).
+    Tests: `tests/signing-key-rotation.test.js` (21 tests for rotation + edge-case validation + startup surfacing), `tests/signed-envelope.test.js` (5 tests for v2 envelope format), `tests/signing-legacy-key.test.js` (4 tests for the legacy-key freeze rotation scenario).
 
 ## HANA findings (Fase 0, 2026-08-18)
 

@@ -78,6 +78,7 @@ const {
   jsonError,
   jsonOk
 } = require('./lib/responses.js');
+const signing = require('./lib/signing-context.js');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -277,20 +278,10 @@ function appLog(level, event, meta = {}) {
 // Legacy signing secret — derived from environment values. Kept so
 // historical signed result summaries (signed before the versioned
 // `RESULT_SIGNING_KEY` was introduced) still verify. New envelopes
-// use the versioned `getSigningKeyMap()` instead.
-function getLegacySigningSecret() {
-  return crypto
-    .createHash('sha256')
-    .update([
-      HANA_PASSWORD || '',
-      ADMIN_HASH || '',
-      MANAGER_HASH || '',
-      REVIEWER_HASH || '',
-      CONTENT_EDITOR_HASH || '',
-      APP_REVISION || ''
-    ].join('|'))
-    .digest('hex');
-}
+// use the versioned `getSigningContext()` (lib/signing-context.js)
+// instead. The legacy secret itself now lives in
+// `lib/signing-context.js#loadLegacySecretFromEnv` and respects
+// `RESULT_SIGNING_LEGACY_KEY` if set.
 
 // Versioned signing key map.
 //
@@ -302,178 +293,54 @@ function getLegacySigningSecret() {
 //   RESULT_SIGNING_KEY_PREVIOUS_ID  — stable identifier for the previous
 //                                     key (optional, for rotation).
 //   RESULT_SIGNING_KEY_PREVIOUS     — the previous secret (optional).
+//   RESULT_SIGNING_LEGACY_KEY       — optional. If set, freezes the
+//                                     secret used for the `legacy`
+//                                     kid so historical envelopes
+//                                     keep verifying even after
+//                                     HANA_PASSWORD / role hashes /
+//                                     APP_REVISION change. Without
+//                                     this, the legacy secret is
+//                                     derived from those env vars
+//                                     at every boot, and changes
+//                                     to any of them silently break
+//                                     verification of old envelopes.
 //
-// The shape returned matches what lib/responses.js's
-// buildSignedEnvelope / verifySignedEnvelope expect:
-//   { current: '<id>', keys: { <id>: '...', <prevId>: '...', legacy: '...' } }
-//
-// CRITICAL: key IDs are STABLE across rotations. The current key
-// might be `v2` after a rotation, but the previous key is still
-// `v1` — never re-assigned. This is what makes rotation work: an
-// envelope signed with `kid=v1` will keep verifying after the
-// operator promotes a new key, as long as the previous key + its
-// id are still configured.
-//
-// Validation rules (applied at parse time; in STARTUP_STRICT mode
-// invalid config throws during startupErrors() — i.e. before the
-// HTTP listener opens):
-//   - kid must match /^[A-Za-z0-9._-]{1,64}$/
-//   - 'legacy' is a reserved id; operators may not use it
-//   - currentId and previousId must differ
-//   - secrets must be at least 32 chars
-//   - id and secret must be set TOGETHER (both directions):
-//       id without secret  → reject
-//       secret without id  → reject
-//   - operatorTouchedSigningConfig: at least one of the 4 env vars
-//     is non-empty
-//
-// If none of the above is satisfied, the app falls back to the
-// legacy derived secret under the 'legacy' kid — for backward
-// compatibility with envelopes signed before the versioned key
-// system was introduced. The fallback is logged.
-const SIGNING_KID_FORMAT = /^[A-Za-z0-9._-]{1,64}$/;
+// The actual keymap + validation + sign/verify helpers live in
+// lib/signing-context.js. We re-export the few functions this
+// file's startup / metrics paths need (parseSigningConfig,
+// validateSigningConfig, isOperatorSigningConfig) and delegate
+// the runtime path (signPayload, buildSignedEnvelopeLocal) to
+// the cached context.
+
 const SIGNING_KID_RESERVED = 'legacy';
-const SIGNING_SECRET_MIN_LENGTH = 32;
 
-// Pure: parse the 4 RESULT_SIGNING_KEY* env vars into a plain
-// object. No validation, no logging, no side effects. Used by both
-// the runtime path (getSigningKeyMap) and the startup path
-// (startupErrors) so they see the same input.
-function parseSigningConfig(env) {
-  return {
-    currentId: env.RESULT_SIGNING_KEY_ID || '',
-    currentSecret: env.RESULT_SIGNING_KEY || '',
-    previousId: env.RESULT_SIGNING_KEY_PREVIOUS_ID || '',
-    previousSecret: env.RESULT_SIGNING_KEY_PREVIOUS || ''
-  };
-}
+// Pure helpers re-exported from lib/signing-context.js so this
+// file's startup paths can keep using the same names.
+const parseSigningConfig = signing.parseSigningConfig;
+const validateSigningConfig = signing.validateSigningConfig;
+const isOperatorSigningConfig = signing.isOperatorSigningConfig;
 
-// Pure: validate a parsed config. Returns an array of error
-// messages (empty = valid). No logging, no side effects.
-function validateSigningConfig(config) {
-  const errors = [];
-  const { currentId, currentSecret, previousId, previousSecret } = config;
-
-  // Kid format + reserved id.
-  if (currentId && !SIGNING_KID_FORMAT.test(currentId)) {
-    errors.push(`RESULT_SIGNING_KEY_ID="${currentId}" is invalid. Kids must match ${SIGNING_KID_FORMAT} (1-64 chars, [A-Za-z0-9._-]).`);
-  }
-  if (previousId && !SIGNING_KID_FORMAT.test(previousId)) {
-    errors.push(`RESULT_SIGNING_KEY_PREVIOUS_ID="${previousId}" is invalid. Kids must match ${SIGNING_KID_FORMAT} (1-64 chars, [A-Za-z0-9._-]).`);
-  }
-  if (currentId === SIGNING_KID_RESERVED || previousId === SIGNING_KID_RESERVED) {
-    errors.push(`"${SIGNING_KID_RESERVED}" is reserved for the legacy derived secret. Pick a different id.`);
-  }
-
-  // Kids must differ.
-  if (currentId && previousId && currentId === previousId) {
-    errors.push(
-      `RESULT_SIGNING_KEY_ID (${currentId}) and RESULT_SIGNING_KEY_PREVIOUS_ID (${previousId}) are the same. ` +
-      `Use distinct ids so rotation actually moves traffic to the new key.`
-    );
-  }
-
-  // Secret length.
-  if (currentSecret && currentSecret.length < SIGNING_SECRET_MIN_LENGTH) {
-    errors.push(`RESULT_SIGNING_KEY must be at least ${SIGNING_SECRET_MIN_LENGTH} chars (got ${currentSecret.length}). Generate a stronger secret.`);
-  }
-  if (previousSecret && previousSecret.length < SIGNING_SECRET_MIN_LENGTH) {
-    errors.push(`RESULT_SIGNING_KEY_PREVIOUS must be at least ${SIGNING_SECRET_MIN_LENGTH} chars (got ${previousSecret.length}). Generate a stronger secret.`);
-  }
-
-  // ID and secret must be set together (both directions).
-  if (currentId && !currentSecret) {
-    errors.push('RESULT_SIGNING_KEY_ID is set but RESULT_SIGNING_KEY is empty.');
-  }
-  if (currentSecret && !currentId) {
-    errors.push('RESULT_SIGNING_KEY is set but RESULT_SIGNING_KEY_ID is empty.');
-  }
-  if (previousId && !previousSecret) {
-    errors.push('RESULT_SIGNING_KEY_PREVIOUS_ID is set but RESULT_SIGNING_KEY_PREVIOUS is empty.');
-  }
-  if (previousSecret && !previousId) {
-    errors.push('RESULT_SIGNING_KEY_PREVIOUS is set but RESULT_SIGNING_KEY_PREVIOUS_ID is empty.');
-  }
-
-  // A previous key without a current key makes no sense — the
-  // "previous" is what we're rotating AWAY from, so there must
-  // be a current to rotate TO. Without this check the startup
-  // summary would report signingKeyValid=true while the runtime
-  // silently falls back to legacy (since `currentValid` is
-  // false but `previousValid` is true, the map would have a v1
-  // slot with no consumer).
-  const currentConfigured = Boolean(config.currentId || config.currentSecret);
-  const previousConfigured = Boolean(config.previousId || config.previousSecret);
-  if (previousConfigured && !currentConfigured) {
-    errors.push(
-      'RESULT_SIGNING_KEY_PREVIOUS(_ID) is set without a current RESULT_SIGNING_KEY(_ID). ' +
-      'A previous key only makes sense during a rotation FROM a current key; configure both pairs.'
-    );
-  }
-
-  return errors;
-}
-
-function isOperatorSigningConfig(config) {
-  return Boolean(
-    config.currentId || config.currentSecret ||
-    config.previousId || config.previousSecret
-  );
-}
-
-// Build the keyMap from process.env. Used by the runtime path
-// (signPayload, buildSignedEnvelopeLocal, /verify-signature).
-// NEVER throws — falls back to legacy and logs a warning instead.
-// The startup-time validation is in startupErrors(), which calls
-// this only for the side effect of validating the env (but the
-// result of this function in startup is discarded).
+// Runtime: builds the SigningContext once per env change and
+// reuses it. The context exposes sign/verify that read from the
+// cached keyMap. This replaces the old getSigningKeyMap() that was
+// called on every sign/verify (which meant re-parsing env vars
+// and re-computing the derived secret on every request).
 function getSigningKeyMap() {
-  const config = parseSigningConfig(process.env);
-  const errors = validateSigningConfig(config);
-  const keys = Object.create(null);
-
-  const currentValid = config.currentId && config.currentSecret && errors.length === 0;
-  const previousValid = config.previousId && config.previousSecret && errors.length === 0;
-
-  if (currentValid) keys[config.currentId] = String(config.currentSecret);
-  if (previousValid) keys[config.previousId] = String(config.previousSecret);
-
-  // legacy slot is always populated (for backwards compat with
-  // envelopes signed before the versioned system was introduced).
-  keys[SIGNING_KID_RESERVED] = getLegacySigningSecret();
-
-  if (currentValid) {
-    return { current: config.currentId, keys };
-  }
-
-  // No usable current key. Log a one-shot warning so an operator
-  // notices their config isn't taking. The build is the same on
-  // every call so we could memoize, but the warning only fires when
-  // the operator's config is non-empty (so it's a "first time we
-  // notice" warning, not a per-request one).
-  if (isOperatorSigningConfig(config)) {
-    appLog('warn', 'result_signing_key_unusable', {
-      hint: 'Signing key env vars are set but not usable. Falling back to legacy derived secret. kid=legacy on all new envelopes.'
-    });
-  } else {
-    appLog('warn', 'result_signing_key_missing', {
-      hint: 'RESULT_SIGNING_KEY env var is not set. Falling back to legacy derived secret. New envelopes will use kid=legacy.'
-    });
-  }
-  return { current: SIGNING_KID_RESERVED, keys };
+  return signing.getSigningContext().keyMap;
 }
 
-// Signed-envelope helpers are now in lib/responses.js. Local thin
-// wrappers keep the existing call sites readable (no need to pass
-// the keyMap on every call) and stay in lockstep with the per-env
-// values.
+// Runtime: sign a raw payload (HMAC of payload only — used for
+// legacy "just-the-payload" signing paths and ad-hoc signatures).
+// Delegates to the cached context so the operator's warnings fire
+// exactly once, not per request.
 function signPayload(payload) {
-  const keyMap = getSigningKeyMap();
-  const kid = keyMap.current;
-  return crypto.createHmac('sha256', keyMap.keys[kid]).update(JSON.stringify(payload)).digest('hex');
+  return signing.getSigningContext().sign(payload).signature;
 }
+
+// Runtime: build a v2 signed envelope. Delegates to the cached
+// context.
 function buildSignedEnvelopeLocal(payload) {
-  return buildSignedEnvelope(payload, getSigningKeyMap());
+  return signing.getSigningContext().sign(payload);
 }
 
 function getMetricsSnapshot() {
@@ -2070,8 +1937,19 @@ app.post('/api/admin/results/verify-signature', requireAdmin, requirePermission(
   // for back-compat with the original endpoint shape).
   const body = req.body || {};
   if (body.payload !== undefined && body.signature && body.algorithm) {
-    const envelope = { payload: body.payload, signature: String(body.signature), algorithm: body.algorithm, kid: body.kid };
-    const matched = verifySignedEnvelope(envelope, getSigningKeyMap());
+    // Reconstruct the envelope exactly as the signer built it. For
+    // v2 envelopes we include the version field in the HMAC input,
+    // so the verifier needs the original version. The caller is
+    // expected to echo the full envelope (incl. version, kid,
+    // algorithm) when present.
+    const envelope = {
+      version: body.version,
+      algorithm: body.algorithm,
+      kid: body.kid,
+      payload: body.payload,
+      signature: String(body.signature)
+    };
+    const matched = signing.getSigningContext().verify(envelope);
     return res.json({ ok: true, valid: matched !== null, matchedKid: matched ? matched.kid : null });
   }
   const payload = body.payload;
@@ -4001,9 +3879,6 @@ module.exports = {
   getSweeperStatus,
   signPayload,
   buildSignedEnvelope: buildSignedEnvelopeLocal,
-  // Legacy export kept so the few remaining internal references
-  // still work. New code should use getSigningKeyMap().
-  getSigningSecret: getLegacySigningSecret,
   getSigningKeyMap,
   // Pure helpers used by both runtime + startup + tests.
   parseSigningConfig,
