@@ -393,7 +393,63 @@ input:focus{outline:none;border-color:#2E75B6}
   <input type="hidden" name="submitted_at">
 </form>
 
-<div id="app"></div>
+<div id="app">
+  <!--
+    Inline fallback. Renders immediately (no JS required) so the
+    candidate never sees a blank page even if every /client/*.js
+    module fails to load or the bootstrap throws. The
+    `style="display:none"` swap on DOMContentLoaded hides this
+    copy once the SPA takes over.
+  -->
+  <div id="boot-fallback" class="screen" style="padding-top:48px">
+    <div class="card" style="text-align:center">
+      <h2 style="margin-bottom:10px">Academy Exam App</h2>
+      <p style="color:#666;margin-bottom:18px">Loading the exam&hellip; if this message stays for more than a few seconds, use the button below.</p>
+      <button class="btn btn-primary" onclick="location.reload()">Reload</button>
+    </div>
+  </div>
+</div>
+<script>
+  // Module-load reporter. Runs in the global scope (no deps
+  // on util.js / state.js, because those might be the modules
+  // that failed). <script onerror> below invokes this.
+  (function () {
+    function __reportModuleLoadError(src) {
+      try {
+        var body = JSON.stringify({
+          type: 'module_load',
+          message: 'Failed to load module: ' + (src || 'unknown'),
+          filename: src || '',
+          line: 0,
+          col: 0,
+          stack: '',
+          screen: 'loading',
+          lastAction: 'script_load',
+          accessCode: null,
+          clientTs: new Date().toISOString(),
+          userAgent: navigator.userAgent || ''
+        });
+        if (navigator.sendBeacon) {
+          navigator.sendBeacon('/api/client-errors', new Blob([body], { type: 'application/json' }));
+        } else {
+          fetch('/api/client-errors', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body, keepalive: true }).catch(function () {});
+        }
+      } catch (_e) {}
+      // Show a recovery screen that the candidate can act on
+      // even if no JS module loaded. Pure DOM, no deps.
+      var app = document.getElementById('app');
+      if (app) {
+        app.innerHTML = '<div class="screen" style="padding-top:48px"><div class="card" style="text-align:center">' +
+          '<div style="font-size:38px;margin-bottom:8px">⚠️</div>' +
+          '<h2 style="margin-bottom:8px">App failed to load</h2>' +
+          '<p style="color:#666;margin-bottom:18px">A required module did not load. Please reload the page. If the problem persists, contact your exam administrator.</p>' +
+          '<button class="btn btn-primary" onclick="location.reload()">Reload</button>' +
+          '</div></div>';
+      }
+    }
+    window.__reportModuleLoadError = __reportModuleLoadError;
+  })();
+</script>
 <div id="modal" class="modal-overlay">
   <div class="modal-box">
     <div class="modal-icon" id="m-icon"></div>
@@ -414,16 +470,17 @@ input:focus{outline:none;border-color:#2E75B6}
   client/dispatcher.js must run BEFORE main.js so the click/change
   listeners are active when the DOM is ready.
 -->
-<script src="/shared/constants.js"></script>
-<script src="/client/util.js"></script>
-<script src="/client/state.js"></script>
-<script src="/client/code-entry.js"></script>
-<script src="/client/exam.js"></script>
-<script src="/client/proctor.js"></script>
-<script src="/client/admin-auth.js"></script>
-<script src="/client/admin-codes.js"></script>
-<script src="/client/admin-question-sets.js"></script>
-<script src="/client/dispatcher.js"></script>
-<script src="/client/main.js"></script>
+<script src="/shared/constants.js" onerror="window.__reportModuleLoadError && window.__reportModuleLoadError(this.src)"></script>
+<script src="/client/util.js" onerror="window.__reportModuleLoadError && window.__reportModuleLoadError(this.src)"></script>
+<script src="/client/reporter.js" onerror="window.__reportModuleLoadError && window.__reportModuleLoadError(this.src)"></script>
+<script src="/client/state.js" onerror="window.__reportModuleLoadError && window.__reportModuleLoadError(this.src)"></script>
+<script src="/client/code-entry.js" onerror="window.__reportModuleLoadError && window.__reportModuleLoadError(this.src)"></script>
+<script src="/client/exam.js" onerror="window.__reportModuleLoadError && window.__reportModuleLoadError(this.src)"></script>
+<script src="/client/proctor.js" onerror="window.__reportModuleLoadError && window.__reportModuleLoadError(this.src)"></script>
+<script src="/client/admin-auth.js" onerror="window.__reportModuleLoadError && window.__reportModuleLoadError(this.src)"></script>
+<script src="/client/admin-codes.js" onerror="window.__reportModuleLoadError && window.__reportModuleLoadError(this.src)"></script>
+<script src="/client/admin-question-sets.js" onerror="window.__reportModuleLoadError && window.__reportModuleLoadError(this.src)"></script>
+<script src="/client/dispatcher.js" onerror="window.__reportModuleLoadError && window.__reportModuleLoadError(this.src)"></script>
+<script src="/client/main.js" onerror="window.__reportModuleLoadError && window.__reportModuleLoadError(this.src)"></script>
 </body>
 </html>

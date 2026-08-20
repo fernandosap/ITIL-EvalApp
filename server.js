@@ -65,6 +65,7 @@ const {
   releaseConn
 } = require('./shared/db-pool.js');
 const audit = require('./lib/audit.js');
+const clientErrors = require('./lib/client-errors.js');
 const rateLimit = require('./lib/rate-limit.js');
 const { createAuthMiddleware } = require('./lib/middleware.js');
 const sweeper = require('./lib/sweeper.js');
@@ -130,6 +131,20 @@ audit.init({
   hanaSslValidateCertificate: HANA_SSL_VALIDATE_CERTIFICATE
 });
 
+// Wire lib/client-errors.js with the same HANA config. Reuses
+// the ADMIN_AUDIT_LOG table (action='client_error'). Must run
+// before any POST /api/client-errors request.
+clientErrors.init({
+  hasDbConfig: HAS_DB_CONFIG,
+  hanaHost: HANA_HOST,
+  hanaPort: HANA_PORT,
+  hanaUser: HANA_USER,
+  hanaPassword: HANA_PASSWORD,
+  hanaSchema: HANA_SCHEMA,
+  hanaEncrypt: HANA_ENCRYPT,
+  hanaSslValidateCertificate: HANA_SSL_VALIDATE_CERTIFICATE
+});
+
 const FAVICON_PATH = path.join(__dirname, 'favicon.svg');
 
 const EXAM_TTL_MS = 90 * 60 * 1000;
@@ -142,6 +157,13 @@ const ADMIN_LOGIN_HASH_MAX = 20;       // defense vs password spray across IPs
 const ADMIN_LOGIN_HASH_WINDOW = 15 * 60 * 1000;
 const PROCTOR_MAX = 90;
 const PROCTOR_WINDOW = 60 * 1000;
+// Client error telemetry rate limits. The browser posts here
+// when window.onerror / unhandledrejection / <script onerror>
+// fire. 30 per minute per IP is enough headroom for a real
+// frontend regression (which can fire dozens in seconds) but
+// low enough to keep a stuck loop from filling HANA.
+const CLIENT_ERROR_MAX = 30;
+const CLIENT_ERROR_WINDOW = 60 * 1000;
 const _questionSetCache = new Map();
 const _runtimeState = {
   adminTokenNotBefore: 0,
@@ -1682,6 +1704,44 @@ app.get('/api/status', async (_req, res) => {
 
 app.get('/api/bootstrap', (_req, res) => {
   res.status(410).json({ error: 'bootstrap_removed', message: 'Client bootstrap is disabled for security reasons.' });
+});
+
+// POST /api/client-errors — anonymous telemetry from the SPA.
+// The browser fires this from:
+//   - window.onerror            (type='error')
+//   - window.onunhandledrejection (type='unhandledrejection')
+//   - <script onerror>           (type='module_load')
+//   - main.js bootstrap try/catch fallback (type='bootstrap_failure')
+//
+// We always respond 200 {ok:true} unless the rate limit
+// triggers. The diagnostic is best-effort: if HANA is down or
+// the table is missing, the write is dropped silently and a
+// structured warn is logged. We never want a broken telemetry
+// path to make the user experience worse.
+//
+// Sanitization (jwt, hex, access codes, URL query stripping,
+// stack truncation, schema whitelist) lives in lib/client-errors.js.
+// This route only does rate limiting and dispatches.
+app.post('/api/client-errors', async (req, res) => {
+  const ip = getClientIp(req);
+  if (!checkRateLimit('client_error', String(ip), CLIENT_ERROR_MAX, CLIENT_ERROR_WINDOW)) {
+    // 204 (not 429) — telemetry should never encourage a
+    // client to retry; just drop it silently.
+    return res.status(204).end();
+  }
+  const body = req.body;
+  if (!body || typeof body !== 'object') {
+    return res.json({ ok: true, dropped: 'invalid_body' });
+  }
+  // Fire-and-forget. We respond before the write finishes so
+  // sendBeacon / fetch on the client doesn't have to wait.
+  // Failures are logged by the lib.
+  clientErrors.reportClientError({
+    payload: body,
+    clientIp: ip,
+    appRevision: APP_REVISION
+  }).catch(() => { /* lib never throws, but be defensive */ });
+  return res.json({ ok: true });
 });
 
 app.post('/api/validate', async (req, res) => {

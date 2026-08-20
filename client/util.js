@@ -185,6 +185,20 @@
     $('modal').classList.add('show');
   }
 
+  // ---------------------------------------------------------------------------
+  // Client error telemetry — thin delegate to IE.reporter
+  // (defined in client/reporter.js, loaded after this module).
+  // The real implementation is in reporter.js so it can be
+  // unit-tested in isolation. We re-export it here so existing
+  // call sites using IE.util.reportClientError keep working.
+  // ---------------------------------------------------------------------------
+  function reportClientError(type, info) {
+    if (root.IE && root.IE.reporter && typeof root.IE.reporter.report === 'function') {
+      return root.IE.reporter.report(type, info);
+    }
+    return false;
+  }
+
   root.IE = root.IE || {};
   root.IE.util = {
     $: $,
@@ -205,6 +219,7 @@
     markOfflineSave: markOfflineSave,
     apiFetch: apiFetch,
     apiJson: apiJson,
-    modal: modal
+    modal: modal,
+    reportClientError: reportClientError
   };
 })(typeof window !== 'undefined' ? window : globalThis);
