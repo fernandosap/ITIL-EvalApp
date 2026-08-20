@@ -470,6 +470,60 @@ test('getSigningKeyMap: rejects secret without id with STARTUP_STRICT=true (via 
 });
 
 // ---------------------------------------------------------------------------
+// Edge case: previous without current (orphan previous)
+// ---------------------------------------------------------------------------
+
+test('getSigningKeyMap: rejects previous without current (orphan previous)', () => {
+  // The earlier validation accepted "previous only" config because
+  // individually the previous pair was well-formed. But the
+  // startup summary would then report signingKeyValid=true while
+  // the runtime silently fell back to legacy (since there's no
+  // current to use). The fix: require a current pair whenever a
+  // previous is configured.
+  const env = {
+    HANA_PASSWORD: 'p', ADMIN_HASH: 'a', MANAGER_HASH: 'm',
+    REVIEWER_HASH: 'r', CONTENT_EDITOR_HASH: 'c', APP_REVISION: 'v',
+    STARTUP_STRICT: 'false',
+    RESULT_SIGNING_KEY_ID: null, RESULT_SIGNING_KEY: null,
+    RESULT_SIGNING_KEY_PREVIOUS_ID: 'v1', RESULT_SIGNING_KEY_PREVIOUS: secret('orphan-prev')
+  };
+  const { getSigningKeyMap, restore } = loadServerWithEnv(env);
+  try {
+    const km = getSigningKeyMap();
+    assert.equal(km.current, 'legacy',
+      'orphan previous (no current) must fall back to legacy');
+    assert.equal(km.keys.v1, undefined,
+      'orphan previous must NOT be placed in the key map');
+  } finally { restore(); }
+});
+
+test('startup-time: orphan previous is surfaced in startupErrors and marked invalid in summary', () => {
+  const env = {
+    HANA_PASSWORD: 'p', ADMIN_HASH: 'a', MANAGER_HASH: 'm',
+    REVIEWER_HASH: 'r', CONTENT_EDITOR_HASH: 'c', APP_REVISION: 'v',
+    STARTUP_STRICT: 'false',
+    RESULT_SIGNING_KEY_ID: null, RESULT_SIGNING_KEY: null,
+    RESULT_SIGNING_KEY_PREVIOUS_ID: 'v1', RESULT_SIGNING_KEY_PREVIOUS: secret('orphan-prev')
+  };
+  const { restore } = loadServerWithEnv(env);
+  try {
+    const { startupSummary, startupErrors } = require('../server.js');
+    const summary = startupSummary();
+    const errors = startupErrors();
+    assert.equal(summary.env.signingKeyConfigured, true,
+      'operator touched the config');
+    assert.equal(summary.env.signingKeyValid, false,
+      'orphan previous must be marked invalid');
+    assert.equal(summary.env.signingActiveKid, 'legacy',
+      'runtime must fall back to legacy');
+    assert.ok(
+      errors.some((e) => /previous key only makes sense during a rotation/.test(e)),
+      'startupErrors must explain the orphan-previous rejection'
+    );
+  } finally { restore(); }
+});
+
+// ---------------------------------------------------------------------------
 // Startup-time validation tests
 // ---------------------------------------------------------------------------
 

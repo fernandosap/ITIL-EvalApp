@@ -289,14 +289,28 @@ Reads HANA vars from `.env` or `--env-file`. Sets `APP_REVISION` from `git rev-p
     2. Rotate: set `RESULT_SIGNING_KEY_ID=v2`, `RESULT_SIGNING_KEY=<secret2>`, `RESULT_SIGNING_KEY_PREVIOUS_ID=v1`, `RESULT_SIGNING_KEY_PREVIOUS=<secret1>`. New envelopes get `kid=v2`; old envelopes (`kid=v1`) still verify because `keys["v1"]` still points to `<secret1>`.
     3. Drop the old key: remove the `*_PREVIOUS*` env vars. `keys["v1"]` is gone; old `kid=v1` envelopes now fail.
 
-    **Validation rules** (applied every call; hard-fail on boot in `STARTUP_STRICT` mode if the operator has set invalid config):
+    **Validation rules** (applied at parse time; misconfiguration surfaces in `startupSummary().errors` and blocks the HTTP listener from opening in `STARTUP_STRICT` mode):
     - `kid` must match `/^[A-Za-z0-9._-]{1,64}$/`. No whitespace, no slashes, no NUL.
     - `legacy` is reserved — operators may NOT use it as `RESULT_SIGNING_KEY_ID` (the slot is always populated by the derived secret, so a user-set `"legacy"` would be silently overwritten).
     - `RESULT_SIGNING_KEY_ID` and `RESULT_SIGNING_KEY_PREVIOUS_ID` must differ (otherwise `keys["v2"]` would be silently overwritten by the previous secret).
     - Secrets must be ≥ 32 chars. Generate with `crypto.randomBytes(32).toString('base64')` for ~44 chars.
-    - ID and secret must be set together (id without secret, or secret without id, is a typo and is rejected).
+    - ID and secret must be set TOGETHER (both directions checked):
+      - `currentId && !currentSecret` → reject (typo)
+      - `currentSecret && !currentId` → reject (typo)
+      - same for previousId/previousSecret
+    - **A previous key without a current key is rejected** — the "previous" is what we're rotating AWAY from, so there must be a current to rotate TO. Without this check the startup summary would report `signingKeyValid=true` while the runtime silently fell back to legacy.
+    - The validation runs in `parseSigningConfig` + `validateSigningConfig`
+      (pure, exported for tests). `getSigningKeyMap()` is the
+      silent runtime wrapper that always returns a usable keyMap
+      (legacy fallback if invalid). The startup path reads the
+      same config and lists errors in `startupSummary().errors`;
+      `startServer()` throws if `summary.errors.length` is non-zero
+      (i.e. STARTUP_STRICT is the natural behavior of `startServer`).
+      **`getSigningKeyMap()` itself never throws and safely falls
+      back to `legacy`** — invalid config is caught at boot, not
+      on first use.
 
-    The earlier implementation hard-coded `current → v1` and `previous → v2`, which broke rotation. The fix and the e2e tests are in `tests/signing-key-rotation.test.js` (9 hardening tests in addition to the 6 rotation tests).
+    The earlier implementation hard-coded `current → v1` and `previous → v2`, which broke rotation. The fix and the e2e tests are in `tests/signing-key-rotation.test.js` (21 tests covering rotation, edge-case validation, and startup-time surfacing).
 
 ## HANA findings (Fase 0, 2026-08-18)
 
@@ -608,37 +622,43 @@ Node's default trust store, so no `sslTrustStore` is needed.
 `/api/health` returns 200 with `db: connected` end-to-end
 through the validated TLS connection.
 
-### 4. Versioned result-signing key ✅ DONE (commits `5014841`, `fa63250`, **hardened** in current commit)
+### 4. Versioned result-signing key — code ✅ DONE (commits `5014841`, `fa63250`, `1f0991f`, `171813a`); **production migration ⏳ PENDING**
 
-`getSigningKeyMap()` returns `{ current, keys }` where `current`
-is the operator-supplied `RESULT_SIGNING_KEY_ID` and `keys`
-is a null-prototype object mapping each id to its secret.
+`parseSigningConfig(env)` (pure) reads the 4
+`RESULT_SIGNING_KEY*` env vars; `validateSigningConfig(config)`
+(pure) checks the rules listed in gotcha #18. `getSigningKeyMap()`
+is the silent runtime wrapper that always returns a usable
+keyMap (legacy fallback if invalid). The startup path reads
+the same config and lists errors in `startupSummary().errors`;
+`startServer()` throws if `summary.errors.length` is non-zero
+(i.e. STARTUP_STRICT is the natural behavior of `startServer`,
+no special-casing needed).
+
 **Key IDs are stable across rotations** — pick a new id for
 a new key, never re-use an old id for a new secret. Envelope
 format includes `kid`; the verifier looks up
 `keys[envelope.kid]`. Without any `RESULT_SIGNING_KEY*` env
 vars set, the app falls back to the legacy derived secret
-under the `legacy` kid and logs a warning at boot.
+under the `legacy` kid and logs a warning at boot. The
+fallback path for "no operator config at all" (clean env)
+is the same with or without STARTUP_STRICT — STARTUP_STRICT
+only catches the "operator-touched-but-invalid" case, not
+the "operator-never-touched" case.
 
-Validation (current commit): kid must match
-`/^[A-Za-z0-9._-]{1,64}$/`; secrets must be ≥ 32 chars;
-`legacy` is reserved; current/previous ids must differ; ID
-and secret must be set together. In `STARTUP_STRICT` mode,
-misconfiguration throws on the first call to
-`getSigningKeyMap()` (which happens at boot via the first
-signed result). With `STARTUP_STRICT` off, invalid config
-logs a warning and falls back to legacy. The fallback path
-for "no operator config at all" (clean env) is the same in
-both modes — STARTUP_STRICT only catches the
-"operator-touched-but-invalid" case, not the
-"operator-never-touched" case.
+Validation: kid must match `/^[A-Za-z0-9._-]{1,64}$/`;
+secrets must be ≥ 32 chars; `legacy` is reserved; current/
+previous ids must differ; ID and secret must be set together
+(both directions). Misconfig is surfaced in
+`startupSummary()` (and visible via `GET /api/admin/system-status`)
+before the HTTP listener opens.
 
-Production status (as of 2026-08-19): the BTP `cf env itil4-evalapp`
-output does NOT include any of the four `RESULT_SIGNING_KEY*`
-env vars. The app in production is therefore still using the
-`legacy` kid (the derived secret). Migrating to a dedicated
-key is a follow-up operator action — see branch-protection
-TODO in `Open items` for the related operational hardening.
+Production status (as of 2026-08-19): the BTP
+`cf env itil4-evalapp` output does NOT include any of the four
+`RESULT_SIGNING_KEY*` env vars. The app in production is
+therefore still using the `legacy` kid (the derived secret).
+Migrating to a dedicated key is a follow-up operator
+action — see branch-protection TODO in `Open items` for the
+related operational hardening.
 
 ### 5. Replace custom XSUAA JWT verifier with `@sap/xssec` — Investigated, deferred (P2)
 

@@ -395,6 +395,22 @@ function validateSigningConfig(config) {
     errors.push('RESULT_SIGNING_KEY_PREVIOUS is set but RESULT_SIGNING_KEY_PREVIOUS_ID is empty.');
   }
 
+  // A previous key without a current key makes no sense — the
+  // "previous" is what we're rotating AWAY from, so there must
+  // be a current to rotate TO. Without this check the startup
+  // summary would report signingKeyValid=true while the runtime
+  // silently falls back to legacy (since `currentValid` is
+  // false but `previousValid` is true, the map would have a v1
+  // slot with no consumer).
+  const currentConfigured = Boolean(config.currentId || config.currentSecret);
+  const previousConfigured = Boolean(config.previousId || config.previousSecret);
+  if (previousConfigured && !currentConfigured) {
+    errors.push(
+      'RESULT_SIGNING_KEY_PREVIOUS(_ID) is set without a current RESULT_SIGNING_KEY(_ID). ' +
+      'A previous key only makes sense during a rotation FROM a current key; configure both pairs.'
+    );
+  }
+
   return errors;
 }
 
