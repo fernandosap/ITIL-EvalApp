@@ -240,6 +240,8 @@ fallback when XSUAA is not bound.
 | `STALE_SESSION_MINUTES` | optional | Default 30. Used by sweeper and admin status. |
 | `AUTO_CLEAR_STALE_SESSIONS`, `STALE_SESSION_SWEEP_MINUTES` | optional | Default true / 10 |
 | `HANA_POOL_SIZE`, `HANA_POOL_PING_CHECK`, `HANA_POOL_TTL_SECONDS` | optional | Defaults 0 / true / 300. When `HANA_POOL_SIZE > 0`, `withDb` uses a pool. See gotcha #3. |
+| `RESULT_SIGNING_KEY` | recommended | 32+ char secret for new signed result summaries. When set, new envelopes use `kid=v1`. When unset, falls back to the legacy derived secret (logs a warning). |
+| `RESULT_SIGNING_KEY_PREVIOUS` | optional | Previous key during rotation. Envelopes signed with `kid=v2` keep verifying. |
 | `SLOW_QUERY_MS`, `SLOW_REQUEST_MS` | optional | Default 400 / 1200. Logs slow ops. |
 | `STARTUP_STRICT` | optional | `true` in current `.env`. If true, missing required config throws on boot. |
 | `APP_REVISION`, `APP_DEPLOYED_AT` | build | Set by `deploy_btp.sh` from git + date. |
@@ -280,6 +282,7 @@ Reads HANA vars from `.env` or `--env-file`. Sets `APP_REVISION` from `git rev-p
 15. **`/api/admin/me` is the canonical role probe** for the client. It works for any role (admin, manager, reviewer, content_editor) because it doesn't require a specific permission, only valid auth. Don't fall back to reading `data.role` from `/api/admin/codes` for the cookie-based XSUAA flow — codes requires `codes:read` which reviewers don't have.
 16. **`lib/audit.js` is a self-contained module** that owns the audit log + its metrics. Server.js just calls `tryWriteAdminAudit()` and exposes `audit.getMetrics()` in `/api/admin/metrics`. The metrics track `attempts / writes / skippedNoTable / skippedNoDb / failures / lastFailureAt / lastFailureMessage / auditTablePresent` so a quietly broken audit log (table dropped, HANA outage) is visible in metrics instead of being silently swallowed.
 17. **String literals for roles / code statuses / lifecycle / exam modes / audit actions** are in `shared/constants.js` (`ROLES`, `CODE_STATUS`, `QUESTION_SET_LIFECYCLE`, `EXAM_MODE`, `AUDIT_ACTION`). Use the constants, not raw strings — `grep " 'admin'"` should ideally be empty in the codebase.
+18. **Result-signing key is now versioned** — `getSigningKeyMap()` returns `{ current, keys: { v1, v2, legacy } }`. New envelopes carry a `kid`. To rotate, set `RESULT_SIGNING_KEY` (new) and `RESULT_SIGNING_KEY_PREVIOUS` (old) — both kids verify. Without `RESULT_SIGNING_KEY` set, the app falls back to the legacy derived secret and logs a warning. Historical envelopes (no `kid`) still verify via the `legacy` slot.
 
 ## HANA findings (Fase 0, 2026-08-18)
 
@@ -569,39 +572,37 @@ HANA audit trail (NOT `cf logs`) for any connections from
 non-CF source IPs in the window between 2026-08-18 and the
 rotation time.
 
-### 2. Migrate to Node 22 LTS + cflinuxfs5 (P1)
+### 2. Migrate to Node 22 LTS + cflinuxfs5 ✅ DONE (commit `28c77f5`)
 
-`engines.node` is `20.x` in `package.json`, but Node 20 reached
-EOL on 2026-04-30. SAP BTP continues to support it temporarily but
-will retire it. Plan: bump `engines.node` to `22.x`, validate
-`@sap/hana-client` compatibility (we're on `^2.25.27`, which
-supports 22), then re-pin the buildpack to a `cflinuxfs5`-ready
-buildpack version (the current pin `nodejs_buildpack#v1.9.1` is
-on `cflinuxfs4` and is itself deprecated). Validate end-to-end
-with a staging deploy + smoke test before touching prod.
+Node 22 LTS (`22.22.2`) is now live in BTP. `engines.node` is
+`22.x`, buildpack pin is `nodejs_buildpack#v1.9.2` (which
+removes EOL Node 20 and ships 22.22.2). The buildpack is still
+on `cflinuxfs4`; the cflinuxfs5 default kicks in Feb 2027 per
+SAP, so we'll do that migration as a separate commit when the
+timing is right (not urgent yet).
 
-### 3. HANA TLS certificate validation (P1)
+### 3. HANA TLS certificate validation ✅ DONE (commit `9bdfe27`)
 
-`HANA_SSL_VALIDATE_CERTIFICATE=false` is a known deviation from
-the SAP-recommended default. The justification at the time of
-deployment was pragmatic ("we couldn't get the cert chain
-trusted in a hurry"), but it should not stay this way
-indefinitely. Plan: enable `true` once the HANA Cloud CA chain
-is in the buildpack's default trust store (or ship a
-`sslTrustStore` PEM file with the app). Verify with a single
-`/api/health` call after enabling; the connection will fail at
-boot if the chain is untrusted, which is the right behavior.
+`HANA_SSL_VALIDATE_CERTIFICATE` is now `true` by default in both
+code and BTP. Verified that the HANA Cloud cert chain
+(`SAP SE → DigiCert G5 TLS RSA4096 SHA384 2021 CA1`) is in
+Node's default trust store, so no `sslTrustStore` is needed.
+`/api/health` returns 200 with `db: connected` end-to-end
+through the validated TLS connection.
 
-### 4. Versioned result-signing key (P2)
+### 4. Versioned result-signing key ✅ DONE (commit pending)
 
-`getSigningSecret()` derives from `HANA_PASSWORD +
-{role hashes} + APP_REVISION`. Rotating any of those invalidates
-historical signed result summaries (compliance exports).
-Plan: introduce a dedicated `RESULT_SIGNING_KEY` env var, add a
-`kid` (key id) to the envelope, and support a "current + previous"
-key set so old envelopes still verify during the transition.
-This is a protocol change — coordinate with anyone consuming
-signed summaries before deploying.
+`getSigningKeyMap()` returns a keyMap with `current` + `keys`
+shape. The envelope format now includes `kid`. New envelopes
+use the `current` kid; the verifier tries the envelope's kid
+first, then falls back to `legacy` (the old derived secret)
+for backwards compatibility with envelopes signed before this
+commit. Operators can rotate by setting `RESULT_SIGNING_KEY`
+(new) and `RESULT_SIGNING_KEY_PREVIOUS` (old) — both kids
+verify in the transition window. The fallback-to-legacy
+warning is logged at boot if `RESULT_SIGNING_KEY` is not set,
+so a future operator notices. The new env vars are documented
+in the env-var table above.
 
 ### 5. Replace custom XSUAA JWT verifier with `@sap/xssec` (P2)
 

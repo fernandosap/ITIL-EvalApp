@@ -274,7 +274,11 @@ function appLog(level, event, meta = {}) {
   console.log(JSON.stringify({ ts: new Date().toISOString(), level, event, ...meta }));
 }
 
-function getSigningSecret() {
+// Legacy signing secret — derived from environment values. Kept so
+// historical signed result summaries (signed before the versioned
+// `RESULT_SIGNING_KEY` was introduced) still verify. New envelopes
+// use the versioned `getSigningKeyMap()` instead.
+function getLegacySigningSecret() {
   return crypto
     .createHash('sha256')
     .update([
@@ -288,16 +292,48 @@ function getSigningSecret() {
     .digest('hex');
 }
 
+// Versioned signing key map.
+//
+// Env vars (in priority order):
+//   RESULT_SIGNING_KEY          — required for new envelopes. 32+ chars.
+//   RESULT_SIGNING_KEY_PREVIOUS — optional, for rotation. 32+ chars.
+//
+// The shape returned matches what lib/responses.js's
+// buildSignedEnvelope / verifySignedEnvelope expect:
+//   { current: 'v1', keys: { v1: '...', v2: '...', legacy: '...' } }
+//
+// If RESULT_SIGNING_KEY is not set, falls back to the legacy
+// derived secret under the 'legacy' kid (so old deploys without
+// the new env var keep working). A warning is logged.
+function getSigningKeyMap() {
+  const keys = {};
+  const current = process.env.RESULT_SIGNING_KEY || '';
+  const previous = process.env.RESULT_SIGNING_KEY_PREVIOUS || '';
+  if (current) keys.v1 = String(current);
+  if (previous) keys.v2 = String(previous);
+  keys.legacy = getLegacySigningSecret();
+  // Decide the primary for new signs. If RESULT_SIGNING_KEY is set,
+  // use it; otherwise fall back to legacy (with a warning).
+  if (current) {
+    return { current: 'v1', keys };
+  }
+  appLog('warn', 'result_signing_key_missing', {
+    hint: 'RESULT_SIGNING_KEY env var is not set. Falling back to legacy derived secret. New envelopes will use kid=legacy.'
+  });
+  return { current: 'legacy', keys };
+}
+
 // Signed-envelope helpers are now in lib/responses.js. Local thin
-// wrappers keep the existing call sites readable (no need to pass the
-// signing secret on every call) and stay in lockstep with the per-env
-// getSigningSecret() value.
+// wrappers keep the existing call sites readable (no need to pass
+// the keyMap on every call) and stay in lockstep with the per-env
+// values.
 function signPayload(payload) {
-  const json = JSON.stringify(payload);
-  return crypto.createHmac('sha256', getSigningSecret()).update(json).digest('hex');
+  const keyMap = getSigningKeyMap();
+  const kid = keyMap.current;
+  return crypto.createHmac('sha256', keyMap.keys[kid]).update(JSON.stringify(payload)).digest('hex');
 }
 function buildSignedEnvelopeLocal(payload) {
-  return buildSignedEnvelope(payload, getSigningSecret());
+  return buildSignedEnvelope(payload, getSigningKeyMap());
 }
 
 function getMetricsSnapshot() {
@@ -1856,11 +1892,22 @@ app.get('/api/admin/results/:code/signed-summary', requireAdmin, requirePermissi
 });
 
 app.post('/api/admin/results/verify-signature', requireAdmin, requirePermission('compliance:read'), (req, res) => {
-  const payload = req.body?.payload;
-  const signature = String(req.body?.signature || '');
+  // Caller can submit the full envelope (preferred — uses kid-based
+  // verification with rotation support), or the legacy
+  // { payload, signature } pair (recomputed against the current key,
+  // for back-compat with the original endpoint shape).
+  const body = req.body || {};
+  if (body.payload !== undefined && body.signature && body.algorithm) {
+    const envelope = { payload: body.payload, signature: String(body.signature), algorithm: body.algorithm, kid: body.kid };
+    const matched = verifySignedEnvelope(envelope, getSigningKeyMap());
+    return res.json({ ok: true, valid: matched !== null, matchedKid: matched ? matched.kid : null });
+  }
+  const payload = body.payload;
+  const signature = String(body.signature || '');
   if (!payload || !signature) return res.status(400).json({ error: 'payload_and_signature_required' });
+  // Legacy shape: just check the current key.
   const expected = signPayload(payload);
-  res.json({ ok: true, valid: expected === signature, expected });
+  res.json({ ok: true, valid: expected === signature, matchedKid: getSigningKeyMap().current });
 });
 
 // ---------------------------------------------------------------------------
@@ -3778,7 +3825,10 @@ module.exports = {
   getSweeperStatus,
   signPayload,
   buildSignedEnvelope: buildSignedEnvelopeLocal,
-  getSigningSecret
+  // Legacy export kept so the few remaining internal references
+  // still work. New code should use getSigningKeyMap().
+  getSigningSecret: getLegacySigningSecret,
+  getSigningKeyMap
 };
 
 if (require.main === module) {

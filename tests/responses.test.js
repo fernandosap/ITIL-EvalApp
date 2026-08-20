@@ -124,69 +124,130 @@ test('parseAnthropicText: handles missing text field gracefully', () => {
   assert.equal(parseAnthropicText(content), 'ok');
 });
 
-test('buildSignedEnvelope: throws without secret', () => {
-  assert.throws(() => buildSignedEnvelope({ x: 1 }, null), /secret is required/);
-  assert.throws(() => buildSignedEnvelope({ x: 1 }, ''), /secret is required/);
+test('buildSignedEnvelope: throws without keyMap', () => {
+  assert.throws(() => buildSignedEnvelope({ x: 1 }, null), /keyMap must have/);
+  assert.throws(() => buildSignedEnvelope({ x: 1 }, {}), /keyMap must have/);
+  assert.throws(() => buildSignedEnvelope({ x: 1 }, { current: 'v1' }), /keyMap must have/);
 });
 
-test('buildSignedEnvelope: returns payload, signature, algorithm', () => {
-  const env = buildSignedEnvelope({ code: 'ABC', score: 80 }, 'mysecret');
+test('buildSignedEnvelope: throws when the current kid is missing from keys', () => {
+  const km = { current: 'v9', keys: { v1: 's' } };
+  assert.throws(() => buildSignedEnvelope({ x: 1 }, km), /v9.*is missing/);
+});
+
+test('buildSignedEnvelope: returns payload, signature, algorithm, kid', () => {
+  const km = { current: 'v1', keys: { v1: 'mysecret' } };
+  const env = buildSignedEnvelope({ code: 'ABC', score: 80 }, km);
   assert.equal(env.algorithm, SIGNING_ALGORITHM);
   assert.equal(env.algorithm, 'HMAC-SHA256');
   assert.deepEqual(env.payload, { code: 'ABC', score: 80 });
+  assert.equal(env.kid, 'v1');
   assert.match(env.signature, /^[a-f0-9]{64}$/);
 });
 
-test('buildSignedEnvelope: signature is deterministic for same payload + secret', () => {
-  const a = buildSignedEnvelope({ x: 1 }, 's');
-  const b = buildSignedEnvelope({ x: 1 }, 's');
+test('buildSignedEnvelope: signature is deterministic for same payload + same key', () => {
+  const km = { current: 'v1', keys: { v1: 's' } };
+  const a = buildSignedEnvelope({ x: 1 }, km);
+  const b = buildSignedEnvelope({ x: 1 }, km);
   assert.equal(a.signature, b.signature);
 });
 
-test('buildSignedEnvelope: signature differs for different secrets', () => {
-  const a = buildSignedEnvelope({ x: 1 }, 's1');
-  const b = buildSignedEnvelope({ x: 1 }, 's2');
+test('buildSignedEnvelope: signature differs for different keys', () => {
+  const a = buildSignedEnvelope({ x: 1 }, { current: 'v1', keys: { v1: 's1' } });
+  const b = buildSignedEnvelope({ x: 1 }, { current: 'v1', keys: { v1: 's2' } });
   assert.notEqual(a.signature, b.signature);
 });
 
-test('verifySignedEnvelope: round-trip succeeds', () => {
-  const env = buildSignedEnvelope({ code: 'ABC', score: 80 }, 'mysecret');
-  assert.equal(verifySignedEnvelope(env, 'mysecret'), true);
+test('buildSignedEnvelope: uses the kid named in `current` for new envelopes', () => {
+  const km = { current: 'v2', keys: { v1: 'old', v2: 'new' } };
+  const env = buildSignedEnvelope({ x: 1 }, km);
+  assert.equal(env.kid, 'v2');
+});
+
+test('verifySignedEnvelope: round-trip with matching current kid', () => {
+  const km = { current: 'v1', keys: { v1: 'mysecret' } };
+  const env = buildSignedEnvelope({ code: 'ABC', score: 80 }, km);
+  const matched = verifySignedEnvelope(env, km);
+  assert.ok(matched);
+  assert.equal(matched.kid, 'v1');
+});
+
+test('verifySignedEnvelope: round-trip with rotated key (v2 current, envelope v1)', () => {
+  // After rotation: current=v2, v1 kept as a "previous" key.
+  // Envelopes signed with v1 must still verify.
+  const kmOld = { current: 'v1', keys: { v1: 'old-secret' } };
+  const env = buildSignedEnvelope({ x: 1 }, kmOld);
+  const kmNew = { current: 'v2', keys: { v1: 'old-secret', v2: 'new-secret' } };
+  const matched = verifySignedEnvelope(env, kmNew);
+  assert.ok(matched);
+  assert.equal(matched.kid, 'v1', 'should fall back to v1 from the keyMap');
+});
+
+test('verifySignedEnvelope: round-trip via legacy slot for envelopes without kid', () => {
+  // Historical envelopes predate the kid system. The legacy slot
+  // catches them by checking with the derived-secret key.
+  const km = { current: 'v1', keys: { v1: 'new-secret', legacy: 'legacy-derived' } };
+  // Simulate an envelope with no kid — what legacy systems produced.
+  const legacyEnv = {
+    payload: { x: 1 },
+    signature: require('crypto').createHmac('sha256', 'legacy-derived').update(JSON.stringify({ x: 1 })).digest('hex'),
+    algorithm: 'HMAC-SHA256'
+    // no kid
+  };
+  const matched = verifySignedEnvelope(legacyEnv, km);
+  assert.ok(matched);
+  assert.equal(matched.kid, 'legacy');
 });
 
 test('verifySignedEnvelope: detects tampered payload', () => {
-  const env = buildSignedEnvelope({ code: 'ABC', score: 80 }, 'mysecret');
+  const km = { current: 'v1', keys: { v1: 'mysecret' } };
+  const env = buildSignedEnvelope({ code: 'ABC', score: 80 }, km);
   const tampered = { ...env, payload: { code: 'ABC', score: 100 } };
-  assert.equal(verifySignedEnvelope(tampered, 'mysecret'), false);
+  assert.equal(verifySignedEnvelope(tampered, km), null);
 });
 
 test('verifySignedEnvelope: detects tampered signature', () => {
-  const env = buildSignedEnvelope({ code: 'ABC', score: 80 }, 'mysecret');
+  const km = { current: 'v1', keys: { v1: 'mysecret' } };
+  const env = buildSignedEnvelope({ code: 'ABC', score: 80 }, km);
   const tampered = { ...env, signature: 'a'.repeat(64) };
-  assert.equal(verifySignedEnvelope(tampered, 'mysecret'), false);
+  assert.equal(verifySignedEnvelope(tampered, km), null);
 });
 
-test('verifySignedEnvelope: rejects wrong secret', () => {
-  const env = buildSignedEnvelope({ x: 1 }, 'correct');
-  assert.equal(verifySignedEnvelope(env, 'wrong'), false);
+test('verifySignedEnvelope: rejects when no key in the map matches', () => {
+  const env = buildSignedEnvelope({ x: 1 }, { current: 'v1', keys: { v1: 's1' } });
+  // Now try to verify with a completely different keyMap (no v1, no legacy).
+  const km = { current: 'v2', keys: { v2: 'something-else' } };
+  assert.equal(verifySignedEnvelope(env, km), null);
 });
 
 test('verifySignedEnvelope: rejects malformed envelope', () => {
-  assert.equal(verifySignedEnvelope(null, 's'), false);
-  assert.equal(verifySignedEnvelope(undefined, 's'), false);
-  assert.equal(verifySignedEnvelope({}, 's'), false);
-  assert.equal(verifySignedEnvelope({ payload: {}, signature: 'x' }, 's'), false); // wrong algorithm
-  assert.equal(verifySignedEnvelope({ algorithm: SIGNING_ALGORITHM, signature: 'a'.repeat(64) }, 's'), false); // no payload
+  const km = { current: 'v1', keys: { v1: 's' } };
+  assert.equal(verifySignedEnvelope(null, km), null);
+  assert.equal(verifySignedEnvelope(undefined, km), null);
+  assert.equal(verifySignedEnvelope({}, km), null);
+  assert.equal(verifySignedEnvelope({ payload: {}, signature: 'x' }, km), null); // wrong algorithm
+  assert.equal(verifySignedEnvelope({ algorithm: SIGNING_ALGORITHM, signature: 'a'.repeat(64) }, km), null); // no payload
+  assert.equal(verifySignedEnvelope({ payload: { x: 1 }, signature: 'a'.repeat(64), algorithm: SIGNING_ALGORITHM }, null), null); // no keyMap
 });
 
 test('verifySignedEnvelope: rejects signature of wrong length', () => {
-  const env = buildSignedEnvelope({ x: 1 }, 's');
+  const km = { current: 'v1', keys: { v1: 's' } };
+  const env = buildSignedEnvelope({ x: 1 }, km);
   const bad = { ...env, signature: 'short' };
-  assert.equal(verifySignedEnvelope(bad, 's'), false);
+  assert.equal(verifySignedEnvelope(bad, km), null);
 });
 
-test('verifySignedEnvelope: rejects without secret', () => {
-  const env = buildSignedEnvelope({ x: 1 }, 's');
-  assert.equal(verifySignedEnvelope(env, null), false);
-  assert.equal(verifySignedEnvelope(env, ''), false);
+test('verifySignedEnvelope: handles unknown kid (falls back to legacy)', () => {
+  // An envelope claiming kid=v999, when v999 is not in the keyMap,
+  // falls back to the legacy slot. Useful when an attacker copies
+  // a valid envelope but changes the kid field; they still need to
+  // match the legacy signature, which they can't forge.
+  const km = { current: 'v1', keys: { v1: 's', legacy: 'l' } };
+  const realEnv = buildSignedEnvelope({ x: 1 }, { current: 'v1', keys: { v1: 's' } });
+  const tamperedKid = { ...realEnv, kid: 'v999' };
+  // tamperedKid is NOT signed with v1 anymore (the signature was
+  // computed with the v1 key but the verifier will try v999 first,
+  // then legacy). Neither v999 nor legacy is the right key, so
+  // verification fails.
+  assert.equal(verifySignedEnvelope(tamperedKid, km), null);
 });
