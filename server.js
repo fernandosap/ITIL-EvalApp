@@ -90,7 +90,7 @@ const HANA_PASSWORD = process.env.HANA_PASSWORD;
 const HANA_SCHEMA = process.env.HANA_SCHEMA || 'ITIL_EXAM';
 const HANA_ENCRYPT = String(process.env.HANA_ENCRYPT || 'true').toLowerCase() === 'true';
 const HANA_SSL_VALIDATE_CERTIFICATE =
-  String(process.env.HANA_SSL_VALIDATE_CERTIFICATE || 'false').toLowerCase() === 'true';
+  String(process.env.HANA_SSL_VALIDATE_CERTIFICATE || 'true').toLowerCase() === 'true';
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514';
 const ANTHROPIC_VERSION = process.env.ANTHROPIC_VERSION || '2023-06-01';
@@ -419,8 +419,8 @@ function startupErrors() {
 
 function startupWarnings() {
   const warnings = [];
-  if (HANA_ENCRYPT && HANA_SSL_VALIDATE_CERTIFICATE === false) {
-    warnings.push('HANA TLS certificate validation is disabled.');
+  if (!HANA_ENCRYPT) {
+    warnings.push('HANA encryption is disabled. Connection is plaintext.');
   }
   if (!ADMIN_HASH) warnings.push('ADMIN_HASH is not configured. Admin login is disabled.');
   if (!MANAGER_HASH) warnings.push('MANAGER_HASH is not configured. Manager login is disabled.');

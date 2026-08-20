@@ -233,7 +233,7 @@ fallback when XSUAA is not bound.
 |---|---|---|
 | `HANA_HOST`, `HANA_PORT`, `HANA_USER`, `HANA_PASSWORD`, `HANA_SCHEMA` | ✅ | Prod schema is `ITIL_EXAM`. |
 | `HANA_ENCRYPT` | optional | `true` by default |
-| `HANA_SSL_VALIDATE_CERTIFICATE` | **debt** | `false` is current (the app warns at boot). **Default in `@sap/hana-client` is `true` and SAP recommends leaving it on.** This is a known security debt — see "Open security debt" below for the migration plan. |
+| `HANA_SSL_VALIDATE_CERTIFICATE` | optional | **`true` is the default** (and what we run in BTP). The HANA Cloud cert is signed by DigiCert G5 which is in the Node.js default trust store, so no custom `sslTrustStore` is needed. Set to `false` only as a last-resort workaround for a misconfigured CA. |
 | `ADMIN_HASH`, `MANAGER_HASH`, `REVIEWER_HASH`, `CONTENT_EDITOR_HASH` | optional | 64-char SHA-256 hex of role password. If absent, that role's login is disabled. |
 | `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `ANTHROPIC_VERSION` | optional | If absent, proctor endpoint returns `{ enabled: false }` |
 | `EXAM_NAME`, `EXAM_DURATION_SECS`, `EXAM_PASS_PCT`, `EXAM_ACTIVE`, `PROCTOR_ENABLED` | optional | Defaults: 45min, 80%, true, true |
