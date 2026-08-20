@@ -314,14 +314,18 @@ function getLegacySigningSecret() {
 // operator promotes a new key, as long as the previous key + its
 // id are still configured.
 //
-// Validation rules (applied on every call; in STARTUP_STRICT mode
-// invalid config throws on boot):
+// Validation rules (applied at parse time; in STARTUP_STRICT mode
+// invalid config throws during startupErrors() — i.e. before the
+// HTTP listener opens):
 //   - kid must match /^[A-Za-z0-9._-]{1,64}$/
 //   - 'legacy' is a reserved id; operators may not use it
 //   - currentId and previousId must differ
 //   - secrets must be at least 32 chars
-//   - if RESULT_SIGNING_KEY_ID is set, RESULT_SIGNING_KEY must be set
-//   - if RESULT_SIGNING_KEY_PREVIOUS_ID is set, RESULT_SIGNING_KEY_PREVIOUS must be set
+//   - id and secret must be set TOGETHER (both directions):
+//       id without secret  → reject
+//       secret without id  → reject
+//   - operatorTouchedSigningConfig: at least one of the 4 env vars
+//     is non-empty
 //
 // If none of the above is satisfied, the app falls back to the
 // legacy derived secret under the 'legacy' kid — for backward
@@ -331,106 +335,109 @@ const SIGNING_KID_FORMAT = /^[A-Za-z0-9._-]{1,64}$/;
 const SIGNING_KID_RESERVED = 'legacy';
 const SIGNING_SECRET_MIN_LENGTH = 32;
 
-function validateSigningKid(value, fieldName) {
-  if (value && !SIGNING_KID_FORMAT.test(value)) {
-    throw new Error(
-      `${fieldName}="${value}" is invalid. Kids must match ${SIGNING_KID_FORMAT} (1-64 chars, [A-Za-z0-9._-]).`
-    );
-  }
-  if (value === SIGNING_KID_RESERVED) {
-    throw new Error(
-      `${fieldName}="${SIGNING_KID_RESERVED}" is reserved for the legacy derived secret. Pick a different id.`
-    );
-  }
+// Pure: parse the 4 RESULT_SIGNING_KEY* env vars into a plain
+// object. No validation, no logging, no side effects. Used by both
+// the runtime path (getSigningKeyMap) and the startup path
+// (startupErrors) so they see the same input.
+function parseSigningConfig(env) {
+  return {
+    currentId: env.RESULT_SIGNING_KEY_ID || '',
+    currentSecret: env.RESULT_SIGNING_KEY || '',
+    previousId: env.RESULT_SIGNING_KEY_PREVIOUS_ID || '',
+    previousSecret: env.RESULT_SIGNING_KEY_PREVIOUS || ''
+  };
 }
 
-function validateSigningSecret(value, fieldName) {
-  if (value && value.length < SIGNING_SECRET_MIN_LENGTH) {
-    throw new Error(
-      `${fieldName} must be at least ${SIGNING_SECRET_MIN_LENGTH} chars (got ${value.length}). Generate a stronger secret.`
-    );
-  }
-}
-
-function getSigningKeyMap() {
-  // Object.create(null) so a kid of '__proto__' / 'constructor' /
-  // 'hasOwnProperty' can't shadow built-ins. We control the key
-  // format but defense in depth is cheap.
-  const keys = Object.create(null);
-
-  // Read raw env vars. We do NOT trim() — whitespace in a kid is a
-  // typo and should fail validation, not silently become a valid id.
-  const currentId = (process.env.RESULT_SIGNING_KEY_ID || '');
-  const currentSecret = process.env.RESULT_SIGNING_KEY || '';
-  const previousId = (process.env.RESULT_SIGNING_KEY_PREVIOUS_ID || '');
-  const previousSecret = process.env.RESULT_SIGNING_KEY_PREVIOUS || '';
-
-  // Hard-validate the configuration. When STARTUP_STRICT is on
-  // and the operator has set any signing env var, misconfiguration
-  // should fail startup rather than silently fall back. When
-  // STARTUP_STRICT is off, we log a warning and fall back.
-  const operatorTouchedSigningConfig = Boolean(
-    currentId || currentSecret || previousId || previousSecret
-  );
+// Pure: validate a parsed config. Returns an array of error
+// messages (empty = valid). No logging, no side effects.
+function validateSigningConfig(config) {
   const errors = [];
-  if (currentId) {
-    try { validateSigningKid(currentId, 'RESULT_SIGNING_KEY_ID'); }
-    catch (e) { errors.push(e.message); }
+  const { currentId, currentSecret, previousId, previousSecret } = config;
+
+  // Kid format + reserved id.
+  if (currentId && !SIGNING_KID_FORMAT.test(currentId)) {
+    errors.push(`RESULT_SIGNING_KEY_ID="${currentId}" is invalid. Kids must match ${SIGNING_KID_FORMAT} (1-64 chars, [A-Za-z0-9._-]).`);
   }
-  if (previousId) {
-    try { validateSigningKid(previousId, 'RESULT_SIGNING_KEY_PREVIOUS_ID'); }
-    catch (e) { errors.push(e.message); }
+  if (previousId && !SIGNING_KID_FORMAT.test(previousId)) {
+    errors.push(`RESULT_SIGNING_KEY_PREVIOUS_ID="${previousId}" is invalid. Kids must match ${SIGNING_KID_FORMAT} (1-64 chars, [A-Za-z0-9._-]).`);
   }
+  if (currentId === SIGNING_KID_RESERVED || previousId === SIGNING_KID_RESERVED) {
+    errors.push(`"${SIGNING_KID_RESERVED}" is reserved for the legacy derived secret. Pick a different id.`);
+  }
+
+  // Kids must differ.
   if (currentId && previousId && currentId === previousId) {
     errors.push(
       `RESULT_SIGNING_KEY_ID (${currentId}) and RESULT_SIGNING_KEY_PREVIOUS_ID (${previousId}) are the same. ` +
       `Use distinct ids so rotation actually moves traffic to the new key.`
     );
   }
-  if (currentSecret) {
-    try { validateSigningSecret(currentSecret, 'RESULT_SIGNING_KEY'); }
-    catch (e) { errors.push(e.message); }
+
+  // Secret length.
+  if (currentSecret && currentSecret.length < SIGNING_SECRET_MIN_LENGTH) {
+    errors.push(`RESULT_SIGNING_KEY must be at least ${SIGNING_SECRET_MIN_LENGTH} chars (got ${currentSecret.length}). Generate a stronger secret.`);
   }
-  if (previousSecret) {
-    try { validateSigningSecret(previousSecret, 'RESULT_SIGNING_KEY_PREVIOUS'); }
-    catch (e) { errors.push(e.message); }
+  if (previousSecret && previousSecret.length < SIGNING_SECRET_MIN_LENGTH) {
+    errors.push(`RESULT_SIGNING_KEY_PREVIOUS must be at least ${SIGNING_SECRET_MIN_LENGTH} chars (got ${previousSecret.length}). Generate a stronger secret.`);
   }
+
+  // ID and secret must be set together (both directions).
   if (currentId && !currentSecret) {
     errors.push('RESULT_SIGNING_KEY_ID is set but RESULT_SIGNING_KEY is empty.');
+  }
+  if (currentSecret && !currentId) {
+    errors.push('RESULT_SIGNING_KEY is set but RESULT_SIGNING_KEY_ID is empty.');
   }
   if (previousId && !previousSecret) {
     errors.push('RESULT_SIGNING_KEY_PREVIOUS_ID is set but RESULT_SIGNING_KEY_PREVIOUS is empty.');
   }
-
-  if (errors.length) {
-    const msg = `Result signing key configuration is invalid:\n  - ${errors.join('\n  - ')}`;
-    if (STARTUP_STRICT && operatorTouchedSigningConfig) {
-      throw new Error(msg);
-    }
-    appLog('warn', 'result_signing_key_invalid', { errors });
+  if (previousSecret && !previousId) {
+    errors.push('RESULT_SIGNING_KEY_PREVIOUS is set but RESULT_SIGNING_KEY_PREVIOUS_ID is empty.');
   }
 
-  // If validation passed, build the map. If anything was wrong
-  // and we got here (STARTUP_STRICT off), we fall back to legacy.
-  const currentValid = currentId && currentSecret && errors.length === 0;
-  const previousValid = previousId && previousSecret && errors.length === 0;
+  return errors;
+}
 
-  if (currentValid) keys[currentId] = String(currentSecret);
-  if (previousValid) keys[previousId] = String(previousSecret);
+function isOperatorSigningConfig(config) {
+  return Boolean(
+    config.currentId || config.currentSecret ||
+    config.previousId || config.previousSecret
+  );
+}
+
+// Build the keyMap from process.env. Used by the runtime path
+// (signPayload, buildSignedEnvelopeLocal, /verify-signature).
+// NEVER throws — falls back to legacy and logs a warning instead.
+// The startup-time validation is in startupErrors(), which calls
+// this only for the side effect of validating the env (but the
+// result of this function in startup is discarded).
+function getSigningKeyMap() {
+  const config = parseSigningConfig(process.env);
+  const errors = validateSigningConfig(config);
+  const keys = Object.create(null);
+
+  const currentValid = config.currentId && config.currentSecret && errors.length === 0;
+  const previousValid = config.previousId && config.previousSecret && errors.length === 0;
+
+  if (currentValid) keys[config.currentId] = String(config.currentSecret);
+  if (previousValid) keys[config.previousId] = String(config.previousSecret);
 
   // legacy slot is always populated (for backwards compat with
   // envelopes signed before the versioned system was introduced).
   keys[SIGNING_KID_RESERVED] = getLegacySigningSecret();
 
   if (currentValid) {
-    return { current: currentId, keys };
+    return { current: config.currentId, keys };
   }
 
-  // No usable current key. Fall back to legacy. We log a warning
-  // here so a future operator notices their config isn't taking.
-  if (operatorTouchedSigningConfig) {
+  // No usable current key. Log a one-shot warning so an operator
+  // notices their config isn't taking. The build is the same on
+  // every call so we could memoize, but the warning only fires when
+  // the operator's config is non-empty (so it's a "first time we
+  // notice" warning, not a per-request one).
+  if (isOperatorSigningConfig(config)) {
     appLog('warn', 'result_signing_key_unusable', {
-      hint: 'Signing key env vars are set but not usable (see prior warnings). Falling back to legacy derived secret.'
+      hint: 'Signing key env vars are set but not usable. Falling back to legacy derived secret. kid=legacy on all new envelopes.'
     });
   } else {
     appLog('warn', 'result_signing_key_missing', {
@@ -567,6 +574,19 @@ function startupErrors() {
   if (MANAGER_HASH && !isSha256Hex(MANAGER_HASH)) errors.push('MANAGER_HASH is not a 64-char SHA-256 hex string.');
   if (REVIEWER_HASH && !isSha256Hex(REVIEWER_HASH)) errors.push('REVIEWER_HASH is not a 64-char SHA-256 hex string.');
   if (CONTENT_EDITOR_HASH && !isSha256Hex(CONTENT_EDITOR_HASH)) errors.push('CONTENT_EDITOR_HASH is not a 64-char SHA-256 hex string.');
+  // Signing-key configuration: validate at startup, not on first
+  // use. The operator-touched-and-invalid case is checked here, so
+  // a misconfigured deploy fails fast (in STARTUP_STRICT mode it
+  // would already have thrown via startServer(); here we just
+  // surface the error in startupSummary so the operator can see
+  // what happened before the HTTP listener opened).
+  const signingConfig = parseSigningConfig(process.env);
+  const signingErrors = validateSigningConfig(signingConfig);
+  if (signingErrors.length && isOperatorSigningConfig(signingConfig)) {
+    errors.push(
+      'Result signing key configuration is invalid: ' + signingErrors.join('; ')
+    );
+  }
   return errors;
 }
 
@@ -584,6 +604,12 @@ function startupWarnings() {
 }
 
 function startupSummary() {
+  // Snapshot the signing config at boot so the summary reflects
+  // what the operator set. Calling getSigningKeyMap() here would
+  // trigger a warning log if the config is invalid; we want the
+  // summary to be side-effect-free.
+  const signingConfig = parseSigningConfig(process.env);
+  const signingConfigValid = validateSigningConfig(signingConfig).length === 0;
   return {
     ok: startupErrors().length === 0,
     errors: startupErrors(),
@@ -600,7 +626,20 @@ function startupSummary() {
       contentEditorConfigured: Boolean(CONTENT_EDITOR_HASH),
       anthropicConfigured: Boolean(ANTHROPIC_API_KEY),
       autoClearStaleSessions: AUTO_CLEAR_STALE_SESSIONS,
-      staleSessionSweepMinutes: STALE_SESSION_SWEEP_MINUTES
+      staleSessionSweepMinutes: STALE_SESSION_SWEEP_MINUTES,
+      // Signing config summary. The key is "configured" if the
+      // operator set any of the 4 RESULT_SIGNING_KEY* env vars;
+      // "valid" means the set is consistent (kids well-formed,
+      // distinct, secrets >= 32 chars, etc.). "activeKid" is what
+      // the runtime would actually use (matches the `current`
+      // field in the keyMap). If `configured` is false (no
+      // operator config) OR `valid` is false (operator-touched-
+      // but-invalid), `activeKid` falls back to "legacy".
+      signingKeyConfigured: isOperatorSigningConfig(signingConfig),
+      signingKeyValid: signingConfigValid,
+      signingActiveKid: (isOperatorSigningConfig(signingConfig) && signingConfigValid)
+        ? signingConfig.currentId
+        : SIGNING_KID_RESERVED
     }
   };
 }
@@ -3939,13 +3978,20 @@ module.exports = {
   normalizeExamTitle,
   validateQuestionUploadEntries,
   startupSummary,
+  // startupErrors is exported for tests so they can assert that
+  // an invalid signing-key config is surfaced in the boot path
+  // (rather than only on first use). Not part of the public API.
+  startupErrors,
   getSweeperStatus,
   signPayload,
   buildSignedEnvelope: buildSignedEnvelopeLocal,
   // Legacy export kept so the few remaining internal references
   // still work. New code should use getSigningKeyMap().
   getSigningSecret: getLegacySigningSecret,
-  getSigningKeyMap
+  getSigningKeyMap,
+  // Pure helpers used by both runtime + startup + tests.
+  parseSigningConfig,
+  validateSigningConfig
 };
 
 if (require.main === module) {

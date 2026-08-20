@@ -339,7 +339,13 @@ test('getSigningKeyMap: keys map is Object.create(null) (prototype-pollution saf
   } finally { restore(); }
 });
 
-test('getSigningKeyMap: STARTUP_STRICT=true + invalid config throws on first call', () => {
+test('getSigningKeyMap: STARTUP_STRICT=true + invalid config is surfaced in startupErrors (not thrown from getSigningKeyMap)', () => {
+  // Earlier design had getSigningKeyMap() throw when STARTUP_STRICT
+  // was on. The cleaner design moves the throw to the startup
+  // path (startServer() reads startupErrors() and throws if any),
+  // so that the HTTP listener never opens with bad config.
+  // getSigningKeyMap() itself is silent and always returns a
+  // keyMap (the legacy fallback if needed).
   const env = {
     HANA_PASSWORD: 'p', ADMIN_HASH: 'a', MANAGER_HASH: 'm',
     REVIEWER_HASH: 'r', CONTENT_EDITOR_HASH: 'c', APP_REVISION: 'v',
@@ -349,7 +355,20 @@ test('getSigningKeyMap: STARTUP_STRICT=true + invalid config throws on first cal
   };
   const { getSigningKeyMap, restore } = loadServerWithEnv(env);
   try {
-    assert.throws(() => getSigningKeyMap(), /RESULT_SIGNING_KEY_ID .*RESULT_SIGNING_KEY_PREVIOUS_ID .* are the same/);
+    // getSigningKeyMap no longer throws — it's always silent.
+    const km = getSigningKeyMap();
+    assert.equal(km.current, 'legacy',
+      'invalid config falls back to legacy; the throw happens at startup');
+
+    // The error is surfaced via startupErrors, where the boot
+    // path (startServer) checks it and throws BEFORE the HTTP
+    // listener opens.
+    const { startupErrors } = require('../server.js');
+    const errors = startupErrors();
+    assert.ok(
+      errors.some((e) => /RESULT_SIGNING_KEY_ID .*RESULT_SIGNING_KEY_PREVIOUS_ID .* are the same/.test(e)),
+      'startupErrors must list the signing-config error'
+    );
   } finally { restore(); }
 });
 
@@ -384,5 +403,135 @@ test('getSigningKeyMap: missing RESULT_SIGNING_KEY env with STARTUP_STRICT=true 
     const km = getSigningKeyMap();
     assert.equal(km.current, 'legacy',
       'no config = legacy, not throw');
+  } finally { restore(); }
+});
+
+// ---------------------------------------------------------------------------
+// Inverse-direction checks: secret without id
+// ---------------------------------------------------------------------------
+
+test('getSigningKeyMap: rejects secret without id (current)', () => {
+  // Symmetric to the "id without secret" case: setting only
+  // RESULT_SIGNING_KEY (no _ID) is also a typo. The previous
+  // implementation only checked one direction, so this slipped
+  // through. The hardened version catches both.
+  const env = {
+    HANA_PASSWORD: 'p', ADMIN_HASH: 'a', MANAGER_HASH: 'm',
+    REVIEWER_HASH: 'r', CONTENT_EDITOR_HASH: 'c', APP_REVISION: 'v',
+    STARTUP_STRICT: 'false',
+    RESULT_SIGNING_KEY_ID: null, RESULT_SIGNING_KEY: secret('orphan'),
+    RESULT_SIGNING_KEY_PREVIOUS_ID: null, RESULT_SIGNING_KEY_PREVIOUS: null
+  };
+  const { getSigningKeyMap, restore } = loadServerWithEnv(env);
+  try {
+    const km = getSigningKeyMap();
+    assert.equal(km.current, 'legacy',
+      'secret-without-id must fall back to legacy, not silently accept');
+  } finally { restore(); }
+});
+
+test('getSigningKeyMap: rejects secret without id (previous)', () => {
+  const env = {
+    HANA_PASSWORD: 'p', ADMIN_HASH: 'a', MANAGER_HASH: 'm',
+    REVIEWER_HASH: 'r', CONTENT_EDITOR_HASH: 'c', APP_REVISION: 'v',
+    STARTUP_STRICT: 'false',
+    RESULT_SIGNING_KEY_ID: null, RESULT_SIGNING_KEY: null,
+    RESULT_SIGNING_KEY_PREVIOUS_ID: null, RESULT_SIGNING_KEY_PREVIOUS: secret('orphan')
+  };
+  const { getSigningKeyMap, restore } = loadServerWithEnv(env);
+  try {
+    const km = getSigningKeyMap();
+    assert.equal(km.current, 'legacy',
+      'previous-secret-without-id must fall back to legacy');
+  } finally { restore(); }
+});
+
+test('getSigningKeyMap: rejects secret without id with STARTUP_STRICT=true (via startupErrors)', () => {
+  // Same as the non-STRICT test but the error is surfaced in
+  // startupErrors (where startServer() checks it and throws).
+  const env = {
+    HANA_PASSWORD: 'p', ADMIN_HASH: 'a', MANAGER_HASH: 'm',
+    REVIEWER_HASH: 'r', CONTENT_EDITOR_HASH: 'c', APP_REVISION: 'v',
+    STARTUP_STRICT: 'true',
+    RESULT_SIGNING_KEY_ID: null, RESULT_SIGNING_KEY: secret('orphan'),
+    RESULT_SIGNING_KEY_PREVIOUS_ID: null, RESULT_SIGNING_KEY_PREVIOUS: null
+  };
+  const { getSigningKeyMap, restore } = loadServerWithEnv(env);
+  try {
+    const km = getSigningKeyMap();
+    assert.equal(km.current, 'legacy');
+    const { startupErrors } = require('../server.js');
+    const errors = startupErrors();
+    assert.ok(
+      errors.some((e) => /RESULT_SIGNING_KEY is set but RESULT_SIGNING_KEY_ID is empty/.test(e)),
+      'startupErrors must list the secret-without-id error'
+    );
+  } finally { restore(); }
+});
+
+// ---------------------------------------------------------------------------
+// Startup-time validation tests
+// ---------------------------------------------------------------------------
+
+test('startup-time: invalid signing config is surfaced in startupSummary BEFORE any route is hit', () => {
+  const env = {
+    HANA_PASSWORD: 'p', ADMIN_HASH: 'a', MANAGER_HASH: 'm',
+    REVIEWER_HASH: 'r', CONTENT_EDITOR_HASH: 'c', APP_REVISION: 'v',
+    STARTUP_STRICT: 'false',
+    RESULT_SIGNING_KEY_ID: 'v2', RESULT_SIGNING_KEY: secret('new'),
+    RESULT_SIGNING_KEY_PREVIOUS_ID: 'v2', RESULT_SIGNING_KEY_PREVIOUS: secret('old')
+  };
+  const { restore } = loadServerWithEnv(env);
+  try {
+    const { startupSummary } = require('../server.js');
+    const summary = startupSummary();
+    assert.equal(summary.env.signingKeyConfigured, true,
+      'operator touched the config — signingKeyConfigured must be true');
+    assert.equal(summary.env.signingKeyValid, false,
+      'duplicate current/previous id makes the config invalid');
+    assert.equal(summary.env.signingActiveKid, 'legacy',
+      'invalid config -> runtime falls back to legacy');
+    // And the error is in the errors array
+    assert.ok(
+      summary.errors.some((e) => /Result signing key configuration is invalid/.test(e)),
+      'startup errors must surface signing-key misconfig'
+    );
+  } finally { restore(); }
+});
+
+test('startup-time: clean env reports signingKeyConfigured=false, signingKeyValid=true', () => {
+  const env = {
+    HANA_PASSWORD: 'p', ADMIN_HASH: 'a', MANAGER_HASH: 'm',
+    REVIEWER_HASH: 'r', CONTENT_EDITOR_HASH: 'c', APP_REVISION: 'v',
+    STARTUP_STRICT: 'false',
+    RESULT_SIGNING_KEY_ID: null, RESULT_SIGNING_KEY: null,
+    RESULT_SIGNING_KEY_PREVIOUS_ID: null, RESULT_SIGNING_KEY_PREVIOUS: null
+  };
+  const { restore } = loadServerWithEnv(env);
+  try {
+    const { startupSummary } = require('../server.js');
+    const summary = startupSummary();
+    assert.equal(summary.env.signingKeyConfigured, false);
+    assert.equal(summary.env.signingKeyValid, true,
+      'no config is not "invalid" — the legacy fallback is intentional');
+    assert.equal(summary.env.signingActiveKid, 'legacy');
+  } finally { restore(); }
+});
+
+test('startup-time: valid signing config reports the active kid in summary', () => {
+  const env = {
+    HANA_PASSWORD: 'p', ADMIN_HASH: 'a', MANAGER_HASH: 'm',
+    REVIEWER_HASH: 'r', CONTENT_EDITOR_HASH: 'c', APP_REVISION: 'v',
+    STARTUP_STRICT: 'false',
+    RESULT_SIGNING_KEY_ID: 'v2', RESULT_SIGNING_KEY: secret('new'),
+    RESULT_SIGNING_KEY_PREVIOUS_ID: 'v1', RESULT_SIGNING_KEY_PREVIOUS: secret('old')
+  };
+  const { restore } = loadServerWithEnv(env);
+  try {
+    const { startupSummary } = require('../server.js');
+    const summary = startupSummary();
+    assert.equal(summary.env.signingKeyConfigured, true);
+    assert.equal(summary.env.signingKeyValid, true);
+    assert.equal(summary.env.signingActiveKid, 'v2');
   } finally { restore(); }
 });
