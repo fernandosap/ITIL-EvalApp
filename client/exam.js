@@ -36,6 +36,31 @@
     }
     S.currentQCache = q;
 
+    // ---- Render error boundary ----
+    // The big template string below is built from server
+    // data (q.stem, q.opts, q.note). A malformed response,
+    // a future schema change, or a bug in the template
+    // could throw mid-render. Without this try/catch, a
+    // throw leaves the exam screen blank, the candidate
+    // stuck, and only the global window.onerror recovery
+    // screen helps (which forces a full Reload).
+    //
+    // The boundary renders a degraded "this question
+    // failed to render" view with a Next button so the
+    // candidate can skip and continue the exam. The
+    // incident is reported to /api/client-errors (with
+    // type='error' from window.onerror) and shown in
+    // the admin client-errors dashboard.
+    try {
+      await _renderQBody(q);
+    } catch (renderErr) {
+      _renderQuestionErrorFallback(renderErr);
+    }
+  }
+
+  // The actual render body, separated so a render error
+  // can be caught without losing the API call result.
+  async function _renderQBody(q) {
     const sel = S.answers[S.currentQ] || [];
     const answered = S.answers.filter((a) => a && a.length > 0).length;
     const pct = (answered / S.total) * 100;
@@ -129,6 +154,56 @@
     queueProgressSave();
   }
 
+  // In-place fallback when _renderQBody throws. Renders a
+  // minimal "this question failed to render" view with
+  // navigation buttons. The candidate can skip to the next
+  // question instead of losing the entire exam session to
+  // the global recovery screen.
+  function _renderQuestionErrorFallback(renderErr) {
+    const isLast = S.currentQ === S.total - 1;
+    const errMsg = (renderErr && renderErr.message) ? String(renderErr.message).slice(0, 200) : 'unknown error';
+    render(`<div class="no-select exam-shell" style="min-height:100vh;display:flex;flex-direction:column">
+      <div class="exam-header">
+        <div class="header-brand">
+          <div class="brand-chip">
+            <span class="brand-chip-mark" aria-hidden="true"><i></i></span>
+            <span class="brand-chip-text">
+              <span class="brand-chip-name">Academy Exam App</span>
+              <span class="brand-chip-sub">${S.isPractice ? 'Practice Knowledge Check' : 'Secure Exam Session'}</span>
+            </span>
+          </div>
+        </div>
+        <div class="header-info">
+          <span class="header-title">Academy assessment flow</span>
+          <span class="header-code">CODE: ${_esc(S.code)}</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <div id="save-pill" class="${root.SAVE_UI.cls}" role="status" aria-live="polite">${_esc(root.SAVE_UI.text)}</div>
+          <div id="timer" class="timer" role="status" aria-live="polite" aria-label="Time remaining">--:--</div>
+        </div>
+      </div>
+      ${connectivityBanner()}
+      <div style="flex:1;display:flex;align-items:center;justify-content:center;padding:24px">
+        <div class="card" style="max-width:520px;text-align:center">
+          <div style="font-size:38px;margin-bottom:8px">⚠️</div>
+          <h2 style="margin-bottom:8px">Question ${S.currentQ + 1} failed to render</h2>
+          <p style="color:#666;margin-bottom:18px">A rendering error prevented this question from displaying. Your previous answers are saved. Skip to the next question to continue.</p>
+          <p style="color:#999;font-size:12px;margin-bottom:18px;font-family:monospace">${_esc(errMsg)}</p>
+          <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap">
+            <button class="btn btn-secondary" data-action="prevQ" ${S.currentQ === 0 ? 'disabled' : ''}>← Back</button>
+            <button class="btn btn-primary" data-action="nextQ" ${isLast ? 'disabled' : ''}>Skip to Next →</button>
+            ${isLast ? `<button class="btn btn-success" data-action="trySubmit">Submit Exam</button>` : ''}
+          </div>
+        </div>
+      </div>
+    </div>`);
+    // Still keep the timer + save pill alive so the candidate
+    // can finish the exam normally.
+    setSavePill(root.SAVE_UI.cls, root.SAVE_UI.text);
+    updateTimer();
+    queueProgressSave();
+  }
+
   function goToQ(i) {
     if (S.submitted) return;
     S.currentQ = i;
@@ -194,12 +269,13 @@
     if (S.submitted) return;
     S.submitted = true;
     clearInterval(S.timerInterval);
-    clearInterval(S.webcamInterval);
     if (root.IE.proctor && typeof root.IE.proctor.teardownSecurity === 'function') {
+      // teardownSecurity() now also clears the webcam
+      // interval and stops MediaStream tracks via
+      // IE.state.stopMediaStreams(). Single source of
+      // truth for the cleanup path.
       root.IE.proctor.teardownSecurity();
     }
-    if (S.webcamStream) S.webcamStream.getTracks().forEach((t) => t.stop());
-    if (S.screenStream) S.screenStream.getTracks().forEach((t) => t.stop());
 
     const payload = buildSubmitPayload(autoSubmit);
     let data;

@@ -2434,6 +2434,154 @@ app.get('/api/admin/audit', requireAdmin, requirePermission('audit:read'), async
   }
 });
 
+// GET /api/admin/client-errors — diagnostic view for the
+// client-side error telemetry posted from the SPA via
+// /api/client-errors. Reads from ADMIN_AUDIT_LOG filtered
+// by ACTION='client_error'. Returns a paginated list plus
+// a small summary (totals, byType, byScreen) so an admin
+// can spot a regression in the field without scrolling.
+//
+// Query params:
+//   limit  — 1..200, default 50
+//   since  — ISO date; rows with CREATED_AT > since only
+//   type   — filter by the client `type` field inside DETAILS_JSON
+//            (e.g. 'error', 'unhandledrejection', 'module_load')
+//   screen — filter by client screen (e.g. 'exam', 'loading')
+//
+// Permission: audit:read — same scope as the existing
+// /api/admin/audit. The content is diagnostic telemetry,
+// not compliance evidence, but the underlying table is the
+// same.
+app.get('/api/admin/client-errors', requireAdmin, requirePermission('audit:read'), async (req, res) => {
+  const limit = Math.min(Math.max(Number(req.query?.limit) || 50, 1), 200);
+  const since = (typeof req.query?.since === 'string' && /^\d{4}-\d{2}-\d{2}/.test(req.query.since))
+    ? req.query.since
+    : null;
+  const typeFilter = (typeof req.query?.type === 'string' && req.query.type.length <= 32)
+    ? req.query.type
+    : null;
+  const screenFilter = (typeof req.query?.screen === 'string' && req.query.screen.length <= 32)
+    ? req.query.screen
+    : null;
+
+  try {
+    const result = await withDb(async (conn) => {
+      if (!(await hasAuditLogTable(conn))) {
+        return { entries: [], summary: { total: 0, byType: {}, byScreen: {}, last24h: 0 } };
+      }
+      // Build the WHERE clause incrementally. We use
+      // parameter binding for the user-controlled parts
+      // (since, type, screen). The limit is interpolated
+      // because LIMIT in HANA prepared statements doesn't
+      // always bind cleanly with the @sap/hana-client
+      // callback API; the value is already clamped to
+      // [1, 200] so injection isn't a concern.
+      const where = [`ACTION = ?`];
+      const params = ['client_error'];
+      if (since) {
+        where.push('CREATED_AT > ?');
+        params.push(since);
+      }
+      // type + screen live inside DETAILS_JSON. The
+      // simplest portable predicate is JSON_VALUE (HANA
+      // supports it). Both are bound parameters so no
+      // injection risk.
+      if (typeFilter) {
+        where.push(`JSON_VALUE(DETAILS_JSON, '$.type') = ?`);
+        params.push(typeFilter);
+      }
+      if (screenFilter) {
+        where.push(`JSON_VALUE(DETAILS_JSON, '$.screen') = ?`);
+        params.push(screenFilter);
+      }
+      const whereSql = where.join(' AND ');
+
+      const rows = await execQuery(
+        conn,
+        `SELECT AUDIT_ID, TARGET_CODE, DETAILS_JSON, CLIENT_IP, CREATED_AT
+           FROM ADMIN_AUDIT_LOG
+          WHERE ${whereSql}
+          ORDER BY CREATED_AT DESC
+          LIMIT ${limit}`
+      );
+      const entries = rows.map((row) => {
+        const details = parseJsonOrNull(row.DETAILS_JSON) || {};
+        return {
+          id: row.AUDIT_ID,
+          accessCode: row.TARGET_CODE || null,
+          clientIp: row.CLIENT_IP || '',
+          createdAt: row.CREATED_AT ? new Date(row.CREATED_AT).toISOString() : null,
+          type: details.type || 'error',
+          screen: details.screen || 'unknown',
+          message: details.message || '',
+          filename: details.filename || '',
+          line: details.line || 0,
+          col: details.col || 0,
+          stack: details.stack || '',
+          lastAction: details.lastAction || '',
+          userAgent: details.userAgent || '',
+          appRevision: details.appRevision || '',
+          clientTs: details.clientTs || null
+        };
+      });
+
+      // Summary: totals + byType + byScreen + last24h. We
+      // run two extra aggregate queries scoped to the same
+      // filter (excluding the page limit). The summary is
+      // bounded by the same since filter as the entries,
+      // so the numbers are consistent with what's on the
+      // page. last24h is global (not filtered) so the
+      // admin always sees the "is this thing on fire?"
+      // signal regardless of the current filter.
+      const byTypeRows = await execQuery(
+        conn,
+        `SELECT JSON_VALUE(DETAILS_JSON, '$.type') AS T, COUNT(*) AS CNT
+           FROM ADMIN_AUDIT_LOG
+          WHERE ACTION = 'client_error' ${since ? 'AND CREATED_AT > ?' : ''}
+          GROUP BY JSON_VALUE(DETAILS_JSON, '$.type')`,
+        since ? [since] : []
+      );
+      const byScreenRows = await execQuery(
+        conn,
+        `SELECT JSON_VALUE(DETAILS_JSON, '$.screen') AS S, COUNT(*) AS CNT
+           FROM ADMIN_AUDIT_LOG
+          WHERE ACTION = 'client_error' ${since ? 'AND CREATED_AT > ?' : ''}
+          GROUP BY JSON_VALUE(DETAILS_JSON, '$.screen')`,
+        since ? [since] : []
+      );
+      const totalRow = await execQuery(
+        conn,
+        `SELECT COUNT(*) AS CNT FROM ADMIN_AUDIT_LOG
+          WHERE ACTION = 'client_error' ${since ? 'AND CREATED_AT > ?' : ''}`,
+        since ? [since] : []
+      );
+      const last24hRow = await execQuery(
+        conn,
+        `SELECT COUNT(*) AS CNT FROM ADMIN_AUDIT_LOG
+          WHERE ACTION = 'client_error'
+            AND CREATED_AT > ADD_SECONDS(CURRENT_UTCTIMESTAMP, -86400)`
+      );
+      const byType = {};
+      for (const r of byTypeRows) byType[r.T || 'unknown'] = Number(r.CNT || 0);
+      const byScreen = {};
+      for (const r of byScreenRows) byScreen[r.S || 'unknown'] = Number(r.CNT || 0);
+      return {
+        entries,
+        summary: {
+          total: Number((totalRow && totalRow[0] && totalRow[0].CNT) || 0),
+          byType,
+          byScreen,
+          last24h: Number((last24hRow && last24hRow[0] && last24hRow[0].CNT) || 0)
+        }
+      };
+    });
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    appLog('error', 'admin_client_errors_fetch_failed', { message: err.message });
+    res.status(500).json({ error: 'admin_client_errors_fetch_failed' });
+  }
+});
+
 app.get('/api/admin/metrics', requireAdmin, requirePermission('dashboard:read'), (_req, res) => {
   res.json({ ok: true, metrics: getMetricsSnapshot() });
 });

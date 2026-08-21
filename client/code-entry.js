@@ -285,6 +285,60 @@
       if (pv) pv.srcObject = stream;
       $('cam-preview').style.display = 'block';
       $('hidden-cam').srcObject = stream;
+      // Listen for the webcam track ending. This happens when
+      // the OS suspends the device, the user revokes camera
+      // permission, the USB camera is unplugged, or the
+      // browser auto-stops the track after long backgrounding.
+      // Without this, the candidate sees a black preview with
+      // no warning and the proctor polls a dead stream
+      // silently. The screen share already has a similar
+      // handler in reqScreen() below.
+      const videoTrack = stream.getVideoTracks()[0];
+      if (videoTrack) {
+        videoTrack.addEventListener('ended', () => {
+          // Don't fire on the tech-check screen — only when
+          // the candidate is actually taking the exam. The
+          // `screen` field is set to 'exam' once they enter.
+          if (S.screen !== 'exam' || S.submitted) {
+            // Update the status pill so the next reqWebcam()
+            // call can succeed.
+            S.webcamOk = false;
+            const st = $('st-cam');
+            if (st) st.innerHTML = '<span class="status-err">Disconnected</span>';
+            return;
+          }
+          S.webcamOk = false;
+          // Hide the live preview to avoid showing a frozen
+          // last frame as if proctoring was still active.
+          const camPreview = $('cam-preview');
+          if (camPreview) camPreview.style.display = 'none';
+          // Log to the session incidents so the admin can
+          // see it later in the result review.
+          if (root.IE && root.IE.state && typeof root.IE.state.logIncident === 'function') {
+            root.IE.state.logIncident('webcam_disconnected', 'Webcam track ended during exam');
+          }
+          modal('🚨', 'Webcam Disconnected', 'Your webcam was disconnected mid-exam. This has been logged. Please reconnect immediately to continue proctoring.', [
+            { label: 'Reconnect Webcam', cls: 'btn-danger', action: () => {
+              // Reset the tech-check UI to allow re-grant
+              $('modal').classList.remove('show');
+              $('st-cam').innerHTML = '<span class="status-err">Disconnected</span>';
+              $('btn-cam').textContent = 'Enable Webcam';
+              $('btn-cam').disabled = false;
+              // Clear the hidden-cam element so drawImage()
+              // doesn't read from a stale source
+              const hc = $('hidden-cam');
+              if (hc) hc.srcObject = null;
+              const pv2 = $('preview-vid');
+              if (pv2) pv2.srcObject = null;
+              // Note: we don't auto-call reqWebcam() because
+              // getUserMedia will only succeed with explicit
+              // user gesture, and the modal button click IS
+              // that gesture.
+              reqWebcam();
+            } }
+          ]);
+        });
+      }
     } catch (_e) {
       $('st-cam').innerHTML = '<span class="status-err">Denied</span>';
       modal('❌', 'Webcam Required', 'Please allow camera access in your browser settings and try again.', [{ label: 'Retry', cls: 'btn-primary', action: reqWebcam }]);

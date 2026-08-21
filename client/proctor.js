@@ -25,6 +25,19 @@
     document.removeEventListener('visibilitychange', onVisChange);
     window.removeEventListener('blur', onBlur);
     window.removeEventListener('focus', onFocus);
+    // Stop the periodic proctor interval (so the next
+    // session doesn't inherit a ticking timer).
+    if (S.webcamInterval) {
+      clearInterval(S.webcamInterval);
+      S.webcamInterval = null;
+    }
+    // Stop live MediaStream tracks. Without this, the
+    // camera/screen share keep running after the candidate
+    // leaves the exam — burning memory and keeping the
+    // "REC" indicator on. stopMediaStreams is idempotent.
+    if (root.IE && root.IE.state && typeof root.IE.state.stopMediaStreams === 'function') {
+      root.IE.state.stopMediaStreams();
+    }
     S.securityBound = false;
   }
   function onBlur() {
@@ -65,6 +78,16 @@
   }
   async function proctor() {
     if (S.submitted || S.screen !== 'exam') return;
+    // Throttle guard: if the previous tick is still in
+    // flight (e.g. the tab was throttled by the browser and
+    // the setInterval backed up several calls while the
+    // tab was hidden), skip this tick instead of stacking
+    // duplicate proctor calls. The server-side rate limit
+    // is 90/min and each call is ~12s; even one stacked
+    // call could blow through it during a real
+    // backgrounded-tab recovery.
+    if (S._proctorInFlight) return;
+    S._proctorInFlight = true;
     try {
       const v = $('hidden-cam');
       if (!v || !v.videoWidth) return;
@@ -85,6 +108,8 @@
       }
     } catch (_e) {
       // soft fail
+    } finally {
+      S._proctorInFlight = false;
     }
   }
 

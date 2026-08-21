@@ -80,6 +80,10 @@
   function setAdminAuthMethod(v) { root._adminAuthMethod = v; }
 
   function resetExam() {
+    // Stop any live MediaStream tracks first. resetExam()
+    // is called both on "start over" and on screen exit;
+    // we don't want to leave camera/screen share open.
+    stopMediaStreams();
     root.S.screen = 'code';
     root.S.code = '';
     root.S.examToken = null;
@@ -91,6 +95,7 @@
     root.S.elapsed = 0;
     root.S.timerInterval = null;
     root.S.webcamInterval = null;
+    root.S._proctorInFlight = false;
     root.S.incidents = [];
     root.S.tabSwitches = 0;
     root.S.webcamStream = null;
@@ -232,6 +237,57 @@
     }
   }
 
+  // Stop all live MediaStream tracks (webcam + screen share)
+  // and clear the references on the live <video> elements.
+  //
+  // Why this exists: getUserMedia / getDisplayMedia allocate
+  // hardware resources and a black "REC" indicator in some
+  // browsers. teardownSecurity() only removes window
+  // listeners; it never stops the tracks. Long exam
+  // sessions + re-entry could leave multiple tracks alive
+  // and burn memory + keep the camera light on.
+  //
+  // Safe to call multiple times; idempotent. Does NOT throw.
+  // Logs the stop so the admin can see if a track was
+  // dropped unexpectedly before submit.
+  function stopMediaStreams() {
+    try {
+      const streams = [root.S && root.S.webcamStream, root.S && root.S.screenStream].filter(Boolean);
+      let stopped = 0;
+      for (const stream of streams) {
+        if (!stream || typeof stream.getTracks !== 'function') continue;
+        for (const track of stream.getTracks()) {
+          try {
+            if (typeof track.stop === 'function' && track.readyState !== 'ended') {
+              track.stop();
+              stopped += 1;
+            }
+          } catch (_e) { /* one bad track shouldn't block others */ }
+        }
+      }
+      // Clear references so any future drawImage() on
+      // hidden-cam doesn't read from a frozen srcObject.
+      const hidden = document.getElementById('hidden-cam');
+      if (hidden) hidden.srcObject = null;
+      const preview = document.getElementById('preview-vid');
+      if (preview) preview.srcObject = null;
+      if (root.S) {
+        if (root.S.webcamStream) { root.S.webcamStream = null; }
+        if (root.S.screenStream) { root.S.screenStream = null; }
+        root.S.webcamOk = false;
+        root.S.screenOk = false;
+      }
+      if (stopped > 0 && root.S && root.S.screen === 'exam' && !root.S.submitted) {
+        // Defensive: we shouldn't reach here mid-exam, but
+        // if we do, record it. submitExam() / resetExam() /
+        // teardownSecurity() are the normal call sites.
+        if (typeof logIncident === 'function') {
+          logIncident('streams_stopped_early', `Stopped ${stopped} tracks unexpectedly`);
+        }
+      }
+    } catch (_e) { /* never throw from a cleanup path */ }
+  }
+
   root.IE = root.IE || {};
   root.IE.state = {
     getS: getS,
@@ -252,8 +308,16 @@
     serializeProgress: serializeProgress,
     buildSubmitPayload: buildSubmitPayload,
     saveProgress: saveProgress,
+    stopMediaStreams: stopMediaStreams,
     queueProgressSave: queueProgressSave,
     replayPendingActions: replayPendingActions,
     fetchStatus: fetchStatus
   };
+
+  // CommonJS export so Node-side unit tests can require()
+  // the same module. The browser path (UMD/IIFE) doesn't
+  // expose `module`, so this line is a no-op there.
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = root.IE.state;
+  }
 })(typeof window !== 'undefined' ? window : globalThis);
