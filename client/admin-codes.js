@@ -74,7 +74,7 @@
   async function showAdmin() {
     S.screen = 'admin';
     document.body.classList.remove('exam-bg');
-    render('<div class="admin-wrap"><div style="padding:60px;text-align:center;color:white;font-size:18px">Loading admin data...</div></div>');
+    render('<div class="admin-wrap"><div class="admin-loading">Loading admin data...</div></div>');
     let data, systemStatus, auditData, notificationData, overviewData, me;
     try {
       [me, data, systemStatus, auditData, notificationData, overviewData] = await Promise.all([
@@ -247,8 +247,8 @@
     render(`<div class="admin-wrap">
       <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:16px">
         <div>
-          <div style="font-size:22px;font-weight:800;color:white">Admin Console</div>
-          <div style="font-size:13px;color:rgba(255,255,255,.75)">${unused} unused · ${active} active · ${completed} completed · ${root._adminQuestionSets.length} exam set${root._adminQuestionSets.length === 1 ? '' : 's'} · Role: ${root._adminRole === 'admin' ? 'Admin' : root._adminRole === 'manager' ? 'Manager' : root._adminRole === 'reviewer' ? 'Reviewer' : 'Content Editor'}</div>
+          <div class="admin-page-title">Admin Console</div>
+          <div class="admin-page-subtitle">${unused} unused · ${active} active · ${completed} completed · ${root._adminQuestionSets.length} exam set${root._adminQuestionSets.length === 1 ? '' : 's'} · Role: ${root._adminRole === 'admin' ? 'Admin' : root._adminRole === 'manager' ? 'Manager' : root._adminRole === 'reviewer' ? 'Reviewer' : 'Content Editor'}</div>
         </div>
         <div style="display:flex;gap:8px;flex-wrap:wrap">
           <button class="btn btn-primary btn-sm" data-action="generateCodes">+ Generate Codes</button>
@@ -526,7 +526,7 @@
   }
 
   async function reviewResult(code) {
-    render('<div class="admin-wrap"><div style="padding:60px;text-align:center;color:white;font-size:18px">Loading candidate answers...</div></div>');
+    render('<div class="admin-wrap"><div class="admin-loading">Loading candidate answers...</div></div>');
     try {
       const resp = await apiJson(`/api/admin/results/${encodeURIComponent(code)}/review`, {}, { timeoutMs: 12000, retries: 1 });
       if (!resp || !resp.ok) throw new Error('review_failed');

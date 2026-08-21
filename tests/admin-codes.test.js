@@ -58,4 +58,7 @@ test('showAdmin: renders code rows with the exam status chip', async () => {
 
   assert.match(rendered, /ABC2DE/);
   assert.match(rendered, /<span>unused<\/span>/);
+  assert.match(rendered, /class="admin-page-title">Admin Console/);
+  assert.match(rendered, /class="admin-page-subtitle">1 unused/);
+  assert.doesNotMatch(rendered, /color:white|rgba\(255,255,255/);
 });
