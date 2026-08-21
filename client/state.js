@@ -167,6 +167,11 @@
     return `<div class="offline-banner" role="status" aria-live="polite">Offline. Answers stay local until connection returns.</div>`;
   }
   function proctorEnabled() { return root.S.proctorOn !== false; }
+  function isProctorRecoveryRequired() {
+    return proctorEnabled()
+      && root.S.screen === 'exam'
+      && (!root.S.webcamOk || !root.S.screenOk);
+  }
 
   // ---- Pending state (offline-safe progress + submit) ----
   function pendingKey(code) {
@@ -352,6 +357,7 @@
     isOnline: isOnline,
     connectivityBanner: connectivityBanner,
     proctorEnabled: proctorEnabled,
+    isProctorRecoveryRequired: isProctorRecoveryRequired,
     pendingKey: pendingKey,
     readPendingState: readPendingState,
     writePendingState: writePendingState,
