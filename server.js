@@ -2147,6 +2147,11 @@ app.get('/api/admin/me', (req, res) => {
   if (parsed) {
     return res.json({ ok: true, role: parsed.role, sub: null, authMethod: 'token' });
   }
+  appLog('warn', 'admin_me_unauthorized', {
+    requestId: req.requestId,
+    hasXsuaaCookie: Boolean(parseCookieHeader(req.headers.cookie)['xsuaa_jwt']),
+    hasAdminToken: Boolean(String(req.headers['x-admin-token'] || '').trim())
+  });
   res.status(401).json({ ok: false, error: 'unauthorized' });
 });
 
@@ -2208,7 +2213,13 @@ app.get('/oauth/callback', async (req, res) => {
     req.secure ? 'Secure' : ''
   ].filter(Boolean).join('; ');
   res.setHeader('Set-Cookie', setCookie);
-  appLog('info', 'oauth_login_success', { requestId: req.requestId });
+  appLog('info', 'oauth_login_success', {
+    requestId: req.requestId,
+    cookieBytes: Buffer.byteLength(setCookie),
+    secure: req.secure === true,
+    sameSite: 'Lax',
+    maxAge
+  });
   // The authorization flow starts from the admin console. Preserve that
   // destination so main.js can bootstrap the newly-set cookie as admin
   // instead of rendering the public access-code screen.
