@@ -166,6 +166,7 @@ const PROCTOR_WINDOW = 60 * 1000;
 const CLIENT_ERROR_MAX = 30;
 const CLIENT_ERROR_WINDOW = 60 * 1000;
 const _questionSetCache = new Map();
+const _xsuaaBrowserSessions = new Map();
 const _runtimeState = {
   adminTokenNotBefore: 0,
   adminTokenNotBeforeFetchedAt: 0,
@@ -613,6 +614,27 @@ function getClientIp(req) {
   return req.socket?.remoteAddress || 'unknown';
 }
 
+function createXsuaaBrowserSession(token, expiresInSeconds) {
+  const now = Date.now();
+  for (const [id, session] of _xsuaaBrowserSessions) {
+    if (session.expiresAt <= now) _xsuaaBrowserSessions.delete(id);
+  }
+  const id = crypto.randomBytes(32).toString('base64url');
+  const expiresAt = now + (Math.max(60, Number(expiresInSeconds || 3600)) * 1000);
+  _xsuaaBrowserSessions.set(id, { token, expiresAt });
+  return { id, expiresAt };
+}
+
+function getXsuaaBrowserSession(id) {
+  const session = _xsuaaBrowserSessions.get(String(id || ''));
+  if (!session) return null;
+  if (session.expiresAt <= Date.now()) {
+    _xsuaaBrowserSessions.delete(String(id));
+    return null;
+  }
+  return session;
+}
+
 function getExamTokenSecret() {
   return crypto
     .createHash('sha256')
@@ -732,8 +754,8 @@ async function getAdminTokenNotBefore(conn) {
 // the scope claim. Falls through to the legacy SHA-256 token path
 // otherwise, so local dev (no XSUAA bound) keeps working.
 //
-// Also accepts a JWT from the `xsuaa_jwt` cookie — that's what the
-// /oauth/callback endpoint sets after a successful code exchange.
+// Browser OAuth uses an opaque, httpOnly session cookie. The JWT remains
+// server-side so its size cannot exceed browser cookie limits.
 function tryXsuaaAuth(req) {
   function authFromToken(token, source) {
     const xsuaa = getXsuaaConfig();
@@ -765,10 +787,13 @@ function tryXsuaaAuth(req) {
     const token = auth.slice(7).trim();
     if (token) return authFromToken(token, 'authorization_header');
   }
-  // 2. xsuaa_jwt cookie (browser flow via /oauth/callback)
+  // 2. Opaque browser session cookie (OAuth callback flow).
   const cookies = parseCookieHeader(req.headers.cookie);
-  const cookieToken = cookies['xsuaa_jwt'];
-  if (cookieToken) return authFromToken(cookieToken, 'cookie');
+  const browserSession = getXsuaaBrowserSession(cookies['xsuaa_session']);
+  if (browserSession) return authFromToken(browserSession.token, 'session_cookie');
+  // Temporary back-compat for sessions created before opaque cookies.
+  const legacyCookieToken = cookies['xsuaa_jwt'];
+  if (legacyCookieToken) return authFromToken(legacyCookieToken, 'legacy_jwt_cookie');
   return null;
 }
 
@@ -2149,7 +2174,8 @@ app.get('/api/admin/me', (req, res) => {
   }
   appLog('warn', 'admin_me_unauthorized', {
     requestId: req.requestId,
-    hasXsuaaCookie: Boolean(parseCookieHeader(req.headers.cookie)['xsuaa_jwt']),
+    hasXsuaaSession: Boolean(parseCookieHeader(req.headers.cookie)['xsuaa_session']),
+    hasLegacyXsuaaCookie: Boolean(parseCookieHeader(req.headers.cookie)['xsuaa_jwt']),
     hasAdminToken: Boolean(String(req.headers['x-admin-token'] || '').trim())
   });
   res.status(401).json({ ok: false, error: 'unauthorized' });
@@ -2201,11 +2227,12 @@ app.get('/oauth/callback', async (req, res) => {
     });
     return res.status(502).json({ error: 'token_exchange_failed' });
   }
-  // Set the JWT in an httpOnly cookie. Max-Age from the token's
-  // expiresIn (default 1h if absent).
+  // Store the JWT server-side and set an opaque httpOnly cookie. Max-Age
+  // comes from expiresIn (default 1h if absent).
   const maxAge = Math.max(60, Number(tokenResp.expiresIn || 3600));
+  const session = createXsuaaBrowserSession(tokenResp.accessToken, maxAge);
   const setCookie = [
-    `xsuaa_jwt=${encodeURIComponent(tokenResp.accessToken)}`,
+    `xsuaa_session=${session.id}`,
     'Path=/',
     `Max-Age=${maxAge}`,
     'HttpOnly',
@@ -2216,6 +2243,7 @@ app.get('/oauth/callback', async (req, res) => {
   appLog('info', 'oauth_login_success', {
     requestId: req.requestId,
     cookieBytes: Buffer.byteLength(setCookie),
+    jwtBytes: Buffer.byteLength(tokenResp.accessToken),
     secure: req.secure === true,
     sameSite: 'Lax',
     maxAge
@@ -2300,11 +2328,13 @@ app.post('/api/admin/logout', requireAdmin, async (req, res) => {
     clientIp: getClientIp(req),
     details: { ok: true, authMethod: req.authMethod || 'token' }
   });
-  // Clear the XSUAA cookie if it was used for this session. Setting
-  // Max-Age=0 expires the cookie on the browser immediately.
-  res.setHeader('Set-Cookie',
-    'xsuaa_jwt=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax' +
-    (req.secure ? '; Secure' : ''));
+  const cookies = parseCookieHeader(req.headers.cookie);
+  if (cookies['xsuaa_session']) _xsuaaBrowserSessions.delete(cookies['xsuaa_session']);
+  // Clear the opaque cookie and legacy JWT cookie. Max-Age=0 expires both
+  // on the browser immediately.
+  const clearCookie = (name) =>
+    `${name}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax${req.secure ? '; Secure' : ''}`;
+  res.setHeader('Set-Cookie', [clearCookie('xsuaa_session'), clearCookie('xsuaa_jwt')]);
   res.json({ ok: true });
 });
 
