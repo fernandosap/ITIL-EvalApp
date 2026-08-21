@@ -309,6 +309,24 @@ Reads HANA vars from `.env` or `--env-file`. Sets `APP_REVISION` from `git rev-p
 
     Tests: `tests/signing-key-rotation.test.js` (21 tests for rotation + edge-case validation + startup surfacing), `tests/signed-envelope.test.js` (5 tests for v2 envelope format), `tests/signing-legacy-key.test.js` (4 tests for the legacy-key freeze rotation scenario).
 
+19. **Security headers middleware + per-IP admin write rate limit** (commit `2c7a961`/later). Three layered defenses:
+
+    **(A) Security headers on every response** (server.js `app.use` after `express.json`):
+    - `Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'`
+    - `X-Content-Type-Options: nosniff`
+    - `Referrer-Policy: strict-origin-when-cross-origin`
+    - `Permissions-Policy: camera=(self), microphone=(self), geolocation=(), payment=()`
+
+    `'unsafe-inline'` for script-src + style-src is required because the SPA shell has one inline `<script>` (the `__reportModuleLoadError` helper from commit `b276ce3`) and a large inline `<style>` block. The CSP still mitigates the realistic threats: cross-origin script injection, third-party exfiltration via XSS, clickjacking iframes (`frame-ancestors 'none'`), and base-URI hijacking. HSTS is intentionally NOT set here — CF terminates TLS and already sets it.
+
+    **(B) `requireAdminWriteRate()`** in `lib/middleware.js`. Per-IP rate limit on state-changing admin endpoints (POST/PUT/DELETE). Default 60/60s. Applied after `requireAdmin` + `requirePermission` to all 26 admin write routes. Bucket key is **client IP only** (not `role:ip`) — the intent is to bound backend load, so two admins at the same egress IP share a budget. In BTP production this means all admin console users from a single corporate egress IP share the 60/min budget, which is the intended blast-radius control. Returns 429 with `Retry-After: <seconds>` header. Skipped: `POST /api/admin/login` (already has its own rate limit) and `POST /api/admin/results/verify-signature` (read-only behavior despite being POST — just compares a signature).
+
+    **(C) `Retry-After` header on `/api/client-errors` 204**. When the client-error telemetry endpoint rate-limits a request, the 204 response now includes `Retry-After: <window-in-seconds>`. This lets a well-behaved browser / service worker retry on schedule instead of hammering the endpoint. The endpoint still returns 204 (not 429) so the failure mode stays invisible to the candidate.
+
+    **CSRF analysis re-verified 2026-08-20** (see "CSRF analysis" section above): the new CSP `connect-src 'self'` + `frame-ancestors 'none'` actually shrinks the residual CSRF surface further. No CSRF tokens were added because the existing SameSite=Lax + header-based tokens + no-CORS-policy was already correct; adding a token would be security theater, not defense.
+
+    Tests: `tests/security-headers.test.js` (10 tests for header values), `tests/admin-write-rate.test.js` (6 tests for rate limit behavior + Retry-After + shared bucket + per-IP isolation), and an updated assertion in `tests/client-errors.test.js` for the Retry-After header on the 204 path.
+
 ## HANA findings (Fase 0, 2026-08-18)
 
 1. **`EXAM_INCIDENTS` is orphan** — 0 rows, no code path touches it. **DROPPED 2026-08-18** ✅
@@ -553,6 +571,12 @@ defaults. **Do not** add CSRF tokens unless the auth model changes
 (e.g. switching to cookie-based sessions with `SameSite=None` for
 cross-origin SSO, or adding a webhook-style endpoint callable from
 another origin).
+
+**Re-verified 2026-08-20**: confirmed after the security-headers
+hardening pass (commit `2c7a961`/later). The new CSP `connect-src 'self'`
+plus `frame-ancestors 'none'` actually shrinks the residual attack
+surface further: an XSS payload could not exfiltrate to a third party
+or iframe the app for clickjacking. The analysis above still holds.
 
 ## Open items / TODO
 

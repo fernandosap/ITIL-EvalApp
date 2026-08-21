@@ -307,6 +307,9 @@ test('POST /api/client-errors: rate-limited per IP, 204 when over', async () => 
   app.post('/api/client-errors', async (req, res) => {
     const ip = req.ip || 'test';
     if (!checkRateLimit('client_error', String(ip), 2, 60000)) {
+      // Mirror server.js: a well-behaved browser that wants
+      // to retry (e.g. background sync) should know when.
+      res.setHeader('Retry-After', Math.ceil(60000 / 1000));
       return res.status(204).end();
     }
     res.json({ ok: true });
@@ -333,6 +336,10 @@ test('POST /api/client-errors: rate-limited per IP, 204 when over', async () => 
     assert.equal(r1.status, 200);
     assert.equal(r2.status, 200);
     assert.equal(r3.status, 204, 'third request from same IP must be 204');
+    // The 204 must include Retry-After so a well-behaved
+    // browser / service worker can retry on schedule.
+    assert.equal(r3.headers.get('retry-after'), '60',
+      '204 must include Retry-After header (window in seconds)');
   } finally {
     server.close();
     rateLimit._resetForTests();

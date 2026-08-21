@@ -198,6 +198,55 @@ const SLOW_REQUEST_MS = Math.max(100, Number(process.env.SLOW_REQUEST_MS || 1200
 
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: false }));
+
+// Security headers — applied to every response.
+// Hardening rationale (see AGENTS.md gotcha #19 for the full
+// analysis):
+//   - CSP default-src 'self' restricts all fetch/connect/img/etc.
+//     to same-origin only. Mitigates a stored XSS in an admin
+//     input from being able to exfiltrate to a third party.
+//   - 'unsafe-inline' for script-src + style-src is required
+//     because the SPA shell has one inline <script> (the
+//     __reportModuleLoadError helper) and a large inline
+//     <style> block. Converting them to external files is
+//     a separate refactor; the inline-only-on-same-origin
+//     allowance does not weaken us against cross-origin
+//     script injection.
+//   - frame-ancestors 'none' prevents clickjacking iframes.
+//   - X-Content-Type-Options nosniff blocks MIME sniffing of
+//     JSON responses (e.g. a malicious JSON with a payload
+//     that the browser tries to execute as HTML).
+//   - Referrer-Policy strict-origin-when-cross-origin — the
+//     CF router sets X-Forwarded-* but we don't want the
+//     full URL leaking to outbound links in admin error
+//     messages or future content.
+//   - HSTS is intentionally NOT set here: CF terminates TLS
+//     and already sets Strict-Transport-Security on its
+//     router responses. Adding it here would be a no-op.
+//   - Permissions-Policy locks down powerful APIs (camera,
+//     microphone, geolocation) to the same origin. The exam
+//     already uses getUserMedia for proctoring so 'self'
+//     is correct.
+app.use((req, res, next) => {
+  res.setHeader('Content-Security-Policy',
+    "default-src 'self'; " +
+    "script-src 'self' 'unsafe-inline'; " +
+    "style-src 'self' 'unsafe-inline'; " +
+    "img-src 'self' data:; " +
+    "connect-src 'self'; " +
+    "frame-ancestors 'none'; " +
+    "base-uri 'self'; " +
+    "form-action 'self'; " +
+    "object-src 'none'"
+  );
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy',
+    'camera=(self), microphone=(self), geolocation=(), payment=()'
+  );
+  next();
+});
+
 app.use((req, res, next) => {
   const requestId = req.headers['x-request-id']
     ? String(req.headers['x-request-id']).trim().slice(0, 120)
@@ -728,6 +777,8 @@ const adminAuth = createAuthMiddleware({
   hasDbConfig: HAS_DB_CONFIG,
   getXsuaaConfig,
   hasPermission,
+  checkRateLimit,
+  getClientIp,
   log: appLog
 });
 
@@ -737,6 +788,15 @@ async function requireAdmin(req, res, next) {
 
 function requireAdminRole(role) {
   return adminAuth.requireAdminRole(role);
+}
+
+// Per-(role+IP) rate limit on state-changing admin requests.
+// Apply AFTER requireAdmin and AFTER requirePermission (so
+// the role + permission are known) but BEFORE the actual
+// handler. Default 60/60s; override per-route for expensive
+// ops like bulk-delete (e.g. requireAdminWriteRate({max: 10})).
+function requireAdminWriteRate(opts) {
+  return adminAuth.requireAdminWriteRate(opts);
 }
 
 function requirePermission(permission) {
@@ -1726,7 +1786,13 @@ app.post('/api/client-errors', async (req, res) => {
   const ip = getClientIp(req);
   if (!checkRateLimit('client_error', String(ip), CLIENT_ERROR_MAX, CLIENT_ERROR_WINDOW)) {
     // 204 (not 429) — telemetry should never encourage a
-    // client to retry; just drop it silently.
+    // client to retry; just drop it silently. We DO add
+    // a Retry-After header so a well-behaved browser that
+    // wants to retry (e.g. a background sync of error
+    // reports) can wait the right amount. The value is
+    // the window in seconds; for a 60s window that's the
+    // worst case wait for the bucket to reset.
+    res.setHeader('Retry-After', Math.ceil(CLIENT_ERROR_WINDOW / 1000));
     return res.status(204).end();
   }
   const body = req.body;
@@ -2199,7 +2265,7 @@ app.post('/api/admin/login', (req, res) => {
   return res.json({ ok: true, token: createAdminToken(role), role });
 });
 
-app.post('/api/admin/logout', requireAdmin, async (req, res) => {
+app.post('/api/admin/logout', requireAdmin, requireAdminWriteRate(), async (req, res) => {
   void tryWriteAdminAudit({
     action: AUDIT_ACTION.LOGOUT,
     actor: req.adminRole || ROLES.ADMIN,
@@ -2214,7 +2280,7 @@ app.post('/api/admin/logout', requireAdmin, async (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/admin/sessions/revoke-all', requireAdmin, requireAdminRole(ROLES.ADMIN), async (req, res) => {
+app.post('/api/admin/sessions/revoke-all', requireAdmin, requireAdminRole(ROLES.ADMIN), requireAdminWriteRate(), async (req, res) => {
   try {
     const revokedAt = Date.now();
     await withDb(async (conn) => {
@@ -2630,7 +2696,7 @@ app.get('/api/admin/audit/export.json', requireAdmin, requirePermission('audit:e
   }
 });
 
-app.post('/api/admin/exam-availability', requireAdmin, requireAdminRole(ROLES.ADMIN), async (req, res) => {
+app.post('/api/admin/exam-availability', requireAdmin, requireAdminRole(ROLES.ADMIN), requireAdminWriteRate(), async (req, res) => {
   const enabled = req.body?.enabled !== false;
   try {
     await withDb(async (conn) => {
@@ -2917,7 +2983,7 @@ app.get('/api/admin/analytics/overview', requireAdmin, requirePermission('analyt
   }
 });
 
-app.post('/api/admin/clear-stale-sessions', requireAdmin, requireAdminRole(ROLES.ADMIN), async (req, res) => {
+app.post('/api/admin/clear-stale-sessions', requireAdmin, requireAdminRole(ROLES.ADMIN), requireAdminWriteRate(), async (req, res) => {
   try {
     const payload = await withDb(async (conn) => {
       const cleared = await clearStaleSessionsWithConn(conn);
@@ -2946,7 +3012,7 @@ app.get('/api/admin/sweeper-status', requireAdmin, requirePermission('dashboard:
   res.json({ ok: true, sweeper: getSweeperStatus() });
 });
 
-app.post('/api/admin/note', requireAdmin, requirePermission('codes:note'), async (req, res) => {
+app.post('/api/admin/note', requireAdmin, requirePermission('codes:note'), requireAdminWriteRate(), async (req, res) => {
   const code = String(req.body?.code || '').trim().toUpperCase();
   const notes = String(req.body?.notes || '');
   if (!/^[A-Z2-9]{6}$/.test(code)) return res.status(400).json({ error: 'invalid_code' });
@@ -2971,7 +3037,7 @@ app.post('/api/admin/note', requireAdmin, requirePermission('codes:note'), async
   }
 });
 
-app.post('/api/admin/reset', requireAdmin, requireAdminRole(ROLES.ADMIN), async (req, res) => {
+app.post('/api/admin/reset', requireAdmin, requireAdminRole(ROLES.ADMIN), requireAdminWriteRate(), async (req, res) => {
   const code = String(req.body?.code || '').trim().toUpperCase();
   if (!/^[A-Z2-9]{6}$/.test(code)) return res.status(400).json({ error: 'invalid_code' });
 
@@ -2995,7 +3061,7 @@ app.post('/api/admin/reset', requireAdmin, requireAdminRole(ROLES.ADMIN), async 
   }
 });
 
-app.delete('/api/admin/codes/:code', requireAdmin, requireAdminRole(ROLES.ADMIN), async (req, res) => {
+app.delete('/api/admin/codes/:code', requireAdmin, requireAdminRole(ROLES.ADMIN), requireAdminWriteRate(), async (req, res) => {
   const code = String(req.params.code || '').trim().toUpperCase();
   if (!/^[A-Z2-9]{6}$/.test(code)) return res.status(400).json({ error: 'invalid_code' });
 
@@ -3035,7 +3101,7 @@ app.delete('/api/admin/codes/:code', requireAdmin, requireAdminRole(ROLES.ADMIN)
   }
 });
 
-app.post('/api/admin/codes/bulk-delete', requireAdmin, requireAdminRole(ROLES.ADMIN), async (req, res) => {
+app.post('/api/admin/codes/bulk-delete', requireAdmin, requireAdminRole(ROLES.ADMIN), requireAdminWriteRate(), async (req, res) => {
   const codes = Array.isArray(req.body?.codes)
     ? [...new Set(req.body.codes.map((code) => String(code || '').trim().toUpperCase()).filter((code) => /^[A-Z2-9]{6}$/.test(code)))]
     : [];
@@ -3088,7 +3154,7 @@ app.post('/api/admin/codes/bulk-delete', requireAdmin, requireAdminRole(ROLES.AD
   }
 });
 
-app.post('/api/admin/generate', requireAdmin, requirePermission('codes:generate'), async (req, res) => {
+app.post('/api/admin/generate', requireAdmin, requirePermission('codes:generate'), requireAdminWriteRate(), async (req, res) => {
   const count = Math.min(Math.max(Number(req.body?.count) || 10, 1), 200);
   const chars = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 
@@ -3138,7 +3204,7 @@ app.post('/api/admin/generate', requireAdmin, requirePermission('codes:generate'
   }
 });
 
-app.post('/api/admin/results/repair-summaries', requireAdmin, requireAdminRole(ROLES.ADMIN), async (req, res) => {
+app.post('/api/admin/results/repair-summaries', requireAdmin, requireAdminRole(ROLES.ADMIN), requireAdminWriteRate(), async (req, res) => {
   try {
     const payload = await withDb(async (conn) => {
       const rows = await execQuery(conn, 'SELECT ACCESS_CODE, RESULT_JSON FROM EXAM_RESULTS');
@@ -3172,7 +3238,7 @@ app.post('/api/admin/results/repair-summaries', requireAdmin, requireAdminRole(R
   }
 });
 
-app.post('/api/admin/results/clear-summaries', requireAdmin, requireAdminRole(ROLES.ADMIN), async (req, res) => {
+app.post('/api/admin/results/clear-summaries', requireAdmin, requireAdminRole(ROLES.ADMIN), requireAdminWriteRate(), async (req, res) => {
   try {
     await withDb(async (conn) => {
       await execQuery(conn, 'UPDATE ACCESS_CODES SET SCORE = NULL, PCT = NULL, PASS = NULL, UPDATED_AT = CURRENT_UTCTIMESTAMP');
@@ -3191,7 +3257,7 @@ app.post('/api/admin/results/clear-summaries', requireAdmin, requireAdminRole(RO
   }
 });
 
-app.post('/api/admin/codes/:code/question-set', requireAdmin, requirePermission('codes:assign'), async (req, res) => {
+app.post('/api/admin/codes/:code/question-set', requireAdmin, requirePermission('codes:assign'), requireAdminWriteRate(), async (req, res) => {
   const code = String(req.params.code || '').trim().toUpperCase();
   const questionSetIdRaw = req.body?.questionSetId;
   const questionSetId = questionSetIdRaw == null || questionSetIdRaw === '' ? null : Number(questionSetIdRaw);
@@ -3241,7 +3307,7 @@ app.get('/api/admin/question-sets', requireAdmin, requirePermission('content:rea
   }
 });
 
-app.post('/api/admin/question-sets/:id/clone', requireAdmin, requirePermission('content:write'), async (req, res) => {
+app.post('/api/admin/question-sets/:id/clone', requireAdmin, requirePermission('content:write'), requireAdminWriteRate(), async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid_question_set_id' });
   try {
@@ -3265,7 +3331,7 @@ app.post('/api/admin/question-sets/:id/clone', requireAdmin, requirePermission('
   }
 });
 
-app.post('/api/admin/question-sets/:id/publish', requireAdmin, requirePermission('content:publish'), async (req, res) => {
+app.post('/api/admin/question-sets/:id/publish', requireAdmin, requirePermission('content:publish'), requireAdminWriteRate(), async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid_question_set_id' });
   try {
@@ -3295,7 +3361,7 @@ app.post('/api/admin/question-sets/:id/publish', requireAdmin, requirePermission
   }
 });
 
-app.post('/api/admin/question-sets/:id/archive', requireAdmin, requirePermission('content:publish'), async (req, res) => {
+app.post('/api/admin/question-sets/:id/archive', requireAdmin, requirePermission('content:publish'), requireAdminWriteRate(), async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid_question_set_id' });
   try {
@@ -3337,7 +3403,7 @@ app.get('/api/admin/question-sets/:id/export.json', requireAdmin, requirePermiss
   }
 });
 
-app.post('/api/admin/question-sets', requireAdmin, requirePermission('content:write'), async (req, res) => {
+app.post('/api/admin/question-sets', requireAdmin, requirePermission('content:write'), requireAdminWriteRate(), async (req, res) => {
   const name = String(req.body?.name || '').trim();
   const description = String(req.body?.description || '').trim();
   if (!name) return res.status(400).json({ error: 'name_required' });
@@ -3390,7 +3456,7 @@ app.post('/api/admin/question-sets', requireAdmin, requirePermission('content:wr
   }
 });
 
-app.post('/api/admin/question-sets/:id/config', requireAdmin, requirePermission('content:write'), async (req, res) => {
+app.post('/api/admin/question-sets/:id/config', requireAdmin, requirePermission('content:write'), requireAdminWriteRate(), async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid_question_set_id' });
   const name = String(req.body?.name || '').trim();
@@ -3453,7 +3519,7 @@ app.post('/api/admin/question-sets/:id/config', requireAdmin, requirePermission(
   }
 });
 
-app.post('/api/admin/question-sets/:id/activate', requireAdmin, requirePermission('content:publish'), async (req, res) => {
+app.post('/api/admin/question-sets/:id/activate', requireAdmin, requirePermission('content:publish'), requireAdminWriteRate(), async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid_question_set_id' });
 
@@ -3495,7 +3561,7 @@ app.post('/api/admin/question-sets/:id/activate', requireAdmin, requirePermissio
   }
 });
 
-app.delete('/api/admin/question-sets/:id', requireAdmin, requirePermission('content:publish'), async (req, res) => {
+app.delete('/api/admin/question-sets/:id', requireAdmin, requirePermission('content:publish'), requireAdminWriteRate(), async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid_question_set_id' });
 
@@ -3566,7 +3632,7 @@ app.get('/api/admin/question-sets/:id/questions', requireAdmin, requirePermissio
   }
 });
 
-app.post('/api/admin/question-sets/:setId/questions', requireAdmin, requirePermission('content:write'), async (req, res) => {
+app.post('/api/admin/question-sets/:setId/questions', requireAdmin, requirePermission('content:write'), requireAdminWriteRate(), async (req, res) => {
   const setId = Number(req.params.setId);
   if (!Number.isInteger(setId)) return res.status(400).json({ error: 'invalid_question_set_id' });
 
@@ -3631,7 +3697,7 @@ app.post('/api/admin/question-sets/:setId/questions', requireAdmin, requirePermi
   }
 });
 
-app.delete('/api/admin/question-sets/:setId/questions/:questionId', requireAdmin, requirePermission('content:write'), async (req, res) => {
+app.delete('/api/admin/question-sets/:setId/questions/:questionId', requireAdmin, requirePermission('content:write'), requireAdminWriteRate(), async (req, res) => {
   const setId = Number(req.params.setId);
   const questionId = Number(req.params.questionId);
   if (!Number.isInteger(setId) || !Number.isInteger(questionId)) return res.status(400).json({ error: 'invalid_identifier' });
@@ -3686,7 +3752,7 @@ app.get('/api/admin/question-sets/:setId/sections', requireAdmin, requirePermiss
   }
 });
 
-app.post('/api/admin/question-sets/:setId/sections', requireAdmin, requirePermission('content:write'), async (req, res) => {
+app.post('/api/admin/question-sets/:setId/sections', requireAdmin, requirePermission('content:write'), requireAdminWriteRate(), async (req, res) => {
   const setId = Number(req.params.setId);
   if (!Number.isInteger(setId)) return res.status(400).json({ error: 'invalid_question_set_id' });
 
@@ -3731,7 +3797,7 @@ app.post('/api/admin/question-sets/:setId/sections', requireAdmin, requirePermis
   }
 });
 
-app.delete('/api/admin/question-sets/:setId/sections/:sectionId', requireAdmin, requirePermission('content:write'), async (req, res) => {
+app.delete('/api/admin/question-sets/:setId/sections/:sectionId', requireAdmin, requirePermission('content:write'), requireAdminWriteRate(), async (req, res) => {
   const setId = Number(req.params.setId);
   const sectionId = Number(req.params.sectionId);
   if (!Number.isInteger(setId) || !Number.isInteger(sectionId)) return res.status(400).json({ error: 'invalid_identifier' });
@@ -3754,7 +3820,7 @@ app.delete('/api/admin/question-sets/:setId/sections/:sectionId', requireAdmin, 
   }
 });
 
-app.post('/api/admin/question-sets/upload/preview', requireAdmin, requirePermission('imports:write'), async (req, res) => {
+app.post('/api/admin/question-sets/upload/preview', requireAdmin, requirePermission('imports:write'), requireAdminWriteRate(), async (req, res) => {
   const questions = Array.isArray(req.body?.questions) ? req.body.questions : [];
   const validation = validateQuestionUploadEntries(questions);
   if (!validation.ok) {
@@ -3781,7 +3847,7 @@ app.post('/api/admin/question-sets/upload/preview', requireAdmin, requirePermiss
   }
 });
 
-app.post('/api/admin/question-sets/upload', requireAdmin, requirePermission('imports:write'), async (req, res) => {
+app.post('/api/admin/question-sets/upload', requireAdmin, requirePermission('imports:write'), requireAdminWriteRate(), async (req, res) => {
   const name = String(req.body?.name || '').trim();
   const description = String(req.body?.description || '').trim();
   const questions = Array.isArray(req.body?.questions) ? req.body.questions : [];
@@ -3862,7 +3928,7 @@ app.post('/api/admin/question-sets/upload', requireAdmin, requirePermission('imp
   }
 });
 
-app.post('/api/admin/question-sets/:id/rollback-import', requireAdmin, requirePermission('imports:rollback'), async (req, res) => {
+app.post('/api/admin/question-sets/:id/rollback-import', requireAdmin, requirePermission('imports:rollback'), requireAdminWriteRate(), async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid_question_set_id' });
   try {
