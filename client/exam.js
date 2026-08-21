@@ -222,22 +222,22 @@
   }
 
   function goToQ(i) {
-    if (S.submitted) return;
+    if (S.submitted || S.proctorRecoveryRequired) return;
     S.currentQ = i;
     renderQ();
   }
   function prevQ() {
-    if (S.submitted || S.currentQ <= 0) return;
+    if (S.submitted || S.proctorRecoveryRequired || S.currentQ <= 0) return;
     S.currentQ -= 1;
     renderQ();
   }
   function nextQ() {
-    if (S.submitted) return;
+    if (S.submitted || S.proctorRecoveryRequired) return;
     S.currentQ = Math.min(S.total - 1, S.currentQ + 1);
     renderQ();
   }
   function pick(displayOptIdx) {
-    if (S.submitted) return;
+    if (S.submitted || S.proctorRecoveryRequired) return;
     const q = S.currentQCache;
     let a = [...(S.answers[S.currentQ] || [])];
     if (q.multi) a = a.includes(displayOptIdx) ? a.filter((x) => x !== displayOptIdx) : [...a, displayOptIdx].sort((x, y) => x - y);
@@ -248,6 +248,7 @@
   }
 
   function trySubmit() {
+    if (S.proctorRecoveryRequired) return;
     const unanswered = S.answers.filter((a) => !a || a.length === 0).length;
     if (unanswered > 0) {
       modal('⚠️', 'Unanswered Questions', `${unanswered} question${unanswered !== 1 ? 's are' : ' is'} still unanswered. Please answer all questions before submitting.`, [{ label: 'Go Back', cls: 'btn-primary' }]);
@@ -283,7 +284,7 @@
 
   // ---- Submission ----
   async function submitExam(autoSubmit) {
-    if (S.submitted) return;
+    if (S.submitted || (!autoSubmit && S.proctorRecoveryRequired)) return;
     S.submitted = true;
     clearInterval(S.timerInterval);
     if (root.IE.proctor && typeof root.IE.proctor.teardownSecurity === 'function') {

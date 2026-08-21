@@ -61,10 +61,15 @@ function clearBrowserStubs() {
 // The reporter IIFE captures `root` at load time. To make the
 // reporter see a specific S, we need to set up `global.window`
 // BEFORE the require(), and re-require to get a fresh IIFE.
-function loadReporterWithS(S) {
+function loadReporterWithS(S, getDiagnosticSessionId) {
   const prevDescriptor = Object.getOwnPropertyDescriptor(global, 'window');
   Object.defineProperty(global, 'window', {
-    value: { S: S || {} },
+    value: {
+      S: S || {},
+      IE: getDiagnosticSessionId
+        ? { state: { getDiagnosticSessionId } }
+        : {}
+    },
     writable: true,
     configurable: true
   });
@@ -82,8 +87,8 @@ function loadReporterWithS(S) {
   };
 }
 
-function withReporter(S, fn) {
-  const { reporter, restore } = loadReporterWithS(S);
+function withReporter(S, fn, getDiagnosticSessionId) {
+  const { reporter, restore } = loadReporterWithS(S, getDiagnosticSessionId);
   try { return fn(reporter); } finally { restore(); }
 }
 
@@ -141,6 +146,22 @@ test('reporter.buildPayload: pulls diagnosticSessionId from S', () => {
     const p = reporter.buildPayload('error', { message: 'x' });
     assert.equal(p.diagnosticSessionId, 'sess-uuid-1234');
   });
+  clearBrowserStubs();
+});
+
+test('reporter.buildPayload: gets distinct IDs for separate fresh sessions', () => {
+  installBrowserStubs();
+  let firstId;
+  let secondId;
+  withReporter({ screen: 'exam' }, (reporter) => {
+    firstId = reporter.buildPayload('error', { message: 'one' }).diagnosticSessionId;
+  }, () => 'session-first');
+  withReporter({ screen: 'exam' }, (reporter) => {
+    secondId = reporter.buildPayload('error', { message: 'two' }).diagnosticSessionId;
+  }, () => 'session-second');
+  assert.equal(firstId, 'session-first');
+  assert.equal(secondId, 'session-second');
+  assert.notEqual(firstId, secondId);
   clearBrowserStubs();
 });
 
