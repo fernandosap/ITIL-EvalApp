@@ -32,8 +32,7 @@
     return `<div class="session-banner" role="status" aria-live="polite">
       <span class="session-banner__dot" aria-hidden="true"></span>
       <span class="session-banner__label">Session secure</span>
-      <span class="session-banner__sep" aria-hidden="true">·</span>
-      <span class="session-banner__detail">${items.join(' · ')}</span>
+      <span class="session-banner__detail">${items.join(' &middot; ')}</span>
     </div>`;
   }
 

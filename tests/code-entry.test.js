@@ -93,8 +93,8 @@ test('buildSessionBanner: full status renders all three items', () => {
   assert.match(out, /<strong>40<\/strong> questions/);
   assert.match(out, /<strong>45<\/strong> min/);
   assert.match(out, /<strong>32\/40<\/strong> to pass \(80%\)/);
-  // Items separated by ·
-  assert.match(out, /·/);
+  // Items separated by middle dots (HTML entity &middot;)
+  assert.match(out, /&middot;|\u00b7/);
 });
 
 test('buildSessionBanner: only total renders just the questions item', () => {
