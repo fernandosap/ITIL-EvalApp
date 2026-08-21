@@ -56,16 +56,13 @@
       stack: (info.stack == null ? '' : String(info.stack)).slice(0, 1200),
       screen: S.screen ? String(S.screen) : 'unknown',
       lastAction: S.lastAction ? String(S.lastAction) : '',
-      // Non-secret per-browser-session correlation ID. Read
-      // from sessionStorage if available; otherwise the
-      // caller (state.js) is expected to have placed one
-      // on the S object. Falls back to a derived value
-      // based on the userAgent (so different browsers on
-      // the same machine still get distinct IDs) but that
-      // is best-effort, not for security purposes.
+      // Ask state.js to create the random per-tab ID on demand. The
+      // user agent is telemetry metadata, not a session identifier.
       diagnosticSessionId: S.diagnosticSessionId
         ? String(S.diagnosticSessionId)
-        : ((typeof navigator !== 'undefined' && navigator.userAgent) ? 'ua-' + String(navigator.userAgent).slice(0, 32) : 'unknown'),
+        : (root.IE && root.IE.state && typeof root.IE.state.getDiagnosticSessionId === 'function'
+          ? String(root.IE.state.getDiagnosticSessionId())
+          : 'unknown'),
       clientTs: new Date().toISOString(),
       userAgent: (ctx.userAgent != null ? ctx.userAgent :
                   (typeof navigator !== 'undefined' ? navigator.userAgent : '')) || ''
