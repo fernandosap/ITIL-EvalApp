@@ -18,7 +18,8 @@
 //   downloadSignedResultSummary, auditActionLabel
 
 (function (root) {
-  const { $, render, modal, _esc, apiJson, apiFetch, durationLabel, normalizeExamTitle, roleCan, statusChip } = root.IE.util;
+  const { $, render, modal, _esc, apiJson, apiFetch, durationLabel, normalizeExamTitle, roleCan } = root.IE.util;
+  const { statusChip } = root.IE.exam;
   const S = root.S;
 
   // ---- Helpers ----
