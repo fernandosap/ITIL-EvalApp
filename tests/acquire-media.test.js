@@ -126,6 +126,7 @@ function loadCodeEntryModule({ S, domIds, mediaDevices } = {}) {
 
   // Window stub: S + IE.state + IE.util stubs.
   const logIncidentCalls = [];
+  const modalCalls = [];
   global.window = {
     S: S_final,
     IE: {
@@ -133,7 +134,10 @@ function loadCodeEntryModule({ S, domIds, mediaDevices } = {}) {
         logIncident: (type, detail) => logIncidentCalls.push({ type, detail })
       },
       util: {
-        modal: (_icon, _title, _body, _buttons) => {}
+        $: (id) => global.document.getElementById(id),
+        modal: (icon, title, body, buttons) => {
+          modalCalls.push({ icon, title, body, buttons });
+        }
       }
     }
   };
@@ -144,7 +148,7 @@ function loadCodeEntryModule({ S, domIds, mediaDevices } = {}) {
   // the API from the global namespace instead.
   require('../client/code-entry.js');
   const codeEntry = global.window.IE.codeEntry;
-  return { codeEntry, S: S_final, calls, logIncidentCalls, requestedIds };
+  return { codeEntry, S: S_final, calls, logIncidentCalls, modalCalls, requestedIds };
 }
 
 // We don't actually invoke the IIFE methods directly
@@ -240,13 +244,8 @@ test('code-entry.js: in-exam ended handler does not touch Tech Check DOM', () =>
     'in-exam branch of onWebcamTrackEnded must not touch cam-preview (Tech Check only)');
   assert.ok(!inExamBranch.includes("'preview-vid'"),
     'in-exam branch of onWebcamTrackEnded must not touch preview-vid (Tech Check only)');
-  // The in-exam branch should call acquireWebcam() (the
-  // pure media function, not the Tech Check wrapper).
-  // We match a call site, not just any mention in a
-  // comment — `acquireWebcam().catch(` is the actual
-  // invocation pattern in the source.
-  assert.ok(/acquireWebcam\(\)\.catch/.test(inExamBranch),
-    'in-exam branch should call acquireWebcam() directly (safe during exam)');
+  assert.ok(inExamBranch.includes("beginProctorRecovery('webcam', acquireWebcam)"),
+    'in-exam branch should start webcam recovery with the safe acquire function');
 });
 
 test('code-entry.js: in-exam screen ended handler does not allow I-understand bypass', () => {
@@ -273,10 +272,89 @@ test('code-entry.js: in-exam screen ended handler does not allow I-understand by
   const parts = body.split(/return;\s*\n/);
   assert.ok(parts.length >= 2, 'expected early return + mid-exam branch');
   const inExamBranch = parts.slice(1).join('return;\n');
-  assert.ok(inExamBranch.includes('Reconnect Screen'),
-    'in-exam branch of onScreenTrackEnded must offer a Reconnect Screen action');
+  assert.ok(inExamBranch.includes("beginProctorRecovery('screen', acquireScreen)"),
+    'in-exam branch of onScreenTrackEnded must start persistent screen recovery');
   // Must NOT have an "I understand" / "OK" bypass as the
   // only action in the in-exam modal.
   assert.ok(!/label:\s*'I understand'/.test(inExamBranch),
     'in-exam branch of onScreenTrackEnded must not offer an I-understand bypass');
+});
+
+async function flushAsyncWork() {
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+}
+
+test('webcam recovery stays blocked through repeated failures and clears after success', async () => {
+  const recoveredTrack = makeFakeTrack();
+  const recoveredStream = makeFakeStream([recoveredTrack]);
+  let attempts = 0;
+  const mediaDevices = {
+    getUserMedia: async () => {
+      attempts += 1;
+      if (attempts < 3) throw new Error(`camera failure ${attempts}`);
+      return recoveredStream;
+    },
+    getDisplayMedia: async () => { throw new Error('not used'); }
+  };
+  const { codeEntry, S, modalCalls } = loadCodeEntryModule({
+    S: { screen: 'exam', submitted: false },
+    domIds: ['hidden-cam', 'exam-cam'],
+    mediaDevices
+  });
+
+  codeEntry.__test__.onWebcamTrackEnded();
+  assert.equal(S.proctorRecoveryRequired, 'webcam');
+  assert.equal(modalCalls.at(-1).buttons[0].label, 'Reconnect Webcam');
+
+  modalCalls.at(-1).buttons[0].action();
+  await flushAsyncWork();
+  assert.equal(S.proctorRecoveryRequired, 'webcam');
+  assert.equal(modalCalls.at(-1).title, 'Webcam Reconnect Failed');
+
+  modalCalls.at(-1).buttons[0].action();
+  await flushAsyncWork();
+  assert.equal(S.proctorRecoveryRequired, 'webcam');
+  assert.equal(modalCalls.at(-1).title, 'Webcam Reconnect Failed');
+
+  modalCalls.at(-1).buttons[0].action();
+  await flushAsyncWork();
+  assert.equal(attempts, 3);
+  assert.equal(S.proctorRecoveryRequired, null);
+  assert.equal(S.webcamOk, true);
+});
+
+test('screen recovery stays blocked through repeated failures and clears after success', async () => {
+  const recoveredTrack = makeFakeTrack();
+  const recoveredStream = makeFakeStream([recoveredTrack]);
+  let attempts = 0;
+  const mediaDevices = {
+    getUserMedia: async () => { throw new Error('not used'); },
+    getDisplayMedia: async () => {
+      attempts += 1;
+      if (attempts < 3) throw new Error(`screen failure ${attempts}`);
+      return recoveredStream;
+    }
+  };
+  const { codeEntry, S, modalCalls } = loadCodeEntryModule({
+    S: { screen: 'exam', submitted: false },
+    mediaDevices
+  });
+
+  codeEntry.__test__.onScreenTrackEnded();
+  assert.equal(S.proctorRecoveryRequired, 'screen');
+  assert.equal(modalCalls.at(-1).buttons[0].label, 'Reconnect Screen');
+
+  modalCalls.at(-1).buttons[0].action();
+  await flushAsyncWork();
+  modalCalls.at(-1).buttons[0].action();
+  await flushAsyncWork();
+  assert.equal(S.proctorRecoveryRequired, 'screen');
+  assert.equal(modalCalls.at(-1).title, 'Screen Share Reconnect Failed');
+
+  modalCalls.at(-1).buttons[0].action();
+  await flushAsyncWork();
+  assert.equal(attempts, 3);
+  assert.equal(S.proctorRecoveryRequired, null);
+  assert.equal(S.screenOk, true);
 });

@@ -91,7 +91,7 @@
         <input class="code-input" id="code-inp" type="text" maxlength="6"
           placeholder="• • • • • •" autocomplete="off" autocorrect="off" spellcheck="false"
           oninput="this.value=this.value.toUpperCase().replace(/[^A-Z0-9]/g,'')"
-          onkeydown="if(event.key==='Enter')handleCodeSubmit()">
+          data-enter-action="handleCodeSubmit">
         <button class="btn btn-primary btn-full" style="margin-top:6px" data-action="handleCodeSubmit">Continue →</button>
         <p style="font-size:11px;color:#bbb;text-align:center;margin-top:8px">If you are resuming an interrupted exam, enter the same code to restore your progress.</p>
       </div>
@@ -352,36 +352,7 @@
     if (root.IE && root.IE.state && typeof root.IE.state.logIncident === 'function') {
       root.IE.state.logIncident('webcam_disconnected', 'Webcam track ended during exam');
     }
-    modal('🚨', 'Webcam Disconnected', 'Your webcam was disconnected mid-exam. This has been logged. Please reconnect immediately to continue proctoring.', [
-      { label: 'Reconnect Webcam', cls: 'btn-danger', action: () => {
-        $('modal').classList.remove('show');
-        // acquireWebcam is the SAFE path during an exam —
-        // it only touches hidden-cam + exam-cam, neither
-        // of which is the Tech Check DOM. We do NOT call
-        // reqWebcam() here because reqWebcam() updates
-        // st-cam / btn-cam / preview-vid which don't exist
-        // on the exam view.
-        acquireWebcam().catch((err) => {
-          // Permission denied or hardware unavailable.
-          // Show the recovery modal again so the candidate
-          // can retry.
-          if (root.IE && root.IE.state && typeof root.IE.state.logIncident === 'function') {
-            root.IE.state.logIncident('webcam_reconnect_failed', String(err && err.message ? err.message : err));
-          }
-          modal('🚨', 'Webcam Reconnect Failed', 'The browser did not grant camera access. Please allow camera access and try again.', [
-            { label: 'Retry', cls: 'btn-danger', action: () => {
-              $('modal').classList.remove('show');
-              acquireWebcam().catch(() => {
-                // Give up silently — the next user action
-                // (or a /api/proctor/check tick) will see
-                // S.webcamOk === false and the candidate
-                // can keep answering.
-              });
-            } }
-          ]);
-        });
-      } }
-    ]);
+    beginProctorRecovery('webcam', acquireWebcam);
   }
 
   // Acquire (or re-acquire) the screen share. Returns the
@@ -421,26 +392,35 @@
     if (root.IE && root.IE.state && typeof root.IE.state.logIncident === 'function') {
       root.IE.state.logIncident('screen_stopped', 'Screen share track ended during exam');
     }
-    // Modal is shown repeatedly (no I-understand bypass) until
-    // the candidate reconnects. The proctor interval will
-    // keep failing for S.screenOk === false / no live track;
-    // the candidate can still answer questions, but
-    // proctoring is degraded.
-    modal('🚨', 'Screen Share Stopped', 'You have stopped screen sharing. This has been logged. Screen sharing is required throughout the exam — please reconnect immediately.', [
-      { label: 'Reconnect Screen', cls: 'btn-danger', action: () => {
-        $('modal').classList.remove('show');
-        acquireScreen().catch((err) => {
-          if (root.IE && root.IE.state && typeof root.IE.state.logIncident === 'function') {
-            root.IE.state.logIncident('screen_reconnect_failed', String(err && err.message ? err.message : err));
-          }
-          modal('🚨', 'Screen Reconnect Failed', 'The browser did not grant screen-sharing access. Please allow screen sharing and try again.', [
-            { label: 'Retry', cls: 'btn-danger', action: () => {
-              $('modal').classList.remove('show');
-              acquireScreen().catch(() => { /* give up silently */ });
-            } }
-          ]);
-        });
-      } }
+    beginProctorRecovery('screen', acquireScreen);
+  }
+
+  function beginProctorRecovery(kind, acquire) {
+    const label = kind === 'webcam' ? 'Webcam' : 'Screen Share';
+    const disconnectedTitle = kind === 'webcam' ? 'Webcam Disconnected' : 'Screen Share Stopped';
+    const disconnectedMessage = kind === 'webcam'
+      ? 'Your webcam was disconnected mid-exam. This has been logged. Please reconnect immediately to continue proctoring.'
+      : 'You have stopped screen sharing. This has been logged. Screen sharing is required throughout the exam — please reconnect immediately.';
+    S.proctorRecoveryRequired = kind;
+
+    const retry = () => {
+      Promise.resolve(acquire()).then(() => {
+        if (S.proctorRecoveryRequired === kind) S.proctorRecoveryRequired = null;
+        if (root.IE && root.IE.state && typeof root.IE.state.logIncident === 'function') {
+          root.IE.state.logIncident(`${kind}_reconnected`, `${label} reconnected during exam`);
+        }
+      }).catch((err) => {
+        if (root.IE && root.IE.state && typeof root.IE.state.logIncident === 'function') {
+          root.IE.state.logIncident(`${kind}_reconnect_failed`, String(err && err.message ? err.message : err));
+        }
+        modal('🚨', `${label} Reconnect Failed`, `The browser did not grant ${kind === 'webcam' ? 'camera' : 'screen-sharing'} access. Please allow access and try again.`, [
+          { label: 'Retry', cls: 'btn-danger', action: retry }
+        ]);
+      });
+    };
+
+    modal('🚨', disconnectedTitle, disconnectedMessage, [
+      { label: `Reconnect ${kind === 'webcam' ? 'Webcam' : 'Screen'}`, cls: 'btn-danger', action: retry }
     ]);
   }
 
@@ -561,6 +541,10 @@
     reqScreen: reqScreen,
     startExam: startExam,
     // Exposed for unit tests; not part of the SPA's public API.
-    __test__: { buildSessionBanner: buildSessionBanner }
+    __test__: {
+      buildSessionBanner: buildSessionBanner,
+      onWebcamTrackEnded: onWebcamTrackEnded,
+      onScreenTrackEnded: onScreenTrackEnded
+    }
   };
 })(typeof window !== 'undefined' ? window : globalThis);

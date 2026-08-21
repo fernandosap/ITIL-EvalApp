@@ -228,7 +228,7 @@
               </select>`
             : `<span style="font-size:12px;color:#555">${_esc(normalizeExamTitle(row.questionSetName || root._activeQuestionSet?.name || 'Default active set'))}</span>`}
         </td>
-        <td><input type="text" value="${_esc(row.notes || '')}" style="margin:0;width:220px;font-size:12px;padding:6px 8px" onblur="saveNote('${row.code}', this.value); this.style.borderColor='#d0d8e8'"></td>
+        <td><input type="text" value="${_esc(row.notes || '')}" style="margin:0;width:220px;font-size:12px;padding:6px 8px" data-blur-action="saveNote" data-args="${row.code},__value__"></td>
         <td>${statusChip(row)}</td>
         <td style="text-align:center">${row.score == null ? '—' : row.score}</td>
         <td style="text-align:center">${row.pct == null ? '—' : `${row.pct}%`}</td>

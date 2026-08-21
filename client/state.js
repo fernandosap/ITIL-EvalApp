@@ -75,6 +75,9 @@
     passScore: 24,
     total: 30,
     proctorOn: true,
+    // Set to 'webcam' or 'screen' while an in-exam proctoring stream is
+    // disconnected. Exam interactions remain blocked until it is restored.
+    proctorRecoveryRequired: null,
     examMode: 'GRADED',
     isPractice: false,
     showCorrectAnswers: false,
@@ -150,6 +153,7 @@
     root.S.screenStream = null;
     root.S.webcamOk = false;
     root.S.screenOk = false;
+    root.S.proctorRecoveryRequired = null;
     root.S.submitted = false;
     root.S.freshStart = false;
   }
