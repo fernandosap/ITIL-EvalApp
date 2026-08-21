@@ -327,6 +327,57 @@ Reads HANA vars from `.env` or `--env-file`. Sets `APP_REVISION` from `git rev-p
 
     Tests: `tests/security-headers.test.js` (10 tests for header values), `tests/admin-write-rate.test.js` (6 tests for rate limit behavior + Retry-After + shared bucket + per-IP isolation), and an updated assertion in `tests/client-errors.test.js` for the Retry-After header on the 204 path.
 
+20. **XSUAA role collections for SSO admin access** (operational, done 2026-08-21). The XSUAA instance bound to the app defines 4 scopes via `xs-security.json`:
+    - `academy-cf-cs-itil4-evalapp!t11367.admin`
+    - `…manager`
+    - `…reviewer`
+    - `…content_editor`
+
+    These scopes live inside a single `Token-Attribute` role template (see `xs-security.json`). The role collections that map user emails to scopes were created on **2026-08-21** via the `btp` CLI (not stored in the repo — they're per-subaccount state):
+
+    ```bash
+    btp login --sso
+    btp target --subaccount fbf099c0-0ac9-4353-89e4-8ed1cf7f80c5
+
+    # Create 4 role collections (one per scope)
+    btp create security/role-collection "academy-cf-cs-itil4-evalapp!t11367.admin" \
+      --description "ITIL EvalApp — full administrative access"
+    btp create security/role-collection "academy-cf-cs-itil4-evalapp!t11367.manager" \
+      --description "ITIL EvalApp — code and result management"
+    btp create security/role-collection "academy-cf-cs-itil4-evalapp!t11367.reviewer" \
+      --description "ITIL EvalApp — audit and compliance review"
+    btp create security/role-collection "academy-cf-cs-itil4-evalapp!t11367.content_editor" \
+      --description "ITIL EvalApp — question bank editing"
+
+    # Add the Token-Attribute role to each collection.
+    # The NAME is the role template name (not the scope).
+    # The `--of-app` + `--of-role-template` pair resolves it.
+    for role in admin manager reviewer content_editor; do
+      btp add security/role "Token-Attribute" \
+        --to-role-collection "academy-cf-cs-itil4-evalapp!t11367.$role" \
+        --of-app "academy-cf-cs-itil4-evalapp!t11367" \
+        --of-role-template "Token-Attribute"
+    done
+
+    # Assign a user to admin (repeat for each new admin)
+    btp assign security/role-collection "academy-cf-cs-itil4-evalapp!t11367.admin" \
+      --to-user EMAIL@sap.com
+
+    # Verify
+    btp get security/role-collection "academy-cf-cs-itil4-evalapp!t11367.admin" \
+      --show-user-assignments
+    ```
+
+    **Current admin roster (as of 2026-08-21)**:
+    - `julian.bender@sap.com`
+    - `m.golen@sap.com`
+    - `fernando.sanchez@sap.com`
+
+    **Gotchas**:
+    - `btp add security/role` rejects if you pass the scope name (e.g. `admin`) as the `NAME` argument — it expects the role template name (`Token-Attribute`). The actual scope filtering happens at token-issuance time, not at role-collection-assignment time.
+    - Adding the role template to a single role collection grants ALL four scopes (admin, manager, reviewer, content_editor). If you want a user to have only `manager` scope, you must create the role collection without the admin scope — which currently requires a custom role template (the current `Token-Attribute` template grants all four). For finer granularity, edit `xs-security.json` to define multiple role templates (one per scope) and re-bind the XSUAA service.
+    - The legacy SHA-256 `X-Admin-Token` auth path still works for users with `ADMIN_HASH` set in env vars. SSO is the recommended path going forward but the fallback exists for local dev and break-glass scenarios.
+
 ## HANA findings (Fase 0, 2026-08-18)
 
 1. **`EXAM_INCIDENTS` is orphan** — 0 rows, no code path touches it. **DROPPED 2026-08-18** ✅
