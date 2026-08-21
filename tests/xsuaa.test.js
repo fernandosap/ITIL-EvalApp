@@ -6,6 +6,7 @@ const crypto = require('node:crypto');
 
 const {
   readXsuaaFromVcap,
+  inspectXsuaaJwt,
   verifyXsuaaJwt,
   mapScopesToRole,
   roleFromClaims,
@@ -187,6 +188,16 @@ test('verifyXsuaaJwt: rejects a token with wrong audience', () => {
   assert.equal(verifyXsuaaJwt(token, xsuaa, now), null);
 });
 
+test('inspectXsuaaJwt: reports a safe rejection reason without claims', () => {
+  const { publicKey, privateKey } = makeKeyPair();
+  const xsuaa = { verificationkey: publicKey, xsappname: 'app!t1' };
+  const now = Math.floor(Date.now() / 1000);
+  const token = signJwt(privateKey, { exp: now + 3600, aud: 'some-other-app!t1' });
+  const result = inspectXsuaaJwt(token, xsuaa, now);
+  assert.equal(result.claims, null);
+  assert.equal(result.reason, 'audience_mismatch');
+});
+
 test('verifyXsuaaJwt: rejects an HS256 (symmetric) token', () => {
   const xsuaa = { verificationkey: 'FAKE', xsappname: 'app!t1' };
   // Manually craft an HS256 token (symmetric). Even if signature is "right",
@@ -277,6 +288,22 @@ test('verifyXsuaaJwt: accepts a token with a matching iss (trailing slash tolera
   });
   const claims = verifyXsuaaJwt(token, xsuaa, now);
   assert.ok(claims);
+});
+
+test('verifyXsuaaJwt: accepts XSUAA token-endpoint issuer', () => {
+  const { publicKey, privateKey } = makeKeyPair();
+  const now = Math.floor(Date.now() / 1000);
+  const xsuaa = {
+    verificationkey: publicKey,
+    xsappname: 'app!t1',
+    url: 'https://tenant.authentication.us10.hana.ondemand.com'
+  };
+  const token = signJwt(privateKey, {
+    iss: 'https://tenant.authentication.us10.hana.ondemand.com/oauth/token',
+    aud: 'app!t1',
+    exp: now + 3600
+  });
+  assert.ok(verifyXsuaaJwt(token, xsuaa, now));
 });
 
 test('verifyXsuaaJwt: rejects a token with no iss when xsuaa.url is configured', () => {
