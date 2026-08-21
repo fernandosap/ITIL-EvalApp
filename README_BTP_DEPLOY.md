@@ -43,7 +43,7 @@ export HANA_USER=<user>
 export HANA_PASSWORD=<password>
 export HANA_SCHEMA=ITIL_EXAM
 export HANA_ENCRYPT=true
-export HANA_SSL_VALIDATE_CERTIFICATE=false
+export HANA_SSL_VALIDATE_CERTIFICATE=true
 ```
 
 Optional role login hashes:
@@ -123,7 +123,7 @@ ROUTE_HOST=my-other-host ./deploy_btp.sh --domain <your-default-domain>
 
 If you are adopting the newer HTML admin functionality with seat notes, run:
 
-- [`migrations/2026-03-18_add_notes_to_access_codes.sql`](/Users/I848070/Documents/Github/ITIL-EvalApp/migrations/2026-03-18_add_notes_to_access_codes.sql)
+- [`migrations/2026-03-18_add_notes_to_access_codes.sql`](migrations/2026-03-18_add_notes_to_access_codes.sql)
 
 This migration is idempotent and only adds `ACCESS_CODES.NOTES` if it does not already exist.
 

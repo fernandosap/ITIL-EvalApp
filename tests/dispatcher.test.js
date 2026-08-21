@@ -22,7 +22,7 @@ global.document = {
 global.window = global;
 
 // Now require the module. It will run the IIFE, attach to window.IE,
-// and register the two listeners.
+// and register its listeners.
 require('../client/dispatcher.js');
 
 const dispatcher = global.window.IE.dispatcher;
@@ -113,10 +113,12 @@ test('lookupAction: skips util and state namespaces', () => {
   assert.equal(dispatcher.lookupAction('onlyInDispatcher'), null);
 });
 
-test('onClick and onChange listeners are registered on document', () => {
+test('action listeners are registered on document', () => {
   const types = recordedListeners.map((l) => l.type);
   assert.ok(types.includes('click'), 'should register a click listener');
   assert.ok(types.includes('change'), 'should register a change listener');
+  assert.ok(types.includes('blur'), 'should register a blur listener');
+  assert.ok(types.includes('keydown'), 'should register a keydown listener');
 });
 
 // End-to-end dispatch via a real DOM. Use a minimal manual DOM stub
@@ -200,6 +202,34 @@ test('dispatchClick: __checked__ sentinel reads from element.checked', () => {
   };
   dispatcher.onClick({ target: el });
   assert.equal(got, true);
+});
+
+test('dispatchBlur: data-blur-action routes the element value', () => {
+  let got = null;
+  global.window.IE = {
+    testMod: { saveNote: (code, value) => { got = { code, value }; } }
+  };
+  const el = {
+    dataset: { blurAction: 'saveNote', args: 'ABC123,__value__' },
+    value: 'updated note',
+    closest: (selector) => selector === '[data-blur-action]' ? el : null
+  };
+  dispatcher.onBlur({ target: el });
+  assert.deepEqual(got, { code: 'ABC123', value: 'updated note' });
+});
+
+test('dispatchKeydown: Enter routes data-enter-action', () => {
+  let calls = 0;
+  global.window.IE = {
+    testMod: { doLogin: () => { calls += 1; } }
+  };
+  const el = {
+    dataset: { enterAction: 'doLogin' },
+    closest: (selector) => selector === '[data-enter-action]' ? el : null
+  };
+  dispatcher.onKeydown({ key: 'Enter', target: el });
+  dispatcher.onKeydown({ key: 'Escape', target: el });
+  assert.equal(calls, 1);
 });
 
 test('dispatchClick: closest() finds an ancestor with data-action', () => {
