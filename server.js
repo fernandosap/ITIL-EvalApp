@@ -2020,7 +2020,7 @@ app.post('/api/submit', requireExamSession, async (req, res) => {
   }
 });
 
-app.get('/api/result/:code', requireAdmin, async (req, res) => {
+app.get('/api/result/:code', requireAdmin, requirePermission('results:read'), async (req, res) => {
   const code = String(req.params.code || '').trim().toUpperCase();
   if (!/^[A-Z2-9]{6}$/.test(code)) return res.status(400).json({ error: 'invalid_code' });
   try {

@@ -34,7 +34,7 @@
       : '';
     const pwdBlock = methods.password
       ? `<label class="label">Password</label>
-         <input type="password" id="pwd" placeholder="Admin password" autocomplete="off" onkeydown="if(event.key==='Enter')doLogin()">
+         <input type="password" id="pwd" placeholder="Admin password" autocomplete="off" data-enter-action="doLogin">
          <button class="btn btn-secondary btn-full" data-action="doLogin">Access Console</button>`
       : (!methods.xsuaa || !methods.xsuaa.enabled
           ? `<p style="color:#a00;font-size:13px">No admin authentication is configured on this server. Set ADMIN_HASH or bind XSUAA.</p>`

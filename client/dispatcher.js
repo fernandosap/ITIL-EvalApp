@@ -9,10 +9,9 @@
 // global listener is needed and the handler surface lives on the
 // IE.* modules naturally.
 //
-// Wire-up (one-time, at module load): two listeners on `document` —
-// one for click, one for change. Both look at the closest
-// [data-action] ancestor and dispatch to the matching function on
-// window.IE.<someModule>.<fn>.
+// Wire-up (one-time, at module load): listeners on `document` dispatch
+// click/change actions, explicit blur actions, and Enter-key actions to
+// matching functions on window.IE.<someModule>.<fn>.
 //
 // HTML contract:
 //
@@ -88,10 +87,13 @@
     return null;
   }
 
-  function dispatch(eventName, e) {
-    const el = e.target.closest && e.target.closest('[data-action]');
+  function dispatch(eventName, e, actionDatasetKey = 'action') {
+    const selector = actionDatasetKey === 'action'
+      ? '[data-action]'
+      : `[data-${actionDatasetKey.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)}]`;
+    const el = e.target.closest && e.target.closest(selector);
     if (!el) return;
-    const action = el.dataset.action;
+    const action = el.dataset[actionDatasetKey];
     if (!action) return;
     const found = lookupAction(action);
     if (!found) {
@@ -131,12 +133,17 @@
 
   function onClick(e) { dispatch('click', e); }
   function onChange(e) { dispatch('change', e); }
+  function onBlur(e) { dispatch('blur', e, 'blurAction'); }
+  function onKeydown(e) {
+    if (e.key === 'Enter') dispatch('keydown', e, 'enterAction');
+  }
 
-  // Wire up at module load. We use capture-phase so the dispatcher
-  // sees the event before any element-specific listeners (none
-  // today, but the convention is useful for future debugging).
+  // Use capture phase so blur is observable and actions run before any
+  // element-specific listeners.
   document.addEventListener('click', onClick);
   document.addEventListener('change', onChange);
+  document.addEventListener('blur', onBlur, true);
+  document.addEventListener('keydown', onKeydown);
 
   root.IE = root.IE || {};
   root.IE.dispatcher = {
@@ -145,6 +152,8 @@
     resolveSentinels: resolveSentinels,
     lookupAction: lookupAction,
     onClick: onClick,
-    onChange: onChange
+    onChange: onChange,
+    onBlur: onBlur,
+    onKeydown: onKeydown
   };
 })(typeof window !== 'undefined' ? window : globalThis);

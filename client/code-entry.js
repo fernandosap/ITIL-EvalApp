@@ -92,7 +92,7 @@
         <input class="code-input" id="code-inp" type="text" maxlength="6"
           placeholder="• • • • • •" autocomplete="off" autocorrect="off" spellcheck="false"
           oninput="this.value=this.value.toUpperCase().replace(/[^A-Z0-9]/g,'')"
-          onkeydown="if(event.key==='Enter')handleCodeSubmit()">
+          data-enter-action="handleCodeSubmit">
         <button class="btn btn-primary btn-full" style="margin-top:6px" data-action="handleCodeSubmit">Continue →</button>
         <p style="font-size:11px;color:#bbb;text-align:center;margin-top:8px">If you are resuming an interrupted exam, enter the same code to restore your progress.</p>
       </div>
