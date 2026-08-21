@@ -2202,7 +2202,10 @@ app.get('/oauth/callback', async (req, res) => {
   ].filter(Boolean).join('; ');
   res.setHeader('Set-Cookie', setCookie);
   appLog('info', 'oauth_login_success', { requestId: req.requestId });
-  res.redirect(302, '/?auth=ok');
+  // The authorization flow starts from the admin console. Preserve that
+  // destination so main.js can bootstrap the newly-set cookie as admin
+  // instead of rendering the public access-code screen.
+  res.redirect(302, '/?admin=1&auth=ok');
 });
 
 // Build the absolute redirect_uri to send to XSUAA. Must match the one
