@@ -13,15 +13,23 @@
   --brand-sky:#dfe9f7;
   --brand-panel:#fff;
   --brand-shadow:0 10px 38px rgba(34,61,107,.17);
+  --sap-pattern:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='160' viewBox='0 0 240 160'%3E%3Cg opacity='.38'%3E%3Cpath d='M24 22h28l-12 12H24z' fill='%2367baf4'/%3E%3Cpath d='M112 22h28l-12 12h-16z' fill='%2349d0c7'/%3E%3Cpath d='M200 22h28l-12 12h-16z' fill='%23529eee'/%3E%3Cpath d='M24 78h28L40 90H24z' fill='%2367baf4'/%3E%3Cpath d='M112 78h28l-12 12h-16z' fill='%2349d0c7'/%3E%3Cpath d='M200 78h28l-12 12h-16z' fill='%23529eee'/%3E%3Cpath d='M24 134h28l-12 12H24z' fill='%2367baf4'/%3E%3Cpath d='M112 134h28l-12 12h-16z' fill='%2349d0c7'/%3E%3Cpath d='M200 134h28l-12 12h-16z' fill='%23529eee'/%3E%3C/g%3E%3C/svg%3E");
 }
-body.exam-bg{background:#eef2f8 !important}
+body.exam-bg{
+ background-image:var(--sap-pattern),linear-gradient(180deg,#eef3fb 0%,#edf2fa 100%) !important;
+ background-size:300px 200px,auto !important;
+ background-position:center top,center !important;
+}
 body{
-  font-family:'Segoe UI',Arial,sans-serif;
-  background:
-    radial-gradient(circle at top left,rgba(255,255,255,.85) 0%,rgba(255,255,255,0) 38%),
-    radial-gradient(circle at top right,rgba(255,255,255,.78) 0%,rgba(255,255,255,0) 34%),
-    linear-gradient(180deg,#eef3fb 0%,#edf2fa 100%);
-  color:#1a1a2e;
+ font-family:'Segoe UI',Arial,sans-serif;
+ background-image:
+   radial-gradient(circle at top left,rgba(255,255,255,.85) 0%,rgba(255,255,255,0) 38%),
+   radial-gradient(circle at top right,rgba(255,255,255,.78) 0%,rgba(255,255,255,0) 34%),
+   var(--sap-pattern),
+   linear-gradient(180deg,#eef3fb 0%,#edf2fa 100%);
+ background-size:auto,auto,300px 200px,auto;
+ background-position:top left,top right,center top,center;
+ color:#1a1a2e;
   min-height:100vh;
   position:relative;
   overflow-x:hidden;
