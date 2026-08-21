@@ -9,9 +9,24 @@
   ],
   "roleTemplateList": [
     {
-      "name": "Token-Attribute",
-      "description": "Scope embedded in the access token",
-      "scopeReferences": ["$XSAPPNAME.admin", "$XSAPPNAME.manager", "$XSAPPNAME.reviewer", "$XSAPPNAME.content_editor"]
+      "name": "Admin",
+      "description": "Full administrative access",
+      "scopeReferences": ["$XSAPPNAME.admin"]
+    },
+    {
+      "name": "Manager",
+      "description": "Code and result management access",
+      "scopeReferences": ["$XSAPPNAME.manager"]
+    },
+    {
+      "name": "Reviewer",
+      "description": "Audit and compliance review access",
+      "scopeReferences": ["$XSAPPNAME.reviewer"]
+    },
+    {
+      "name": "ContentEditor",
+      "description": "Question-bank editing access",
+      "scopeReferences": ["$XSAPPNAME.content_editor"]
     }
   ],
   "oauth2Configuration": {
