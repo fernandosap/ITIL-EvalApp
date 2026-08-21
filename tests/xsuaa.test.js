@@ -120,6 +120,8 @@ test('mapScopesToRole: ignores non-string entries', () => {
 test('roleFromClaims: extracts role from a string "scope" claim', () => {
   assert.equal(roleFromClaims({ scope: 'admin codes:read' }), 'admin');
   assert.equal(roleFromClaims({ scope: 'manager' }), 'manager');
+  assert.equal(roleFromClaims({ scope: 'academy-cf-cs-itil4-evalapp!t11367.reviewer' }), 'reviewer');
+  assert.equal(roleFromClaims({ scope: 'academy-cf-cs-itil4-evalapp!t11367.content_editor' }), 'content_editor');
 });
 
 test('roleFromClaims: accepts an array "scope" claim', () => {

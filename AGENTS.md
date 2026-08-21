@@ -215,8 +215,19 @@ fallback when XSUAA is not bound.
 - **API clients**: send `Authorization: Bearer <jwt>` directly (RS256, signed by XSUAA's verification key).
 - **JWT validation** (`shared/xsuaa.js` `verifyXsuaaJwt`): manual RS256 verification using the verification key from `VCAP_SERVICES.xsuaa[0].credentials.verificationkey`. Validates `alg=RS256`, signature, `exp`, `nbf`, `aud == xsappname` (or `*`).
 - **Role mapping**: highest-priority scope wins. `admin` > `manager` > `reviewer` > `content_editor`.
-- **Logout**: `POST /api/admin/logout` sets `xsuaa_jwt=; Max-Age=0` to expire the cookie. Does NOT invalidate the IdP session (XSUAA session is separate and would need `/oauth/logout` against XSUAA — not implemented; not needed for this app).
+- **Logout**: `POST /api/admin/logout` clears `xsuaa_session` (and the legacy `xsuaa_jwt` cookie when present). It does NOT invalidate the IdP session (XSUAA session is separate and would need `/oauth/logout` against XSUAA — not implemented; not needed for this app).
 - **No `@sap/xssec` dependency** — manual JWT verification keeps the dep tree small (~140 LOC in `shared/xsuaa.js`).
+
+### Opaque browser-session lifecycle
+
+The OAuth browser flow stores the XSUAA JWT in the process-local
+`_xsuaaBrowserSessions` map and sends the browser only an opaque
+`xsuaa_session` cookie. This avoids browser cookie-size limits and keeps the
+JWT off the client, but sessions are valid only on the process that created
+them. A CF restart/deploy invalidates active SSO browser sessions. The app is
+currently pinned to one instance; before scaling beyond one instance, move
+this session map to shared storage (or use sticky routing plus an explicit
+availability plan).
 
 ### Exam token
 
@@ -333,7 +344,11 @@ Reads HANA vars from `.env` or `--env-file`. Sets `APP_REVISION` from `git rev-p
     - `…reviewer`
     - `…content_editor`
 
-    These scopes live inside a single `Token-Attribute` role template (see `xs-security.json`). The role collections that map user emails to scopes were created on **2026-08-21** via the `btp` CLI (not stored in the repo — they're per-subaccount state):
+    Each scope has its own role template in `xs-security.json` (`Admin`,
+    `Manager`, `Reviewer`, or `ContentEditor`). A role collection must receive
+    only its matching template; this preserves least privilege. The role
+    collections that map user emails to scopes were created on **2026-08-21**
+    via the `btp` CLI (not stored in the repo — they're per-subaccount state):
 
     ```bash
     btp login --sso
@@ -349,14 +364,19 @@ Reads HANA vars from `.env` or `--env-file`. Sets `APP_REVISION` from `git rev-p
     btp create security/role-collection "academy-cf-cs-itil4-evalapp!t11367.content_editor" \
       --description "ITIL EvalApp — question bank editing"
 
-    # Add the Token-Attribute role to each collection.
+    # Add exactly one matching role template to each collection.
     # The NAME is the role template name (not the scope).
-    # The `--of-app` + `--of-role-template` pair resolves it.
     for role in admin manager reviewer content_editor; do
-      btp add security/role "Token-Attribute" \
+      template=$(case "$role" in
+        admin) echo Admin ;;
+        manager) echo Manager ;;
+        reviewer) echo Reviewer ;;
+        content_editor) echo ContentEditor ;;
+      esac)
+      btp add security/role "$template" \
         --to-role-collection "academy-cf-cs-itil4-evalapp!t11367.$role" \
         --of-app "academy-cf-cs-itil4-evalapp!t11367" \
-        --of-role-template "Token-Attribute"
+        --of-role-template "$template"
     done
 
     # Assign a user to admin (repeat for each new admin)
@@ -374,8 +394,8 @@ Reads HANA vars from `.env` or `--env-file`. Sets `APP_REVISION` from `git rev-p
     - `fernando.sanchez@sap.com`
 
     **Gotchas**:
-    - `btp add security/role` rejects if you pass the scope name (e.g. `admin`) as the `NAME` argument — it expects the role template name (`Token-Attribute`). The actual scope filtering happens at token-issuance time, not at role-collection-assignment time.
-    - Adding the role template to a single role collection grants ALL four scopes (admin, manager, reviewer, content_editor). If you want a user to have only `manager` scope, you must create the role collection without the admin scope — which currently requires a custom role template (the current `Token-Attribute` template grants all four). For finer granularity, edit `xs-security.json` to define multiple role templates (one per scope) and re-bind the XSUAA service.
+    - `btp add security/role` rejects if you pass the scope name (e.g. `admin`) as the `NAME` argument — it expects the role template name (`Admin`, `Manager`, `Reviewer`, or `ContentEditor`). The actual scope filtering happens at token-issuance time.
+    - Never attach more than one role template to a least-privilege role collection. `roleFromClaims()` selects the highest available role, so combining scopes may intentionally promote a user to a more privileged role.
     - The legacy SHA-256 `X-Admin-Token` auth path still works for users with `ADMIN_HASH` set in env vars. SSO is the recommended path going forward but the fallback exists for local dev and break-glass scenarios.
 
 ## HANA findings (Fase 0, 2026-08-18)
