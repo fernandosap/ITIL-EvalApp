@@ -70,21 +70,47 @@ test('sanitizePayload: screen accepts the allowed SPA screens', () => {
   }
 });
 
-test('sanitizePayload: accessCode is validated against the exact 6-char format', () => {
-  // Valid: 6 chars from the right alphabet
-  assert.equal(clientErrors.sanitizePayload({ accessCode: 'ABC2DE' }).accessCode, 'ABC2DE');
-  // Invalid: lowercase rejected
-  assert.equal(clientErrors.sanitizePayload({ accessCode: 'abc2de' }).accessCode, null);
-  // Invalid: too short
-  assert.equal(clientErrors.sanitizePayload({ accessCode: 'ABC' }).accessCode, null);
-  // Invalid: too long
-  assert.equal(clientErrors.sanitizePayload({ accessCode: 'ABC2DEF' }).accessCode, null);
-  // Invalid: forbidden chars (I, L, O, 0, 1)
-  assert.equal(clientErrors.sanitizePayload({ accessCode: 'ABC2DI' }).accessCode, null);
-  assert.equal(clientErrors.sanitizePayload({ accessCode: 'ABC2D0' }).accessCode, null);
-  // Invalid: non-string
-  assert.equal(clientErrors.sanitizePayload({ accessCode: 123456 }).accessCode, null);
-  assert.equal(clientErrors.sanitizePayload({ accessCode: null }).accessCode, null);
+test('sanitizePayload: drops accessCode (it is a credential, never travels with telemetry)', () => {
+  // The exam access code is a credential. The server
+  // schema deliberately does NOT accept it as a field
+  // — even a "valid" code is dropped. The browser
+  // correlates errors via diagnosticSessionId (a
+  // random UUID) instead.
+  const out = clientErrors.sanitizePayload({ accessCode: 'ABC2DE' });
+  assert.equal(out.accessCode, undefined,
+    'accessCode must be dropped from the sanitized payload');
+  // Defense in depth: even if a future browser regression
+  // re-introduces it, the schema whitelist should reject it.
+  assert.equal(JSON.stringify(out).includes('ABC2DE'), false,
+    'raw access code must not appear in the sanitized payload');
+});
+
+test('sanitizePayload: keeps diagnosticSessionId when present and valid', () => {
+  // UUID v4 from crypto.randomUUID
+  const out = clientErrors.sanitizePayload({ diagnosticSessionId: '550e8400-e29b-41d4-a716-446655440000' });
+  assert.equal(out.diagnosticSessionId, '550e8400-e29b-41d4-a716-446655440000');
+  // Legacy "dsid-..." format
+  const out2 = clientErrors.sanitizePayload({ diagnosticSessionId: 'dsid-l3j2-abc123' });
+  assert.equal(out2.diagnosticSessionId, 'dsid-l3j2-abc123');
+  // UA-fallback
+  const out3 = clientErrors.sanitizePayload({ diagnosticSessionId: 'ua-Chrome/130' });
+  assert.equal(out3.diagnosticSessionId, 'ua-Chrome/130');
+});
+
+test('sanitizePayload: rejects invalid diagnosticSessionId (whitespace / control chars / too long)', () => {
+  // Whitespace is the realistic concern (a newline
+  // injection into the storage would be bad).
+  assert.equal(clientErrors.sanitizePayload({ diagnosticSessionId: 'has space' }).diagnosticSessionId, null);
+  assert.equal(clientErrors.sanitizePayload({ diagnosticSessionId: 'has\ttab' }).diagnosticSessionId, null);
+  assert.equal(clientErrors.sanitizePayload({ diagnosticSessionId: 'has\nnewline' }).diagnosticSessionId, null);
+  // SQL-injection-shaped value
+  assert.equal(clientErrors.sanitizePayload({ diagnosticSessionId: "abc'; DROP TABLE--" }).diagnosticSessionId, null);
+  // Too long (the cap is 80)
+  assert.equal(clientErrors.sanitizePayload({ diagnosticSessionId: 'x'.repeat(81) }).diagnosticSessionId, null);
+  // Empty
+  assert.equal(clientErrors.sanitizePayload({ diagnosticSessionId: '' }).diagnosticSessionId, null);
+  // Non-string
+  assert.equal(clientErrors.sanitizePayload({ diagnosticSessionId: 12345 }).diagnosticSessionId, null);
 });
 
 test('sanitizeString: strips JWTs', () => {
@@ -220,7 +246,9 @@ test('reportClientError: writes to ADMIN_AUDIT_LOG via the withDb hook', async (
       type: 'error',
       message: 'boom',
       screen: 'exam',
-      accessCode: 'ABC2DE',
+      // diagnosticSessionId is the new correlation key;
+      // the access code is intentionally NOT sent.
+      diagnosticSessionId: 'sess-uuid-1234',
       filename: '/client/exam.js',
       line: 42,
       stack: 'Error: boom\n    at renderQ (exam.js:42:5)'
@@ -229,34 +257,31 @@ test('reportClientError: writes to ADMIN_AUDIT_LOG via the withDb hook', async (
     appRevision: 'v1.2.3'
   });
   assert.equal(r, 'ok');
-  // We expect at least: SELECT against SYS.TABLES (for the
-  // table check) + INSERT into ADMIN_AUDIT_LOG. The SET
-  // SCHEMA call is bypassed by the withDb mock (the lib's
-  // _withDb returns _customDbFn(fn) directly without
-  // running SET SCHEMA), so we only see 2 calls here.
-  // In production, the SET SCHEMA runs before the fn.
   assert.ok(calls.length >= 2, `expected >= 2 SQL calls, got ${calls.length}`);
-  // The SELECT against SYS.TABLES must come first (table check).
   const select = calls.find((c) => c.sql.includes('FROM SYS.TABLES'));
   assert.ok(select, 'expected a SELECT against SYS.TABLES');
   assert.equal(select.params[0], 'S', 'schema name should be upper-cased by the lib');
-  // The INSERT must target ADMIN_AUDIT_LOG and carry the
-  // sanitized accessCode + action='client_error'.
   const insert = calls.find((c) => c.sql.includes('INSERT INTO ADMIN_AUDIT_LOG'));
   assert.ok(insert, 'expected an INSERT INTO ADMIN_AUDIT_LOG call');
   assert.equal(insert.params[0], 'client_error',
     'action column should be "client_error"');
-  assert.equal(insert.params[1], 'ABC2DE',
-    'target_code should be the validated access code');
+  // TARGET_CODE is always NULL for client errors — the
+  // exam access code is a credential and never travels
+  // with diagnostic telemetry.
+  assert.equal(insert.params[1], null,
+    'target_code should be null (access code is a credential, never stored)');
   assert.equal(insert.params[3], 'anonymous',
     'actor should be "anonymous" (unauthenticated endpoint)');
-  // DETAILS_JSON should include appRevision + receivedAt.
+  // DETAILS_JSON should include appRevision + receivedAt +
+  // diagnosticSessionId (but NOT accessCode).
   const details = JSON.parse(insert.params[2]);
   assert.equal(details.appRevision, 'v1.2.3');
   assert.ok(details.receivedAt);
   assert.equal(details.message, 'boom');
   assert.equal(details.screen, 'exam');
-  assert.equal(details.accessCode, 'ABC2DE');
+  assert.equal(details.diagnosticSessionId, 'sess-uuid-1234');
+  assert.equal(details.accessCode, undefined,
+    'accessCode must not appear in the persisted details JSON');
 });
 
 test('reportClientError: returns "no_table" when ADMIN_AUDIT_LOG is missing', async () => {

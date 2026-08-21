@@ -110,12 +110,36 @@ test('reporter.buildPayload: includes type, message, filename, line, col, stack'
   clearBrowserStubs();
 });
 
-test('reporter.buildPayload: pulls accessCode from S', () => {
+test('reporter.buildPayload: does NOT include the access code (it is a credential)', () => {
+  // The exam access code is a credential. The reporter
+  // must never include it in the diagnostic payload,
+  // even if S.code is set. The admin dashboard correlates
+  // errors via diagnosticSessionId (a random UUID per
+  // tab) instead.
   installBrowserStubs();
   withReporter({ screen: 'results', code: 'ABC2DE' }, (reporter) => {
     const p = reporter.buildPayload('error', { message: 'x' });
     assert.equal(p.screen, 'results');
-    assert.equal(p.accessCode, 'ABC2DE');
+    assert.equal(p.accessCode, undefined,
+      'payload must not include accessCode (credential leak)');
+    // The code is also not in the message/stack/filename
+    // (sanitization is server-side, but the browser
+    // should not even ship it).
+    assert.equal(JSON.stringify(p).includes('ABC2DE'), false,
+      'raw access code must not appear anywhere in the payload');
+  });
+  clearBrowserStubs();
+});
+
+test('reporter.buildPayload: pulls diagnosticSessionId from S', () => {
+  installBrowserStubs();
+  withReporter({
+    screen: 'results',
+    code: 'ABC2DE',  // ignored
+    diagnosticSessionId: 'sess-uuid-1234'
+  }, (reporter) => {
+    const p = reporter.buildPayload('error', { message: 'x' });
+    assert.equal(p.diagnosticSessionId, 'sess-uuid-1234');
   });
   clearBrowserStubs();
 });

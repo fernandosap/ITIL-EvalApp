@@ -2265,7 +2265,14 @@ app.post('/api/admin/login', (req, res) => {
   return res.json({ ok: true, token: createAdminToken(role), role });
 });
 
-app.post('/api/admin/logout', requireAdmin, requireAdminWriteRate(), async (req, res) => {
+// /api/admin/logout is intentionally NOT wrapped in
+// requireAdminWriteRate — if a user is being rate-limited
+// (e.g. by a runaway loop or a flagged IP), logout is the
+// one write operation we always want to allow, so the
+// admin can recover their session. Same reasoning for
+// /api/admin/sessions/revoke-all (admin-initiated
+// emergency revocation).
+app.post('/api/admin/logout', requireAdmin, async (req, res) => {
   void tryWriteAdminAudit({
     action: AUDIT_ACTION.LOGOUT,
     actor: req.adminRole || ROLES.ADMIN,
@@ -2280,7 +2287,7 @@ app.post('/api/admin/logout', requireAdmin, requireAdminWriteRate(), async (req,
   res.json({ ok: true });
 });
 
-app.post('/api/admin/sessions/revoke-all', requireAdmin, requireAdminRole(ROLES.ADMIN), requireAdminWriteRate(), async (req, res) => {
+app.post('/api/admin/sessions/revoke-all', requireAdmin, requireAdminRole(ROLES.ADMIN), async (req, res) => {
   try {
     const revokedAt = Date.now();
     await withDb(async (conn) => {

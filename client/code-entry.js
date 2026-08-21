@@ -272,73 +272,195 @@
     </div>`);
   }
 
+  // ---- Media acquisition (separate from Tech Check UI) ----
+  // These two functions are the only place that calls
+  // getUserMedia / getDisplayMedia. They manage S.webcamStream
+  // / S.screenStream and the hidden-cam / exam-cam bindings,
+  // and they register the `ended` handler on the video track.
+  //
+  // The Tech Check screen has its own buttons + status pills
+  // (st-cam, btn-cam, st-screen, btn-screen, cam-preview,
+  // preview-vid). Those live ONLY on the Tech Check view and
+  // do not exist on the exam view. So the Tech Check wrapper
+  // (reqWebcam / reqScreen) is a thin adapter that:
+  //   1. calls the pure media acquire function
+  //   2. updates the Tech Check DOM
+  // The in-exam reconnect path (called from the `ended`
+  // handler below) calls the pure acquire function only —
+  // it never touches the Tech Check DOM, which doesn't exist
+  // during an exam.
+  //
+  // This split is what makes mid-exam reconnect safe:
+  // before this change, the `ended` handler tried to update
+  // st-cam / btn-cam from inside the exam view and threw
+  // TypeError: Cannot read properties of null.
+
+  // Acquire (or re-acquire) the webcam. Returns the new
+  // MediaStream. On failure, throws — the caller decides
+  // whether to show a modal.
+  async function acquireWebcam() {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 320, height: 240 }, audio: false });
+    S.webcamStream = stream;
+    S.webcamOk = true;
+    // hidden-cam is the offscreen <video> the proctor reads
+    // from with drawImage(). exam-cam is the small corner
+    // feed shown to the candidate. Both must point at the
+    // new stream; without the exam-cam rebind, the corner
+    // feed would stay frozen on the last frame.
+    const hidden = $('hidden-cam');
+    if (hidden) hidden.srcObject = stream;
+    const examCam = $('exam-cam');
+    if (examCam) examCam.srcObject = stream;
+    // Register the ended handler on the new video track.
+    // The previous stream's track is already ended; we only
+    // care about this one.
+    const videoTrack = stream.getVideoTracks()[0];
+    if (videoTrack) {
+      videoTrack.addEventListener('ended', () => onWebcamTrackEnded());
+    }
+    return stream;
+  }
+
+  // Called when the active webcam MediaStreamTrack ends.
+  // The track ends for one of: OS suspend, USB unplug,
+  // user revokes camera permission, browser auto-stops
+  // the track after long backgrounding. We don't care
+  // which — the recovery is the same.
+  function onWebcamTrackEnded() {
+    S.webcamOk = false;
+    // Mark the live preview as stale. exam-cam is the
+    // candidate-facing corner feed; it would otherwise
+    // freeze on the last frame and look like proctoring
+    // was still active. Same for hidden-cam so drawImage()
+    // returns null and the proctor's no-videoWidth guard
+    // skips the capture.
+    const examCam = $('exam-cam');
+    if (examCam) examCam.srcObject = null;
+    const hidden = $('hidden-cam');
+    if (hidden) hidden.srcObject = null;
+    if (S.screen !== 'exam' || S.submitted) {
+      // On the Tech Check screen we don't show a modal;
+      // we just flip the status pill so the next reqWebcam
+      // can succeed. (The Tech Check view re-renders the
+      // pill when the user goes back to it.)
+      const st = $('st-cam');
+      if (st) st.innerHTML = '<span class="status-err">Disconnected</span>';
+      return;
+    }
+    // Mid-exam: log + recovery modal. The Reconnect button
+    // is the user-gesture that satisfies getUserMedia's
+    // permission requirement.
+    if (root.IE && root.IE.state && typeof root.IE.state.logIncident === 'function') {
+      root.IE.state.logIncident('webcam_disconnected', 'Webcam track ended during exam');
+    }
+    modal('🚨', 'Webcam Disconnected', 'Your webcam was disconnected mid-exam. This has been logged. Please reconnect immediately to continue proctoring.', [
+      { label: 'Reconnect Webcam', cls: 'btn-danger', action: () => {
+        $('modal').classList.remove('show');
+        // acquireWebcam is the SAFE path during an exam —
+        // it only touches hidden-cam + exam-cam, neither
+        // of which is the Tech Check DOM. We do NOT call
+        // reqWebcam() here because reqWebcam() updates
+        // st-cam / btn-cam / preview-vid which don't exist
+        // on the exam view.
+        acquireWebcam().catch((err) => {
+          // Permission denied or hardware unavailable.
+          // Show the recovery modal again so the candidate
+          // can retry.
+          if (root.IE && root.IE.state && typeof root.IE.state.logIncident === 'function') {
+            root.IE.state.logIncident('webcam_reconnect_failed', String(err && err.message ? err.message : err));
+          }
+          modal('🚨', 'Webcam Reconnect Failed', 'The browser did not grant camera access. Please allow camera access and try again.', [
+            { label: 'Retry', cls: 'btn-danger', action: () => {
+              $('modal').classList.remove('show');
+              acquireWebcam().catch(() => {
+                // Give up silently — the next user action
+                // (or a /api/proctor/check tick) will see
+                // S.webcamOk === false and the candidate
+                // can keep answering.
+              });
+            } }
+          ]);
+        });
+      } }
+    ]);
+  }
+
+  // Acquire (or re-acquire) the screen share. Returns the
+  // new MediaStream. On failure, throws.
+  async function acquireScreen() {
+    const stream = await navigator.mediaDevices.getDisplayMedia({ video: { displaySurface: 'monitor' }, audio: false });
+    S.screenStream = stream;
+    S.screenOk = true;
+    // No hidden-cam rebind for screen — the proctor only
+    // captures from the webcam. Screen sharing is for the
+    // proctor's record-keeping (so an admin reviewing the
+    // session can see what was on the candidate's screen
+    // during a flagged incident), not for AI analysis.
+    const track = stream.getVideoTracks()[0];
+    if (track) {
+      track.addEventListener('ended', () => onScreenTrackEnded());
+    }
+    return stream;
+  }
+
+  // Called when the active screen-share track ends. The
+  // previous version only showed a "I understand" modal
+  // that let the candidate continue without proctoring —
+  // unacceptable, because screen sharing is a proctoring
+  // requirement, not a courtesy. We now mark S.screenOk
+  // = false, log the incident, and force a Reconnect
+  // action before the candidate can proceed.
+  function onScreenTrackEnded() {
+    S.screenOk = false;
+    if (S.screen !== 'exam' || S.submitted) {
+      // Tech Check path: flip the status pill. The Tech
+      // Check view re-renders it when the user goes back.
+      const st = $('st-screen');
+      if (st) st.innerHTML = '<span class="status-err">Disconnected</span>';
+      return;
+    }
+    if (root.IE && root.IE.state && typeof root.IE.state.logIncident === 'function') {
+      root.IE.state.logIncident('screen_stopped', 'Screen share track ended during exam');
+    }
+    // Modal is shown repeatedly (no I-understand bypass) until
+    // the candidate reconnects. The proctor interval will
+    // keep failing for S.screenOk === false / no live track;
+    // the candidate can still answer questions, but
+    // proctoring is degraded.
+    modal('🚨', 'Screen Share Stopped', 'You have stopped screen sharing. This has been logged. Screen sharing is required throughout the exam — please reconnect immediately.', [
+      { label: 'Reconnect Screen', cls: 'btn-danger', action: () => {
+        $('modal').classList.remove('show');
+        acquireScreen().catch((err) => {
+          if (root.IE && root.IE.state && typeof root.IE.state.logIncident === 'function') {
+            root.IE.state.logIncident('screen_reconnect_failed', String(err && err.message ? err.message : err));
+          }
+          modal('🚨', 'Screen Reconnect Failed', 'The browser did not grant screen-sharing access. Please allow screen sharing and try again.', [
+            { label: 'Retry', cls: 'btn-danger', action: () => {
+              $('modal').classList.remove('show');
+              acquireScreen().catch(() => { /* give up silently */ });
+            } }
+          ]);
+        });
+      } }
+    ]);
+  }
+
+  // Tech Check wrappers. These combine the pure media
+  // acquisition with the Tech Check DOM updates. They are
+  // ONLY meant to be called from the Tech Check view —
+  // never from inside the exam.
   async function reqWebcam() {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 320, height: 240 }, audio: false });
-      S.webcamStream = stream;
-      S.webcamOk = true;
+      await acquireWebcam();
+      // Tech Check UI updates — only safe because we're on
+      // the Tech Check view where st-cam / btn-cam exist.
       $('st-cam').innerHTML = '<span class="status-ok">✓ Active</span>';
       $('btn-cam').textContent = '✓ Webcam Active';
       $('btn-cam').disabled = true;
       $('btn-screen').disabled = false;
       const pv = $('preview-vid');
-      if (pv) pv.srcObject = stream;
+      if (pv) pv.srcObject = S.webcamStream;
       $('cam-preview').style.display = 'block';
-      $('hidden-cam').srcObject = stream;
-      // Listen for the webcam track ending. This happens when
-      // the OS suspends the device, the user revokes camera
-      // permission, the USB camera is unplugged, or the
-      // browser auto-stops the track after long backgrounding.
-      // Without this, the candidate sees a black preview with
-      // no warning and the proctor polls a dead stream
-      // silently. The screen share already has a similar
-      // handler in reqScreen() below.
-      const videoTrack = stream.getVideoTracks()[0];
-      if (videoTrack) {
-        videoTrack.addEventListener('ended', () => {
-          // Don't fire on the tech-check screen — only when
-          // the candidate is actually taking the exam. The
-          // `screen` field is set to 'exam' once they enter.
-          if (S.screen !== 'exam' || S.submitted) {
-            // Update the status pill so the next reqWebcam()
-            // call can succeed.
-            S.webcamOk = false;
-            const st = $('st-cam');
-            if (st) st.innerHTML = '<span class="status-err">Disconnected</span>';
-            return;
-          }
-          S.webcamOk = false;
-          // Hide the live preview to avoid showing a frozen
-          // last frame as if proctoring was still active.
-          const camPreview = $('cam-preview');
-          if (camPreview) camPreview.style.display = 'none';
-          // Log to the session incidents so the admin can
-          // see it later in the result review.
-          if (root.IE && root.IE.state && typeof root.IE.state.logIncident === 'function') {
-            root.IE.state.logIncident('webcam_disconnected', 'Webcam track ended during exam');
-          }
-          modal('🚨', 'Webcam Disconnected', 'Your webcam was disconnected mid-exam. This has been logged. Please reconnect immediately to continue proctoring.', [
-            { label: 'Reconnect Webcam', cls: 'btn-danger', action: () => {
-              // Reset the tech-check UI to allow re-grant
-              $('modal').classList.remove('show');
-              $('st-cam').innerHTML = '<span class="status-err">Disconnected</span>';
-              $('btn-cam').textContent = 'Enable Webcam';
-              $('btn-cam').disabled = false;
-              // Clear the hidden-cam element so drawImage()
-              // doesn't read from a stale source
-              const hc = $('hidden-cam');
-              if (hc) hc.srcObject = null;
-              const pv2 = $('preview-vid');
-              if (pv2) pv2.srcObject = null;
-              // Note: we don't auto-call reqWebcam() because
-              // getUserMedia will only succeed with explicit
-              // user gesture, and the modal button click IS
-              // that gesture.
-              reqWebcam();
-            } }
-          ]);
-        });
-      }
     } catch (_e) {
       $('st-cam').innerHTML = '<span class="status-err">Denied</span>';
       modal('❌', 'Webcam Required', 'Please allow camera access in your browser settings and try again.', [{ label: 'Retry', cls: 'btn-primary', action: reqWebcam }]);
@@ -347,16 +469,10 @@
 
   async function reqScreen() {
     try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({ video: { displaySurface: 'monitor' }, audio: false });
-      S.screenStream = stream;
-      S.screenOk = true;
-      const track = stream.getVideoTracks()[0];
-      track.addEventListener('ended', () => {
-        root.IE.state.logIncident('screen_stopped', 'Candidate stopped screen sharing mid-exam');
-        if (S.screen === 'exam' && !S.submitted) {
-          modal('🚨', 'Screen Share Stopped', 'You have stopped screen sharing. This has been logged. Please restart your screen share immediately.', [{ label: 'I understand', cls: 'btn-danger' }]);
-        }
-      });
+      await acquireScreen();
+      // Tech Check UI updates — only safe because we're on
+      // the Tech Check view where st-screen / btn-screen /
+      // btn-start exist.
       $('st-screen').innerHTML = '<span class="status-ok">✓ Sharing</span>';
       $('btn-screen').textContent = '✓ Screen Active';
       $('btn-screen').disabled = true;

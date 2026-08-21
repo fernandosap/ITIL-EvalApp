@@ -18,6 +18,39 @@
   // ---- Globals ----
   root.CFG = { webcamIntervalS: 28 };
 
+  // Per-browser-session correlation ID for diagnostic
+  // telemetry. This is NOT a credential — it's a random
+  // UUID generated once per tab and persisted to
+  // sessionStorage. It lets the admin correlate multiple
+  // error beacons from the same session without including
+  // any exam access code (which IS a credential and must
+  // never appear in anonymous telemetry).
+  //
+  // Generated lazily on first read so we don't pay the
+  // crypto cost at boot. sessionStorage is used (not
+  // localStorage) so the ID is wiped when the tab closes —
+  // it's purely a per-tab correlation handle.
+  function getDiagnosticSessionId() {
+    if (root.S.diagnosticSessionId) return root.S.diagnosticSessionId;
+    let id = null;
+    try {
+      // crypto.randomUUID is the standard modern way; fall
+      // back to a Math.random + Date combo for ancient
+      // browsers (none in our supported matrix but defensive).
+      if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+        id = crypto.randomUUID();
+      } else {
+        id = 'dsid-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+      }
+      if (typeof sessionStorage !== 'undefined') {
+        try { sessionStorage.setItem('academy_diag_sid', id); } catch (_e) { /* private mode etc. */ }
+      }
+    } catch (_e) { id = null; }
+    if (!id) id = 'dsid-anon-' + Date.now().toString(36);
+    root.S.diagnosticSessionId = id;
+    return id;
+  }
+
   root.S = root.S || {
     screen: 'code',
     code: '',
@@ -46,8 +79,23 @@
     isPractice: false,
     showCorrectAnswers: false,
     freshStart: false,
-    securityBound: false
+    securityBound: false,
+    // Populated lazily on first read by getDiagnosticSessionId().
+    diagnosticSessionId: null
   };
+
+  // Try to restore a previously-stored diagnostic session
+  // ID for this tab. Falls through to lazy generation on
+  // first read if the storage was cleared (private mode,
+  // cleared cookies, etc.).
+  try {
+    if (typeof sessionStorage !== 'undefined') {
+      const existing = sessionStorage.getItem('academy_diag_sid');
+      if (existing && /^[A-Za-z0-9._-]{1,80}$/.test(existing)) {
+        root.S.diagnosticSessionId = existing;
+      }
+    }
+  } catch (_e) { /* ignore */ }
   root._adminToken = root._adminToken || null;
   root._adminAuthMethod = root._adminAuthMethod || 'token';
   root._adminRole = root._adminRole || 'admin';
@@ -311,7 +359,8 @@
     stopMediaStreams: stopMediaStreams,
     queueProgressSave: queueProgressSave,
     replayPendingActions: replayPendingActions,
-    fetchStatus: fetchStatus
+    fetchStatus: fetchStatus,
+    getDiagnosticSessionId: getDiagnosticSessionId
   };
 
   // CommonJS export so Node-side unit tests can require()

@@ -78,6 +78,17 @@
       const app = document.getElementById('app');
       if (!app) return;
       const safeMessage = (err && err.message) ? String(err.message).slice(0, 240) : 'Unknown startup error';
+      // HTML-escape the error message before interpolation.
+      // Even though the surrounding <pre> is in a <details>
+      // and the page has a CSP, we don't want a stray `<img
+      // onerror=...>` in an error message to become an
+      // inline event handler.
+      const escaped = safeMessage
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
       app.innerHTML =
         '<div class="screen" style="padding-top:48px">' +
           '<div class="card" style="text-align:center">' +
@@ -90,7 +101,7 @@
             '<details style="margin-top:14px;text-align:left;color:#888;font-size:12px">' +
               '<summary style="cursor:pointer">Technical details</summary>' +
               '<pre style="margin-top:8px;white-space:pre-wrap;word-break:break-word;font-size:11px">' +
-                safeMessage + '</pre>' +
+                escaped + '</pre>' +
             '</details>' +
           '</div>' +
         '</div>';

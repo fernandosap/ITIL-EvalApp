@@ -34,6 +34,15 @@
 
   // Pure helper. Builds the sanitized payload. Exported so
   // tests can verify the shape without mocking the network.
+  //
+  // IMPORTANT: we deliberately do NOT include the exam
+  // access code in the payload. The access code is a
+  // credential (anyone with it can sit the exam under
+  // another candidate's name) and it has no place in
+  // anonymous diagnostic telemetry. For per-candidate
+  // correlation, the admin can join by (timestamp, IP) or
+  // use the diagnosticSessionId below — which is a random
+  // UUID, not a secret.
   function buildPayload(type, info, ctx) {
     info = info || {};
     ctx = ctx || {};
@@ -47,7 +56,16 @@
       stack: (info.stack == null ? '' : String(info.stack)).slice(0, 1200),
       screen: S.screen ? String(S.screen) : 'unknown',
       lastAction: S.lastAction ? String(S.lastAction) : '',
-      accessCode: S.code ? String(S.code) : null,
+      // Non-secret per-browser-session correlation ID. Read
+      // from sessionStorage if available; otherwise the
+      // caller (state.js) is expected to have placed one
+      // on the S object. Falls back to a derived value
+      // based on the userAgent (so different browsers on
+      // the same machine still get distinct IDs) but that
+      // is best-effort, not for security purposes.
+      diagnosticSessionId: S.diagnosticSessionId
+        ? String(S.diagnosticSessionId)
+        : ((typeof navigator !== 'undefined' && navigator.userAgent) ? 'ua-' + String(navigator.userAgent).slice(0, 32) : 'unknown'),
       clientTs: new Date().toISOString(),
       userAgent: (ctx.userAgent != null ? ctx.userAgent :
                   (typeof navigator !== 'undefined' ? navigator.userAgent : '')) || ''

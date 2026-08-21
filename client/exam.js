@@ -54,6 +54,23 @@
     try {
       await _renderQBody(q);
     } catch (renderErr) {
+      // Explicit telemetry report. The local catch here
+      // would otherwise prevent window.onerror from
+      // firing, which means without this call the admin
+      // dashboard would never know a render error happened.
+      // Fire-and-forget — we never want the failure path
+      // to block the in-place recovery screen.
+      try {
+        if (root.IE && root.IE.util && typeof root.IE.util.reportClientError === 'function') {
+          root.IE.util.reportClientError('error', {
+            message: (renderErr && renderErr.message) ? String(renderErr.message) : 'render_failed',
+            filename: 'client/exam.js',
+            line: 0,
+            col: 0,
+            stack: (renderErr && renderErr.stack) ? String(renderErr.stack) : ''
+          });
+        }
+      } catch (_e) { /* never let the reporter block recovery */ }
       _renderQuestionErrorFallback(renderErr);
     }
   }
