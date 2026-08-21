@@ -52,14 +52,14 @@ function b64urlDecode(input) {
   return Buffer.from(input.replace(/-/g, '+').replace(/_/g, '/') + pad, 'base64');
 }
 
-// Verify a JWT against an XSUAA verification key. RS256 only (XSUAA
-// default). Returns the claims object on success, or null on any failure
-// (bad signature, expired, wrong audience, etc.). Never throws.
-function verifyXsuaaJwt(token, xsuaa, nowSeconds = Math.floor(Date.now() / 1000)) {
-  if (typeof token !== 'string' || !token) return null;
-  if (!xsuaa || !xsuaa.verificationkey) return null;
+// Inspect a JWT against an XSUAA verification key. The reason is safe for
+// structured logs: it describes only which server-side validation failed,
+// never token contents or user claims.
+function inspectXsuaaJwt(token, xsuaa, nowSeconds = Math.floor(Date.now() / 1000)) {
+  if (typeof token !== 'string' || !token) return { claims: null, reason: 'missing_token' };
+  if (!xsuaa || !xsuaa.verificationkey) return { claims: null, reason: 'missing_verification_key' };
   const parts = token.split('.');
-  if (parts.length !== 3) return null;
+  if (parts.length !== 3) return { claims: null, reason: 'malformed_token' };
   const [headerB64, payloadB64, signatureB64] = parts;
   let header, payload, signatureBuf;
   try {
@@ -67,9 +67,9 @@ function verifyXsuaaJwt(token, xsuaa, nowSeconds = Math.floor(Date.now() / 1000)
     payload = JSON.parse(b64urlDecode(payloadB64).toString('utf8'));
     signatureBuf = b64urlDecode(signatureB64);
   } catch (_e) {
-    return null;
+    return { claims: null, reason: 'malformed_token' };
   }
-  if (!header || header.alg !== 'RS256') return null;
+  if (!header || header.alg !== 'RS256') return { claims: null, reason: 'unsupported_algorithm' };
 
   // Verify signature
   try {
@@ -77,35 +77,43 @@ function verifyXsuaaJwt(token, xsuaa, nowSeconds = Math.floor(Date.now() / 1000)
     verifier.update(headerB64 + '.' + payloadB64);
     verifier.end();
     const ok = verifier.verify(xsuaa.verificationkey, signatureBuf);
-    if (!ok) return null;
+    if (!ok) return { claims: null, reason: 'invalid_signature' };
   } catch (_e) {
-    return null;
+    return { claims: null, reason: 'invalid_signature' };
   }
 
   // Standard claims checks
-  if (typeof payload.exp === 'number' && nowSeconds >= payload.exp) return null;
-  if (typeof payload.nbf === 'number' && nowSeconds < payload.nbf) return null;
+  if (typeof payload.exp === 'number' && nowSeconds >= payload.exp) return { claims: null, reason: 'expired' };
+  if (typeof payload.nbf === 'number' && nowSeconds < payload.nbf) return { claims: null, reason: 'not_yet_valid' };
   // Audience: REQUIRED (do not accept tokens that omit aud). aud can
   // be a string or array; we accept any match. The wildcard '*' is
   // honored for tokens issued by a tenant without an xsappname set
   // (e.g. a test IdP) but is uncommon in production XSUAA tokens.
-  if (!xsuaa.xsappname) return null;
-  if (!payload.aud) return null;
+  if (!xsuaa.xsappname) return { claims: null, reason: 'missing_xsappname' };
+  if (!payload.aud) return { claims: null, reason: 'missing_audience' };
   const auds = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
-  if (!auds.includes(xsuaa.xsappname) && !auds.includes('*')) return null;
+  if (!auds.includes(xsuaa.xsappname) && !auds.includes('*')) return { claims: null, reason: 'audience_mismatch' };
   // Issuer: REQUIRED when the XSUAA config exposes one. XSUAA issues
   // tokens with `iss` set to the tenant URL (e.g.
   // "https://<tenant>.authentication.us10.hana.ondemand.com"). Without
   // an explicit iss check, a token signed by some other XSUAA tenant
   // that happens to share the same xsappname + verification key (e.g.
   // during a key rotation or in a misconfigured sub-account) would be
-  // accepted. We derive the expected issuer from xsuaa.url.
+  // accepted. XSUAA deployments use either the tenant URL or its
+  // canonical /oauth/token endpoint as the iss value.
   if (xsuaa.url) {
     const expectedIss = String(xsuaa.url).replace(/\/+$/, '');
     const iss = String(payload.iss || '').replace(/\/+$/, '');
-    if (!iss || iss !== expectedIss) return null;
+    const validIssuers = new Set([expectedIss, `${expectedIss}/oauth/token`]);
+    if (!validIssuers.has(iss)) return { claims: null, reason: 'issuer_mismatch' };
   }
-  return payload;
+  return { claims: payload, reason: null };
+}
+
+// Verify a JWT against an XSUAA verification key. RS256 only (XSUAA
+// default). Returns the claims object on success, or null on any failure.
+function verifyXsuaaJwt(token, xsuaa, nowSeconds = Math.floor(Date.now() / 1000)) {
+  return inspectXsuaaJwt(token, xsuaa, nowSeconds).claims;
 }
 
 // ---------------------------------------------------------------------------
@@ -292,6 +300,7 @@ function parseCookieHeader(header) {
 module.exports = {
   readXsuaaFromVcap,
   getXsuaaConfig,
+  inspectXsuaaJwt,
   verifyXsuaaJwt,
   mapScopesToRole,
   roleFromClaims,

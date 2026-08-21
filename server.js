@@ -52,6 +52,7 @@ const {
 } = require('./shared/scoring.js');
 const {
   getXsuaaConfig,
+  inspectXsuaaJwt,
   verifyXsuaaJwt,
   roleFromClaims,
   buildAuthorizeUrl,
@@ -734,34 +735,40 @@ async function getAdminTokenNotBefore(conn) {
 // Also accepts a JWT from the `xsuaa_jwt` cookie — that's what the
 // /oauth/callback endpoint sets after a successful code exchange.
 function tryXsuaaAuth(req) {
+  function authFromToken(token, source) {
+    const xsuaa = getXsuaaConfig();
+    if (!xsuaa) return null;
+    const inspection = inspectXsuaaJwt(token, xsuaa);
+    if (!inspection.claims) {
+      appLog('warn', 'xsuaa_auth_rejected', {
+        requestId: req.requestId,
+        source,
+        reason: inspection.reason
+      });
+      return null;
+    }
+    const role = roleFromClaims(inspection.claims);
+    if (!role) {
+      appLog('warn', 'xsuaa_auth_rejected', {
+        requestId: req.requestId,
+        source,
+        reason: 'missing_recognized_role'
+      });
+      return null;
+    }
+    return { role, sub: inspection.claims.sub || null };
+  }
+
   // 1. Authorization: Bearer <jwt> (API clients)
   const auth = String(req.headers.authorization || '').trim();
   if (auth.startsWith('Bearer ')) {
     const token = auth.slice(7).trim();
-    if (token) {
-      const xsuaa = getXsuaaConfig();
-      if (xsuaa) {
-        const claims = verifyXsuaaJwt(token, xsuaa);
-        if (claims) {
-          const role = roleFromClaims(claims);
-          if (role) return { role, sub: claims.sub || null };
-        }
-      }
-    }
+    if (token) return authFromToken(token, 'authorization_header');
   }
   // 2. xsuaa_jwt cookie (browser flow via /oauth/callback)
   const cookies = parseCookieHeader(req.headers.cookie);
   const cookieToken = cookies['xsuaa_jwt'];
-  if (cookieToken) {
-    const xsuaa = getXsuaaConfig();
-    if (xsuaa) {
-      const claims = verifyXsuaaJwt(cookieToken, xsuaa);
-      if (claims) {
-        const role = roleFromClaims(claims);
-        if (role) return { role, sub: claims.sub || null };
-      }
-    }
-  }
+  if (cookieToken) return authFromToken(cookieToken, 'cookie');
   return null;
 }
 
