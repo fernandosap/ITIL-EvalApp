@@ -38,7 +38,7 @@
 
   async function showQuestionSetAnalytics(setId) {
     S.screen = 'admin-analytics';
-    render('<div class="admin-wrap"><div style="padding:60px;text-align:center;color:white;font-size:18px">Loading analytics...</div></div>');
+    render('<div class="admin-wrap"><div class="admin-loading">Loading analytics...</div></div>');
     try {
       const resp = await apiJson(`/api/admin/question-sets/${setId}/analytics`, {}, { timeoutMs: 20000, retries: 1 });
       if (!resp || !resp.ok) throw new Error('analytics_failed');
@@ -616,7 +616,7 @@
   // ---- Open / edit question set ----
   async function openQuestionSet(setId, fallbackName) {
     S.screen = 'admin-question-set';
-    render('<div class="admin-wrap"><div style="padding:60px;text-align:center;color:white;font-size:18px">Loading exam set…</div></div>');
+    render('<div class="admin-wrap"><div class="admin-loading">Loading exam set…</div></div>');
     try {
       const [qData, sData, setList] = await Promise.all([
         apiJson(`/api/admin/question-sets/${setId}/questions`, {}, { timeoutMs: 12000, retries: 1 }),

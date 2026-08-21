@@ -23,3 +23,9 @@ test('reading surfaces use opaque backgrounds', () => {
   assert.match(html, /\.glass-card\{background:var\(--brand-panel\);/);
   assert.doesNotMatch(html, /\.glass-card\{[^}]*backdrop-filter/);
 });
+
+test('admin text and loading states use dark text on the light application background', () => {
+  assert.match(html, /\.admin-page-title\{[^}]*color:#1f3864/);
+  assert.match(html, /\.admin-page-subtitle\{[^}]*color:#405778/);
+  assert.match(html, /\.admin-loading\{[^}]*color:#1f3864/);
+});
