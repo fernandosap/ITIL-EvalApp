@@ -11,7 +11,7 @@
   --brand-navy:#1f3864;
   --brand-blue:#2e75b6;
   --brand-sky:#dfe9f7;
-  --brand-panel:rgba(255,255,255,0.94);
+  --brand-panel:#fff;
   --brand-shadow:0 10px 38px rgba(34,61,107,.17);
 }
 body.exam-bg{background:#eef2f8 !important}
@@ -25,25 +25,6 @@ body{
   min-height:100vh;
   position:relative;
   overflow-x:hidden;
-}
-body::before{
-  content:"";
-  position:fixed;
-  inset:0;
-  pointer-events:none;
-  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='160' viewBox='0 0 240 160'%3E%3Cg opacity='0.9'%3E%3Cpath d='M24 22h28l-12 12H24z' fill='%2367baf4'/%3E%3Cpath d='M112 22h28l-12 12h-16z' fill='%2349d0c7'/%3E%3Cpath d='M200 22h28l-12 12h-16z' fill='%23529eee'/%3E%3Cpath d='M24 78h28L40 90H24z' fill='%23f1ce64'/%3E%3Cpath d='M112 78h28l-12 12h-16z' fill='%239dda73'/%3E%3Cpath d='M200 78h28l-12 12h-16z' fill='%238f82f3'/%3E%3Cpath d='M24 134h28l-12 12H24z' fill='%23df94c6'/%3E%3Cpath d='M112 134h28l-12 12h-16z' fill='%235ba6f0'/%3E%3Cpath d='M200 134h28l-12 12h-16z' fill='%23f0d67c'/%3E%3C/g%3E%3C/svg%3E");
-  background-size:300px 200px;
-  background-position:center top;
-  opacity:.62;
-}
-body::after{
-  content:"";
-  position:fixed;
-  inset:0;
-  pointer-events:none;
-  background:
-    linear-gradient(90deg,rgba(238,243,251,.45) 0%,rgba(255,255,255,0) 32%,rgba(255,255,255,0) 68%,rgba(238,243,251,.45) 100%),
-    radial-gradient(circle at center,rgba(255,255,255,.22) 0%,rgba(255,255,255,0) 58%);
 }
 
 .screen{max-width:680px;margin:0 auto;padding:24px 16px 48px}
@@ -331,7 +312,7 @@ input[type="text"],input[type="password"],input[type="number"]{
   font-size:14px;margin-bottom:14px;transition:border-color .15s}
 input:focus{outline:none;border-color:#2E75B6}
 .divider{height:1px;background:#e8ecf2;margin:18px 0}
-.glass-card{background:var(--brand-panel);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);border-radius:18px;padding:28px 32px;box-shadow:var(--brand-shadow),0 2px 8px rgba(0,0,0,.08);border:1px solid rgba(120,150,196,.16)}
+.glass-card{background:var(--brand-panel);border-radius:18px;padding:28px 32px;box-shadow:var(--brand-shadow),0 2px 8px rgba(0,0,0,.08);border:1px solid rgba(120,150,196,.16)}
 .consent-box{background:#f7f9fc;border:1.5px solid #d0d8e8;border-radius:8px;
   padding:14px 16px;margin:14px 0;font-size:13px;line-height:1.7;color:#444}
 .consent-box ul{margin:6px 0 0 18px}
