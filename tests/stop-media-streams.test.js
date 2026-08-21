@@ -51,6 +51,32 @@ function loadStateModule(S) {
   return { state: require('../client/state.js'), videoEls };
 }
 
+test('isProctorRecoveryRequired: remains true until both required streams recover', () => {
+  const S = {
+    screen: 'exam',
+    proctorOn: true,
+    webcamOk: false,
+    screenOk: false
+  };
+  const { state } = loadStateModule(S);
+
+  assert.equal(state.isProctorRecoveryRequired(), true, 'both streams missing blocks the exam');
+  S.screenOk = true;
+  assert.equal(state.isProctorRecoveryRequired(), true, 'recovering screen must not clear missing webcam');
+  S.webcamOk = true;
+  assert.equal(state.isProctorRecoveryRequired(), false, 'exam unblocks only after both streams recover');
+});
+
+test('isProctorRecoveryRequired: does not apply when proctoring is disabled', () => {
+  const { state } = loadStateModule({
+    screen: 'exam',
+    proctorOn: false,
+    webcamOk: false,
+    screenOk: false
+  });
+  assert.equal(state.isProctorRecoveryRequired(), false);
+});
+
 test('stopMediaStreams: stops every live track on the webcam + screen streams', () => {
   const camTrack1 = makeFakeTrack();
   const camTrack2 = makeFakeTrack();
