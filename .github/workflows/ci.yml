@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Unit and regression tests
+        run: npm test
+
+      - name: Syntax check
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in server.js lib/*.js client/*.js shared/*.js; do
+            node --check "$f"
+          done
+
+      - name: Repository secret scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          PATTERNS_FILE=.githooks/secret-patterns.txt
+          COMBINED=$(grep -v -E '^\s*(#|$)' "$PATTERNS_FILE" | paste -sd '|' -)
+          [ -n "$COMBINED" ] || exit 0
+          HITS=$(git grep -n -E "$COMBINED" -- . ':!.githooks/*' ':!package-lock.json' || true)
+          HITS=$(printf '%s\n' "$HITS" | grep -v 'secretscan: ok' || true)
+          if [ -n "$HITS" ]; then
+            echo "Possible secret pattern(s) detected:"
+            printf '%s\n' "$HITS" | head -20
+            exit 1
+          fi
