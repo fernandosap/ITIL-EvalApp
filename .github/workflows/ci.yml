@@ -8,6 +8,8 @@ on:
 
 permissions:
   contents: read
+  issues: write
+  pull-requests: write
 
 jobs:
   test:
@@ -34,6 +36,21 @@ jobs:
         run: |
           set -o pipefail
           npm test 2>&1 | tee unit-test.log
+
+      - name: Comment unit failure diagnostics
+        if: failure() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        shell: bash
+        run: |
+          {
+            echo '### Temporary unit-test diagnostics'
+            echo '```text'
+            tail -n 120 unit-test.log
+            echo '```'
+          } > /tmp/unit-comment.md
+          gh pr comment "$PR_NUMBER" --body-file /tmp/unit-comment.md
 
       - name: Upload unit diagnostics
         if: always()
@@ -98,6 +115,21 @@ jobs:
         run: |
           set -o pipefail
           npx playwright test --config=playwright.config.js 2>&1 | tee playwright-test.log
+
+      - name: Comment browser failure diagnostics
+        if: failure() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        shell: bash
+        run: |
+          {
+            echo '### Temporary browser-test diagnostics'
+            echo '```text'
+            tail -n 120 playwright-test.log
+            echo '```'
+          } > /tmp/browser-comment.md
+          gh pr comment "$PR_NUMBER" --body-file /tmp/browser-comment.md
 
       - name: Upload browser diagnostics
         if: always()
