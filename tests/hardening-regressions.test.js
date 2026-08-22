@@ -7,13 +7,14 @@ const path = require('node:path');
 
 const runtime = require('../lib/runtime-hardening.js');
 const legacyLogin = require('../lib/core/legacy-login.js');
+const sharedRateLimit = require('../lib/core/rate-limit-shared.js');
+const authCore = require('../lib/core/auth.js');
 const { mapScopesToRole, roleFromClaims } = require('../shared/xsuaa.js');
 const { readConnConfig } = require('../shared/db-pool.js');
 const { config } = require('../lib/core/db.js');
 const { generateCode, CHARS } = require('../lib/core/access-codes.js');
 const { normalizeUpload } = require('../lib/core/question-sets.js');
 const { normalizeIncident, incidentHash } = require('../lib/core/proctor.js');
-const { jwtIssuedAt } = require('../lib/core/auth.js');
 
 function makeRes() {
   const listeners = new Map();
@@ -40,17 +41,24 @@ function restoreEnv(name, value) {
 
 test.beforeEach(() => runtime.resetForTests());
 
-test('session start throttle is global per IP, not bypassable by rotating codes', () => {
+test('session start throttle is global per IP, not bypassable by rotating codes', async () => {
   let passed = 0;
   for (let i = 0; i < 10; i += 1) {
     const res = makeRes();
-    runtime.sessionStartGuard(req({ code: `ABC2${String(i).padStart(2, '0')}` }), res, () => { passed += 1; });
+    await runtime.sessionStartGuard(req({ code: `ABC2${String(i).padStart(2, '0')}` }), res, () => { passed += 1; });
   }
   const blocked = makeRes();
-  runtime.sessionStartGuard(req({ code: 'ZZZ999' }), blocked, () => { passed += 1; });
+  await runtime.sessionStartGuard(req({ code: 'ZZZ999' }), blocked, () => { passed += 1; });
   assert.equal(passed, 10);
   assert.equal(blocked.statusCode, 429);
   assert.equal(blocked.body.error, 'too_many_attempts');
+});
+
+test('shared rate-limit bucket hashes sensitive keys before persistence', () => {
+  const key = 'session-start:pair:127.0.0.1:ABC234';
+  const hash = sharedRateLimit.keyHash(key);
+  assert.match(hash, /^[a-f0-9]{64}$/);
+  assert.notEqual(hash, key);
 });
 
 test('reviewer-only legacy password configuration still authenticates', () => {
@@ -113,7 +121,19 @@ test('proctor incident normalization is bounded and hashes deterministically', (
 test('JWT issued-at helper reads iat in milliseconds', () => {
   const payload = Buffer.from(JSON.stringify({ iat: 12345 })).toString('base64url');
   const token = `${Buffer.from('{}').toString('base64url')}.${payload}.sig`;
-  assert.equal(jwtIssuedAt(token), 12345000);
+  assert.equal(authCore.jwtIssuedAt(token), 12345000);
+});
+
+test('SSO token encryption round-trips without storing plaintext', () => {
+  const env = { HANA_PASSWORD: 'high-entropy-test-password', HANA_SCHEMA: 'ITIL_EXAM' };
+  const token = 'header.payload.signature';
+  const encrypted = authCore.encryptToken(token, env);
+  assert.notEqual(encrypted.ciphertext, token);
+  assert.equal(authCore.decryptToken({
+    TOKEN_CIPHERTEXT: encrypted.ciphertext,
+    TOKEN_IV: encrypted.iv,
+    TOKEN_TAG: encrypted.tag
+  }, env), token);
 });
 
 test('XSUAA role mapping requires exact xsappname scope', () => {
@@ -146,13 +166,19 @@ test('question-set mutations use CURRENT_IDENTITY_VALUE and transactions', () =>
   assert.match(source, /transaction:\s*true/g);
 });
 
-test('shared SSO, readiness, live sessions and timeline routes are wired', () => {
+test('distributed runtime controls and explicit service wiring are present', () => {
   const authSource = fs.readFileSync(path.join(__dirname, '..', 'lib', 'core', 'auth.js'), 'utf8');
   const proctorSource = fs.readFileSync(path.join(__dirname, '..', 'lib', 'core', 'proctor.js'), 'utf8');
   const runtimeSource = fs.readFileSync(path.join(__dirname, '..', 'lib', 'runtime-hardening.js'), 'utf8');
-  assert.match(authSource, /ADMIN_SSO_SESSIONS/);
+  const dbSource = fs.readFileSync(path.join(__dirname, '..', 'lib', 'core', 'db.js'), 'utf8');
+  assert.match(authSource, /ADMIN_SSO_SESSIONS_V2/);
+  assert.match(authSource, /TOKEN_CIPHERTEXT/);
+  assert.match(authSource, /aes-256-gcm/);
   assert.match(proctorSource, /INSERT INTO EXAM_PROCTOR_INCIDENTS/);
   assert.match(runtimeSource, /\/api\/admin\/live-sessions/);
   assert.match(runtimeSource, /\/api\/admin\/proctor\/incidents\/:code/);
   assert.match(runtimeSource, /\/api\/admin\/question-sets\/:id\/readiness/);
+  assert.match(dbSource, /APP_RATE_LIMITS/);
+  assert.match(dbSource, /APP_MUTEX/);
+  assert.doesNotMatch(runtimeSource, /require\.cache\[/);
 });
