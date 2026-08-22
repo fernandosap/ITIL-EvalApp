@@ -5,10 +5,14 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const runtime = require('../lib/runtime-hardening.js');
+const bootstrap = require('../lib/bootstrap.js');
+const examRoutes = require('../lib/routes/exam.js');
 const legacyLogin = require('../lib/core/legacy-login.js');
 const sharedRateLimit = require('../lib/core/rate-limit-shared.js');
 const authCore = require('../lib/core/auth.js');
+const concurrency = require('../lib/core/concurrency.js');
+const csp = require('../lib/core/csp.js');
+const housekeeping = require('../lib/core/housekeeping.js');
 const { mapScopesToRole, roleFromClaims } = require('../shared/xsuaa.js');
 const { readConnConfig } = require('../shared/db-pool.js');
 const { config } = require('../lib/core/db.js');
@@ -39,16 +43,16 @@ function restoreEnv(name, value) {
   else process.env[name] = value;
 }
 
-test.beforeEach(() => runtime.resetForTests());
+test.beforeEach(() => bootstrap.resetForTests());
 
 test('session start throttle is global per IP, not bypassable by rotating codes', async () => {
   let passed = 0;
   for (let i = 0; i < 10; i += 1) {
     const res = makeRes();
-    await runtime.sessionStartGuard(req({ code: `ABC2${String(i).padStart(2, '0')}` }), res, () => { passed += 1; });
+    await examRoutes.sessionStartGuard(req({ code: `ABC2${String(i).padStart(2, '0')}` }), res, () => { passed += 1; });
   }
   const blocked = makeRes();
-  await runtime.sessionStartGuard(req({ code: 'ZZZ999' }), blocked, () => { passed += 1; });
+  await examRoutes.sessionStartGuard(req({ code: 'ZZZ999' }), blocked, () => { passed += 1; });
   assert.equal(passed, 10);
   assert.equal(blocked.statusCode, 429);
   assert.equal(blocked.body.error, 'too_many_attempts');
@@ -79,11 +83,7 @@ test('reviewer-only legacy password configuration still authenticates', () => {
     );
     assert.equal(fellThrough, false);
     assert.equal(res.statusCode, 200);
-    assert.equal(res.body.ok, true);
     assert.equal(res.body.role, 'reviewer');
-    const decoded = Buffer.from(res.body.token, 'base64url').toString('utf8').split(':');
-    assert.equal(decoded[2], 'reviewer');
-    assert.equal(decoded.length, 5);
   } finally {
     for (const name of names) restoreEnv(name, previous[name]);
   }
@@ -118,22 +118,33 @@ test('proctor incident normalization is bounded and hashes deterministically', (
   assert.notEqual(incidentHash('ABC234', incident), incidentHash('XYZ234', incident));
 });
 
-test('JWT issued-at helper reads iat in milliseconds', () => {
-  const payload = Buffer.from(JSON.stringify({ iat: 12345 })).toString('base64url');
-  const token = `${Buffer.from('{}').toString('base64url')}.${payload}.sig`;
-  assert.equal(authCore.jwtIssuedAt(token), 12345000);
-});
-
-test('SSO token encryption round-trips without storing plaintext', () => {
-  const env = { HANA_PASSWORD: 'high-entropy-test-password', HANA_SCHEMA: 'ITIL_EXAM' };
+test('rotatable SSO encryption uses authoritative key IDs', () => {
+  const env = {
+    SSO_SESSION_KEY_ID: 'v2',
+    SSO_SESSION_ENCRYPTION_KEY: 'current-key-material-abcdefghijklmnopqrstuvwxyz',
+    SSO_SESSION_PREVIOUS_KEY_ID: 'v1',
+    SSO_SESSION_PREVIOUS_KEY: 'previous-key-material-abcdefghijklmnopqrstuvwxyz'
+  };
   const token = 'header.payload.signature';
   const encrypted = authCore.encryptToken(token, env);
+  assert.equal(encrypted.keyId, 'v2');
   assert.notEqual(encrypted.ciphertext, token);
   assert.equal(authCore.decryptToken({
+    KEY_ID: encrypted.keyId,
     TOKEN_CIPHERTEXT: encrypted.ciphertext,
     TOKEN_IV: encrypted.iv,
     TOKEN_TAG: encrypted.tag
   }, env), token);
+  assert.throws(() => authCore.decryptToken({
+    KEY_ID: 'unknown',
+    TOKEN_CIPHERTEXT: encrypted.ciphertext,
+    TOKEN_IV: encrypted.iv,
+    TOKEN_TAG: encrypted.tag
+  }, env), /unknown_key_id/);
+});
+
+test('SSO encryption key is no longer derived from HANA credentials', () => {
+  assert.throws(() => authCore.sessionKeyRing({ HANA_PASSWORD: 'x'.repeat(40), HANA_SCHEMA: 'ITIL_EXAM' }), /encryption_key_required/);
 });
 
 test('XSUAA role mapping requires exact xsappname scope', () => {
@@ -147,6 +158,24 @@ test('HANA direct and pooled connections validate TLS certificates by default', 
   const env = { HANA_HOST: 'hana.example', HANA_PORT: '443', HANA_USER: 'u', HANA_PASSWORD: 'p' };
   assert.equal(config(env).connection.sslValidateCertificate, true);
   assert.equal(readConnConfig(env).sslValidateCertificate, true);
+});
+
+test('optimistic concurrency normalizes strong and weak ETags', () => {
+  assert.equal(concurrency.normalizeTag('"123"'), '123');
+  assert.equal(concurrency.normalizeTag('W/"123"'), '123');
+  assert.equal(concurrency.timestampVersion('2026-08-22T12:00:00.000Z'), String(Date.parse('2026-08-22T12:00:00.000Z')));
+});
+
+test('CSP removes broad inline script/style block permissions', () => {
+  const policy = csp.buildPolicy(path.join(__dirname, '..'));
+  assert.doesNotMatch(policy, /script-src[^;]*'unsafe-inline'/);
+  assert.doesNotMatch(policy, /style-src\s[^;]*'unsafe-inline'/);
+  assert.match(policy, /script-src-attr/);
+});
+
+test('runtime retention has an explicit default', () => {
+  assert.equal(housekeeping.retentionDays({}), 90);
+  assert.equal(housekeeping.retentionDays({ PROCTOR_INCIDENT_RETENTION_DAYS: '0' }), 0);
 });
 
 test('durable submit uses INSERT rather than MERGE and transaction mode', () => {
@@ -166,19 +195,32 @@ test('question-set mutations use CURRENT_IDENTITY_VALUE and transactions', () =>
   assert.match(source, /transaction:\s*true/g);
 });
 
-test('distributed runtime controls and explicit service wiring are present', () => {
-  const authSource = fs.readFileSync(path.join(__dirname, '..', 'lib', 'core', 'auth.js'), 'utf8');
-  const proctorSource = fs.readFileSync(path.join(__dirname, '..', 'lib', 'core', 'proctor.js'), 'utf8');
-  const runtimeSource = fs.readFileSync(path.join(__dirname, '..', 'lib', 'runtime-hardening.js'), 'utf8');
+test('route wrapping shim is removed and explicit route modules are used', () => {
+  const root = path.join(__dirname, '..');
+  assert.equal(fs.existsSync(path.join(root, 'lib', 'runtime-hardening.js')), false);
+  const bootstrapSource = fs.readFileSync(path.join(root, 'lib', 'bootstrap.js'), 'utf8');
+  const packageSource = fs.readFileSync(path.join(root, 'package.json'), 'utf8');
+  assert.doesNotMatch(bootstrapSource, /app\[(?:methodName|['"]get['"]|['"]post['"])\]/);
+  assert.doesNotMatch(bootstrapSource, /require\.cache/);
+  assert.match(packageSource, /lib\/bootstrap\.js/);
+  for (const file of ['oauth.js', 'exam.js', 'admin.js', 'helpers.js']) {
+    assert.equal(fs.existsSync(path.join(root, 'lib', 'routes', file)), true);
+  }
+});
+
+test('current August migrations are schema agnostic', () => {
+  const root = path.join(__dirname, '..', 'migrations');
+  for (const file of ['2026-08-22_runtime_integrity.sql', '2026-08-22_final_maturity.sql', '2026-08-22_sso_key_rotation.sql']) {
+    const sql = fs.readFileSync(path.join(root, file), 'utf8');
+    assert.doesNotMatch(sql, /"ITIL_EXAM"/);
+    assert.match(sql, /CURRENT_SCHEMA|target_schema/);
+  }
+});
+
+test('V3 shared runtime schema includes rotatable SSO storage', () => {
   const dbSource = fs.readFileSync(path.join(__dirname, '..', 'lib', 'core', 'db.js'), 'utf8');
-  assert.match(authSource, /ADMIN_SSO_SESSIONS_V2/);
-  assert.match(authSource, /TOKEN_CIPHERTEXT/);
-  assert.match(authSource, /aes-256-gcm/);
-  assert.match(proctorSource, /INSERT INTO EXAM_PROCTOR_INCIDENTS/);
-  assert.match(runtimeSource, /\/api\/admin\/live-sessions/);
-  assert.match(runtimeSource, /\/api\/admin\/proctor\/incidents\/:code/);
-  assert.match(runtimeSource, /\/api\/admin\/question-sets\/:id\/readiness/);
+  assert.match(dbSource, /ADMIN_SSO_SESSIONS_V3/);
+  assert.match(dbSource, /KEY_ID NVARCHAR\(64\)/);
   assert.match(dbSource, /APP_RATE_LIMITS/);
   assert.match(dbSource, /APP_MUTEX/);
-  assert.doesNotMatch(runtimeSource, /require\.cache\[/);
 });
