@@ -5,10 +5,10 @@
   "description": "Academy Exam App with Node middleware and SAP HANA persistence",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
+    "start": "node --require ./lib/runtime-hardening.js server.js",
     "check:env": "node scripts/check-env.mjs",
-    "test:smoke": "node scripts/smoke-test.mjs",
-    "test": "node --test tests/*.test.js",
+    "test:smoke": "node --require ./lib/runtime-hardening.js scripts/smoke-test.mjs",
+    "test": "node --require ./lib/runtime-hardening.js --test tests/*.test.js",
     "precommit": "bash .githooks/pre-commit",
     "inspect:hana": "node scripts/inspect-hana.mjs"
   },
