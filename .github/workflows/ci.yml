@@ -47,7 +47,7 @@ jobs:
           {
             echo '### Temporary unit-test diagnostics'
             echo '```text'
-            tail -n 120 unit-test.log
+            grep -n -E 'not ok|failureType:|error:|AssertionError|ERR_|expected:|actual:' unit-test.log | head -n 250 || true
             echo '```'
           } > /tmp/unit-comment.md
           gh pr comment "$PR_NUMBER" --body-file /tmp/unit-comment.md
@@ -126,7 +126,7 @@ jobs:
           {
             echo '### Temporary browser-test diagnostics'
             echo '```text'
-            tail -n 120 playwright-test.log
+            tail -n 160 playwright-test.log
             echo '```'
           } > /tmp/browser-comment.md
           gh pr comment "$PR_NUMBER" --body-file /tmp/browser-comment.md
