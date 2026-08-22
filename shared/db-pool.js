@@ -40,7 +40,8 @@ function readConnConfig(env = process.env) {
     uid: env.HANA_USER || '',
     pwd: env.HANA_PASSWORD || '',
     encrypt: String(env.HANA_ENCRYPT || 'true').toLowerCase() === 'true',
-    sslValidateCertificate: String(env.HANA_SSL_VALIDATE_CERTIFICATE || 'false').toLowerCase() === 'true'
+    // Match server.js: certificate validation is secure-by-default.
+    sslValidateCertificate: String(env.HANA_SSL_VALIDATE_CERTIFICATE || 'true').toLowerCase() === 'true'
   };
 }
 

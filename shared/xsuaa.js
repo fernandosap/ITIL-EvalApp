@@ -120,26 +120,29 @@ function verifyXsuaaJwt(token, xsuaa, nowSeconds = Math.floor(Date.now() / 1000)
 // Scope -> role mapping
 // ---------------------------------------------------------------------------
 
-// XSUAA returns scopes as a space-separated string in the 'scope' claim.
-// Each scope in our config is $XSAPPNAME.<role>. We map to internal roles
-// by stripping the prefix and looking up the role in our permissions set.
 const KNOWN_ROLES = new Set(['admin', 'manager', 'reviewer', 'content_editor']);
-
-// Roles in priority order for the case where a token has multiple scopes.
-// 'admin' wins (most permissive), then manager/reviewer/content_editor.
 const ROLE_PRIORITY = ['admin', 'manager', 'reviewer', 'content_editor'];
 
-// Map a scope array to the highest-priority known role. Returns null if
-// the token has no recognized scopes.
-function mapScopesToRole(scopes) {
+// Map scopes to the highest-priority known role. When xsappname is supplied
+// (the production path), only exact `${xsappname}.<role>` scopes are accepted.
+// This prevents a token containing an unrelated `some-other-app.admin` scope
+// from being treated as an admin for this application. Bare-role matching is
+// retained only for unit tests/local helpers where no XSUAA binding exists.
+function mapScopesToRole(scopes, xsappname = null) {
   if (!Array.isArray(scopes) || scopes.length === 0) return null;
   const rolesPresent = new Set();
-  for (const s of scopes) {
-    if (typeof s !== 'string') continue;
-    // Accept both '$XSAPPNAME.admin' and bare 'admin' (defensive)
-    const parts = s.split('.');
-    const last = parts[parts.length - 1];
-    if (KNOWN_ROLES.has(last)) rolesPresent.add(last);
+  const expectedPrefix = xsappname ? `${String(xsappname)}.` : null;
+  for (const scope of scopes) {
+    if (typeof scope !== 'string') continue;
+    if (expectedPrefix) {
+      if (!scope.startsWith(expectedPrefix)) continue;
+      const role = scope.slice(expectedPrefix.length);
+      if (KNOWN_ROLES.has(role)) rolesPresent.add(role);
+      continue;
+    }
+    const parts = scope.split('.');
+    const role = parts[parts.length - 1];
+    if (KNOWN_ROLES.has(role)) rolesPresent.add(role);
   }
   for (const role of ROLE_PRIORITY) {
     if (rolesPresent.has(role)) return role;
@@ -147,29 +150,25 @@ function mapScopesToRole(scopes) {
   return null;
 }
 
-// Combined helper: extract the 'scope' string from a verified claims object
-// and turn it into a role.
-function roleFromClaims(claims) {
+// Combined helper: extract scope/scp and turn it into an internal role.
+// In production we derive the expected xsappname from the bound XSUAA
+// credentials automatically, so existing server.js call sites remain strict
+// without needing to pass configuration through every layer.
+function roleFromClaims(claims, xsappname = null) {
   if (!claims) return null;
   const raw = claims.scope || claims.scp;
   let scopes;
   if (Array.isArray(raw)) scopes = raw;
   else if (typeof raw === 'string') scopes = raw.split(/\s+/).filter(Boolean);
   else return null;
-  return mapScopesToRole(scopes);
+  const configuredXsappname = xsappname || getXsuaaConfig()?.xsappname || null;
+  return mapScopesToRole(scopes, configuredXsappname);
 }
 
 // ---------------------------------------------------------------------------
 // OAuth 2.0 authorization-code flow helpers
 // ---------------------------------------------------------------------------
 
-// Build the XSUAA /oauth/authorize URL. Caller must pass a fully-qualified
-// redirectUri that matches the one registered in xs-security.json (XSUAA
-// checks it byte-for-byte).
-//
-//   xsuaa         { url, clientid } from readXsuaaFromVcap
-//   redirectUri   e.g. 'https://app.example.com/oauth/callback'
-//   state         random opaque string for CSRF protection
 function buildAuthorizeUrl(xsuaa, redirectUri, state) {
   if (!xsuaa || !xsuaa.url || !xsuaa.clientid) {
     throw new Error('buildAuthorizeUrl: xsuaa config is incomplete');
@@ -186,19 +185,6 @@ function buildAuthorizeUrl(xsuaa, redirectUri, state) {
   return `${xsuaa.url.replace(/\/$/, '')}/oauth/authorize?${params.toString()}`;
 }
 
-// Exchange an authorization code for an access token.
-//
-// Return shape (always an object — no more `null`):
-//   { ok: true,  accessToken, expiresIn, tokenType, body }  // success
-//   { ok: false, error: 'not_configured' | 'missing_code' | 'network' |
-//                   'upstream', statusCode, errorDescription, body }
-//   { ok: false, error: 'parse', body }                     // 2xx but bad JSON
-//
-// Pure: this function accepts an `executor` (a function that takes
-// options, a body string, and a callback) so tests can inject a fake
-// HTTP caller. The default executor uses the global `https` module.
-// XSUAA's /oauth/token endpoint requires application/x-www-form-urlencoded
-// with grant_type and HTTP Basic auth using clientid:clientsecret.
 function exchangeCodeForToken(xsuaa, code, redirectUri, executor) {
   if (!xsuaa || !xsuaa.clientid || !xsuaa.clientsecret) {
     return Promise.resolve({ ok: false, error: 'not_configured' });
@@ -229,9 +215,6 @@ function exchangeCodeForToken(xsuaa, code, redirectUri, executor) {
     exec(opts, body, (err, statusCode, rawBody) => {
       if (err) return resolve({ ok: false, error: 'network', message: String(err.message || err) });
       if (statusCode < 200 || statusCode >= 300) {
-        // XSUAA returns { error, error_description } on 4xx. Try to
-        // parse and surface that — it's what makes "why did this fail"
-        // debuggable in the logs.
         let errorDescription = null;
         try {
           const parsed = JSON.parse(rawBody);
@@ -259,8 +242,6 @@ function exchangeCodeForToken(xsuaa, code, redirectUri, executor) {
   });
 }
 
-// Default HTTPS executor using the global `https` module. Exposed for
-// tests via a setter.
 let _httpsImpl = null;
 function _setHttpsForTests(mod) { _httpsImpl = mod; }
 function defaultHttpsPost(opts, body, cb) {
@@ -275,14 +256,10 @@ function defaultHttpsPost(opts, body, cb) {
   req.end();
 }
 
-// Generate a random opaque state string for CSRF protection on the
-// authorize redirect. 32 bytes of random data, base64url-encoded.
 function generateState() {
   return crypto.randomBytes(32).toString('base64url');
 }
 
-// Parse a Cookie header into a plain object. No URL-encoding of values
-// beyond the standard decodeURIComponent. Returns {} on missing/empty.
 function parseCookieHeader(header) {
   const out = {};
   if (!header || typeof header !== 'string') return out;
@@ -309,7 +286,6 @@ module.exports = {
   generateState,
   parseCookieHeader,
   _setHttpsForTests,
-  // Exported for tests
   KNOWN_ROLES,
   ROLE_PRIORITY
 };
