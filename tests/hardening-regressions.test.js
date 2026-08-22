@@ -37,6 +37,11 @@ function tick() {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
+function restoreEnv(name, previous) {
+  if (previous == null) delete process.env[name];
+  else process.env[name] = previous;
+}
+
 test.beforeEach(() => runtime.resetForTests());
 
 test('secureMathRandom always returns a value in [0,1)', () => {
@@ -65,6 +70,32 @@ test('session/start has an independent global per-IP rate limit', () => {
   runtime.sessionStartGuard(makeReq('/api/session/start', 'POST', { 'x-forwarded-for': '203.0.113.20' }, { code: 'XYZ234' }), otherIp, () => { nextCalls += 1; });
   assert.equal(otherIp.statusCode, 200);
   assert.equal(nextCalls, 11);
+});
+
+test('reviewer-only legacy password configuration can authenticate', () => {
+  const names = ['ADMIN_HASH', 'MANAGER_HASH', 'REVIEWER_HASH', 'CONTENT_EDITOR_HASH'];
+  const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+  try {
+    delete process.env.ADMIN_HASH;
+    delete process.env.MANAGER_HASH;
+    process.env.REVIEWER_HASH = 'a'.repeat(64);
+    delete process.env.CONTENT_EDITOR_HASH;
+
+    const res = makeRes();
+    runtime.fallbackRoleOnlyLoginGuard(
+      makeReq('/api/admin/login', 'POST', {}, { hash: 'a'.repeat(64) }),
+      res,
+      () => assert.fail('reviewer-only configuration should be handled by the fallback guard')
+    );
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.ok, true);
+    assert.equal(res.body.role, 'reviewer');
+    const decoded = Buffer.from(res.body.token, 'base64url').toString('utf8').split(':');
+    assert.equal(decoded[2], 'reviewer');
+    assert.equal(decoded.length, 5);
+  } finally {
+    for (const name of names) restoreEnv(name, previous[name]);
+  }
 });
 
 test('submit is locked while in-flight and cached after success for idempotent retry', () => {
