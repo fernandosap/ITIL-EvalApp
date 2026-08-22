@@ -41,6 +41,11 @@
     </div>`;
   }
 
+  function connectivityBanner() {
+    if (typeof navigator === 'undefined' || navigator.onLine !== false) return '';
+    return `<div role="status" aria-live="polite" style="background:#fff3cd;color:#664d03;border-bottom:1px solid #ffecb5;padding:8px 16px;text-align:center;font-size:12px;font-weight:700">You are offline. Your answers stay in this browser and will retry when the connection returns.</div>`;
+  }
+
   function normalizeExamTitle(value) { return window.SharedConstants.normalizeExamTitle(value); }
   function roleCan(permission) { return window.SharedConstants.hasPermission(String(window._adminRole || 'admin'), permission); }
 
@@ -206,6 +211,7 @@
     fmt,
     durationLabel,
     brandLockup,
+    connectivityBanner,
     normalizeExamTitle,
     roleCan,
     _sha256,
