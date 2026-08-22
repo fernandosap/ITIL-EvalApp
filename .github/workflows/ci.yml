@@ -30,7 +30,19 @@ jobs:
         run: npm audit --omit=dev --audit-level=high
 
       - name: Unit and regression tests
-        run: npm test
+        shell: bash
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee unit-test.log
+
+      - name: Upload unit diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-log
+          path: unit-test.log
+          if-no-files-found: ignore
+          retention-days: 2
 
       - name: Syntax check
         shell: bash
@@ -82,4 +94,18 @@ jobs:
         run: npx playwright install --with-deps chromium
 
       - name: Browser integration smoke
-        run: npx playwright test --config=playwright.config.js
+        shell: bash
+        run: |
+          set -o pipefail
+          npx playwright test --config=playwright.config.js 2>&1 | tee playwright-test.log
+
+      - name: Upload browser diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-test-log
+          path: |
+            playwright-test.log
+            test-results
+          if-no-files-found: ignore
+          retention-days: 2
