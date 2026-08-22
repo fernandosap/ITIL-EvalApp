@@ -39,6 +39,7 @@ jobs:
           node --check server.js
           node --check playwright.config.js
           node --check scripts/migrate-runtime.mjs
+          node --check scripts/check-env.mjs
           while IFS= read -r -d '' f; do
             node --check "$f"
           done < <(find lib client shared tests/e2e -type f \( -name '*.js' -o -name '*.cjs' \) -print0)
