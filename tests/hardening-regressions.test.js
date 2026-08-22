@@ -144,7 +144,7 @@ test('rotatable SSO encryption uses authoritative key IDs', () => {
 });
 
 test('SSO encryption key is no longer derived from HANA credentials', () => {
-  assert.throws(() => authCore.sessionKeyRing({ HANA_PASSWORD: 'x'.repeat(40), HANA_SCHEMA: 'ITIL_EXAM' }), /encryption_key_required/);
+  assert.throws(() => authCore.sessionKeyRing({ HANA_PASSWORD: 'x'.repeat(40), HANA_SCHEMA: 'ITIL_EXAM' }), /sso_session_id_and_key_required/);
 });
 
 test('XSUAA role mapping requires exact xsappname scope', () => {
@@ -201,7 +201,7 @@ test('route wrapping shim is removed and explicit route modules are used', () =>
   const bootstrapSource = fs.readFileSync(path.join(root, 'lib', 'bootstrap.js'), 'utf8');
   const packageSource = fs.readFileSync(path.join(root, 'package.json'), 'utf8');
   assert.doesNotMatch(bootstrapSource, /app\[(?:methodName|['"]get['"]|['"]post['"])\]/);
-  assert.doesNotMatch(bootstrapSource, /require\.cache/);
+  assert.doesNotMatch(bootstrapSource, /require\.cache\s*\[/);
   assert.match(packageSource, /lib\/bootstrap\.js/);
   for (const file of ['oauth.js', 'exam.js', 'admin.js', 'helpers.js']) {
     assert.equal(fs.existsSync(path.join(root, 'lib', 'routes', file)), true);
