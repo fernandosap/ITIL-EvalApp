@@ -3,9 +3,11 @@
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
+const { buildPolicy } = require('../../lib/core/csp.js');
 
 const root = path.resolve(__dirname, '..', '..');
 const port = Number(process.env.E2E_PORT || 4173);
+const csp = buildPolicy(root);
 const types = { '.js': 'application/javascript', '.html': 'text/html; charset=utf-8', '.svg': 'image/svg+xml' };
 const questions = [
   { stem: 'Which framework is being assessed?', opts: ['ITIL 4', 'COBIT', 'TOGAF'], multi: false, note: '' },
@@ -14,7 +16,9 @@ const questions = [
 ];
 
 function send(res, status, body, type = 'application/json', extraHeaders = {}) {
-  res.writeHead(status, { 'Content-Type': type, 'Cache-Control': 'no-store', ...extraHeaders });
+  const headers = { 'Content-Type': type, 'Cache-Control': 'no-store', ...extraHeaders };
+  if (String(type).startsWith('text/html')) headers['Content-Security-Policy'] = csp;
+  res.writeHead(status, headers);
   res.end(body);
 }
 
@@ -31,54 +35,26 @@ function readBody(req) {
 
 async function api(req, res, url) {
   if (url.pathname === '/api/status') {
-    return send(res, 200, JSON.stringify({
-      examActive: true,
-      examName: 'E2E Exam',
-      total: 3,
-      durationSecs: 2700,
-      passPct: 80,
-      passScore: 3,
-      proctorEnabled: false
-    }));
+    return send(res, 200, JSON.stringify({ examActive: true, examName: 'E2E Exam', total: 3, durationSecs: 2700, passPct: 80, passScore: 3, proctorEnabled: false }));
   }
-  if (url.pathname === '/api/admin/auth-methods') {
-    return send(res, 200, JSON.stringify({ password: true, xsuaa: { enabled: false } }));
-  }
+  if (url.pathname === '/api/admin/auth-methods') return send(res, 200, JSON.stringify({ password: true, xsuaa: { enabled: false } }));
   if (url.pathname === '/api/admin/me') return send(res, 401, JSON.stringify({ ok: false, error: 'unauthorized' }));
   if (url.pathname === '/api/client-errors' && req.method === 'POST') return send(res, 200, JSON.stringify({ ok: true }));
 
   if (url.pathname === '/api/validate' && req.method === 'POST') {
     const body = await readBody(req);
-    if (String(body.code || '').toUpperCase() !== 'ABC234') {
-      return send(res, 200, JSON.stringify({ valid: false, reason: 'not_found' }));
-    }
+    if (String(body.code || '').toUpperCase() !== 'ABC234') return send(res, 200, JSON.stringify({ valid: false, reason: 'not_found' }));
     return send(res, 200, JSON.stringify({
-      valid: true,
-      status: 'unused',
-      durationSecs: 2700,
-      passPct: 80,
-      passScore: 3,
-      total: 3,
-      proctorEnabled: false,
-      examMode: 'GRADED',
-      isPractice: false,
-      showCorrectAnswers: false
+      valid: true, status: 'unused', durationSecs: 2700, passPct: 80, passScore: 3, total: 3,
+      proctorEnabled: false, examMode: 'GRADED', isPractice: false, showCorrectAnswers: false
     }));
   }
 
   if (url.pathname === '/api/session/start' && req.method === 'POST') {
     await readBody(req);
     return send(res, 200, JSON.stringify({
-      ok: true,
-      examToken: 'e2e-exam-token',
-      total: 3,
-      durationSecs: 2700,
-      passPct: 80,
-      passScore: 3,
-      proctorEnabled: false,
-      examMode: 'GRADED',
-      isPractice: false,
-      showCorrectAnswers: false
+      ok: true, examToken: 'e2e-exam-token', total: 3, durationSecs: 2700, passPct: 80, passScore: 3,
+      proctorEnabled: false, examMode: 'GRADED', isPractice: false, showCorrectAnswers: false
     }));
   }
 
@@ -99,20 +75,9 @@ async function api(req, res, url) {
     return send(res, 200, JSON.stringify({
       ok: true,
       result: {
-        code: 'ABC234',
-        score: 3,
-        total: 3,
-        pct: 100,
-        pass: true,
-        passPct: 80,
-        durationSecs: 95,
-        submittedAt: new Date().toISOString(),
-        tabSwitches: 0,
-        incidentCount: 0,
-        autoSubmit: false,
-        isPractice: false,
-        showCorrectAnswers: false,
-        sectionResults: []
+        code: 'ABC234', score: 3, total: 3, pct: 100, pass: true, passPct: 80, durationSecs: 95,
+        submittedAt: new Date().toISOString(), tabSwitches: 0, incidentCount: 0, autoSubmit: false,
+        isPractice: false, showCorrectAnswers: false, sectionResults: []
       }
     }));
   }
