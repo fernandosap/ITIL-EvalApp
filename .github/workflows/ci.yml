@@ -26,6 +26,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Production dependency audit
+        run: npm audit --omit=dev --audit-level=high
+
       - name: Unit and regression tests
         run: npm test
 
@@ -35,6 +38,7 @@ jobs:
           set -euo pipefail
           node --check server.js
           node --check playwright.config.js
+          node --check scripts/migrate-runtime.mjs
           while IFS= read -r -d '' f; do
             node --check "$f"
           done < <(find lib client shared tests/e2e -type f \( -name '*.js' -o -name '*.cjs' \) -print0)
