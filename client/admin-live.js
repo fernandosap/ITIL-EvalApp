@@ -17,9 +17,13 @@
   }
 
   function ensureButton() {
-    if (document.getElementById('admin-live-launcher')) return;
-    const params = new URLSearchParams(root.location.search);
-    if (params.get('admin') !== '1') return;
+    const existing = document.getElementById('admin-live-launcher');
+    // Never expose operations affordances on the unauthenticated login page.
+    if (!root.S || root.S.screen !== 'admin') {
+      if (existing) existing.remove();
+      return;
+    }
+    if (existing) return;
     const btn = document.createElement('button');
     btn.id = 'admin-live-launcher';
     btn.type = 'button';
@@ -60,6 +64,7 @@
   }
 
   async function openPanel() {
+    if (!root.S || root.S.screen !== 'admin') return;
     const body = shell('Live Exam Sessions');
     try {
       const data = await api('/api/admin/live-sessions');
