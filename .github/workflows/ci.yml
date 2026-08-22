@@ -33,9 +33,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for f in server.js lib/*.js client/*.js shared/*.js; do
+          node --check server.js
+          node --check playwright.config.js
+          while IFS= read -r -d '' f; do
             node --check "$f"
-          done
+          done < <(find lib client shared tests/e2e -type f \( -name '*.js' -o -name '*.cjs' \) -print0)
 
       - name: Repository secret scan
         shell: bash
@@ -51,3 +53,28 @@ jobs:
             printf '%s\n' "$HITS" | head -20
             exit 1
           fi
+
+  browser-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install app dependencies
+        run: npm ci
+
+      - name: Install Playwright test runner without changing lockfile
+        run: npm install --no-save --package-lock=false @playwright/test@1.55.0
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Browser integration smoke
+        run: npx playwright test --config=playwright.config.js

@@ -13,26 +13,23 @@
 // list that this file used to carry. Modules attach to window.IE.*
 // and the dispatcher walks those namespaces to find the right
 // function for a given data-action.
-//
-// Load order (in index.html) is strict:
-//   shared/constants.js → client/util.js → client/state.js → client/code-entry.js
-//   → client/exam.js → client/proctor.js → client/admin-auth.js
-//   → client/admin-codes.js → client/admin-question-sets.js
-//   → client/dispatcher.js → client/main.js
 
 (function (root) {
+  function loadAdminOperationsModule() {
+    if (document.querySelector('script[data-admin-live-module]') || root.IE?.adminLive) return;
+    const script = document.createElement('script');
+    script.src = '/client/admin-live.js';
+    script.async = true;
+    script.dataset.adminLiveModule = '1';
+    script.onerror = () => {
+      try { root.IE?.util?.reportClientError?.('module_load', { message: 'Failed to load admin-live.js', filename: '/client/admin-live.js', line: 0, col: 0, stack: '' }); } catch (_e) {}
+    };
+    document.head.appendChild(script);
+  }
+
   // ---- Global error capture ----
-  // window.onerror / unhandledrejection are the LAST line of
-  // defense for runtime errors that escape the SPA's internal
-  // try/catch. Without them, an uncaught throw during
-  // renderQ/goToQ would leave the screen blank with no
-  // diagnostic. We ship a sanitized report and log to the
-  // console for the developer.
   root.addEventListener('error', (e) => {
     if (!e) return;
-    // Ignore errors from the inline module-load reporter and
-    // the recovery screen — those are diagnostic paths, not
-    // candidate-facing failures.
     if (e.filename && /__reportModuleLoadError|boot-fallback|recovery/i.test(e.filename)) return;
     try {
       const info = {
@@ -45,7 +42,6 @@
       if (root.IE && root.IE.util && typeof root.IE.util.reportClientError === 'function') {
         root.IE.util.reportClientError('error', info);
       }
-      // eslint-disable-next-line no-console
       console.error('[exam:error]', info);
     } catch (_e) { /* never throw from a reporter */ }
   });
@@ -60,29 +56,18 @@
       if (root.IE && root.IE.util && typeof root.IE.util.reportClientError === 'function') {
         root.IE.util.reportClientError('unhandledrejection', info);
       }
-      // eslint-disable-next-line no-console
       console.error('[exam:unhandledrejection]', info);
     } catch (_e) { /* never throw */ }
   });
 
   // ---- Recovery screen (rendered on bootstrap failure) ----
-  // Pure DOM, no deps on the rest of the SPA. If the rest of
-  // the SPA is broken enough to cause a bootstrap failure, this
-  // still has to work.
   function renderRecoveryScreen(err) {
     try {
-      // Hide the boot-fallback first so the two don't
-      // visually stack.
       const bf = document.getElementById('boot-fallback');
       if (bf) bf.style.display = 'none';
       const app = document.getElementById('app');
       if (!app) return;
       const safeMessage = (err && err.message) ? String(err.message).slice(0, 240) : 'Unknown startup error';
-      // HTML-escape the error message before interpolation.
-      // Even though the surrounding <pre> is in a <details>
-      // and the page has a CSP, we don't want a stray `<img
-      // onerror=...>` in an error message to become an
-      // inline event handler.
       const escaped = safeMessage
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
@@ -108,7 +93,6 @@
       const reloadBtn = document.getElementById('recovery-reload');
       if (reloadBtn) reloadBtn.addEventListener('click', () => window.location.reload());
     } catch (_e) {
-      // Last-resort: just reload.
       try { window.location.reload(); } catch (__e) {}
     }
   }
@@ -142,13 +126,9 @@
     try {
       const params = new URLSearchParams(window.location.search);
       if (params.get('admin') === '1') {
-        // After an XSUAA callback, ?auth=ok is in the URL. Try to bootstrap
-        // from the cookie first; fall through to the login form if no
-        // session was set.
+        loadAdminOperationsModule();
         if (await root.IE.adminAuth.tryBootstrapFromCookie()) {
           root.IE.admin.showAdmin();
-          // Strip ?auth=ok from the URL so a refresh doesn't repeat the
-          // bootstrap dance. Use replaceState to avoid polluting history.
           params.delete('auth');
           const newSearch = params.toString();
           window.history.replaceState({}, '', window.location.pathname + (newSearch ? '?' + newSearch : ''));
@@ -158,16 +138,9 @@
       } else {
         root.IE.codeEntry.showCodeEntry();
       }
-      // Hide the boot-fallback now that the SPA has rendered
-      // its first screen. If a render replaced the entire
-      // #app innerHTML (e.g. showCodeEntry), the fallback is
-      // already gone — that's fine, this is a no-op then.
       const bf = document.getElementById('boot-fallback');
       if (bf) bf.style.display = 'none';
     } catch (err) {
-      // The bootstrap threw. Without this catch, the candidate
-      // would see the boot-fallback copy with no recovery
-      // path. With it, we report + render a recovery screen.
       try {
         if (root.IE && root.IE.util && typeof root.IE.util.reportClientError === 'function') {
           root.IE.util.reportClientError('bootstrap_failure', {
@@ -179,7 +152,6 @@
           });
         }
       } catch (_e) { /* never throw from a reporter */ }
-      // eslint-disable-next-line no-console
       console.error('[exam:bootstrap_failure]', err);
       renderRecoveryScreen(err);
     }

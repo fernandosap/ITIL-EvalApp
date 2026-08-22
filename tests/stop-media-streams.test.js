@@ -118,7 +118,7 @@ test('stopMediaStreams: nulls the stream references on root.S', () => {
   };
   const { state } = loadStateModule(S);
   state.stopMediaStreams();
-  console.error('DEBUG: trackStopped:', trackStopped, 'S.webcamStream:', S.webcamStream, 'S.webcamOk:', S.webcamOk);
+  assert.equal(trackStopped, true);
   assert.equal(S.webcamStream, null);
   assert.equal(S.screenStream, null);
   assert.equal(S.webcamOk, false);

@@ -223,7 +223,7 @@ test('readConnConfig: defaults HANA_PORT to 443', () => {
   } finally { restore(); }
 });
 
-test('readConnConfig: defaults encrypt=true, sslValidateCertificate=false', () => {
+test('readConnConfig: defaults encrypt=true, sslValidateCertificate=true', () => {
   const restore = snapshotEnv(ENV_KEYS);
   const dbPool = loadDbPoolWithFakeHana({ installFake: false });
   try {
@@ -234,7 +234,7 @@ test('readConnConfig: defaults encrypt=true, sslValidateCertificate=false', () =
     delete process.env.HANA_SSL_VALIDATE_CERTIFICATE;
     const cfg = dbPool.readConnConfig();
     assert.equal(cfg.encrypt, true);
-    assert.equal(cfg.sslValidateCertificate, false);
+    assert.equal(cfg.sslValidateCertificate, true);
   } finally { restore(); }
 });
 
