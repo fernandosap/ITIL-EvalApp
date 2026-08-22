@@ -21,8 +21,8 @@ function makeRes() {
   };
 }
 
-function makeReq(path, method = 'GET', headers = {}) {
-  return { path, method, headers, socket: { remoteAddress: '127.0.0.1' } };
+function makeReq(path, method = 'GET', headers = {}, body = null) {
+  return { path, method, headers, body, socket: { remoteAddress: '127.0.0.1' } };
 }
 
 test.beforeEach(() => runtime.resetForTests());
@@ -35,53 +35,58 @@ test('secureMathRandom always returns a value in [0,1)', () => {
   }
 });
 
-test('session/start is independently rate limited', () => {
+test('session/start is independently rate limited by IP and code', () => {
   let nextCalls = 0;
   for (let i = 0; i < 10; i++) {
     const res = makeRes();
-    runtime.hardeningMiddleware(makeReq('/api/session/start', 'POST'), res, () => { nextCalls += 1; });
+    runtime.sessionStartGuard(makeReq('/api/session/start', 'POST', {}, { code: 'ABC234' }), res, () => { nextCalls += 1; });
     assert.equal(res.statusCode, 200);
   }
   const blocked = makeRes();
-  runtime.hardeningMiddleware(makeReq('/api/session/start', 'POST'), blocked, () => { nextCalls += 1; });
+  runtime.sessionStartGuard(makeReq('/api/session/start', 'POST', {}, { code: 'ABC234' }), blocked, () => { nextCalls += 1; });
   assert.equal(blocked.statusCode, 429);
   assert.equal(blocked.body.error, 'too_many_attempts');
   assert.equal(nextCalls, 10);
+
+  const differentCode = makeRes();
+  runtime.sessionStartGuard(makeReq('/api/session/start', 'POST', {}, { code: 'XYZ234' }), differentCode, () => { nextCalls += 1; });
+  assert.equal(differentCode.statusCode, 200);
+  assert.equal(nextCalls, 11);
 });
 
 test('concurrent submit using same exam token is blocked until first response finishes', () => {
   const headers = { 'x-exam-token': 'exam-token-1' };
   const firstRes = makeRes();
   let firstNext = 0;
-  runtime.hardeningMiddleware(makeReq('/api/submit', 'POST', headers), firstRes, () => { firstNext += 1; });
+  runtime.submitGuard(makeReq('/api/submit', 'POST', headers), firstRes, () => { firstNext += 1; });
   assert.equal(firstNext, 1);
 
   const secondRes = makeRes();
   let secondNext = 0;
-  runtime.hardeningMiddleware(makeReq('/api/submit', 'POST', headers), secondRes, () => { secondNext += 1; });
+  runtime.submitGuard(makeReq('/api/submit', 'POST', headers), secondRes, () => { secondNext += 1; });
   assert.equal(secondRes.statusCode, 409);
   assert.equal(secondRes.body.error, 'submission_in_progress');
   assert.equal(secondNext, 0);
 
   firstRes.emit('finish');
   const thirdRes = makeRes();
-  runtime.hardeningMiddleware(makeReq('/api/submit', 'POST', headers), thirdRes, () => { secondNext += 1; });
+  runtime.submitGuard(makeReq('/api/submit', 'POST', headers), thirdRes, () => { secondNext += 1; });
   assert.equal(secondNext, 1);
 });
 
 test('question-set writes are serialized in the single-instance runtime', () => {
   const first = makeRes();
-  runtime.hardeningMiddleware(makeReq('/api/admin/question-sets/1/clone', 'POST'), first, () => {});
+  runtime.questionSetMutationGuard(makeReq('/api/admin/question-sets/1/clone', 'POST'), first, () => {});
 
   const second = makeRes();
-  runtime.hardeningMiddleware(makeReq('/api/admin/question-sets/upload', 'POST'), second, () => assert.fail('second mutation should be blocked'));
+  runtime.questionSetMutationGuard(makeReq('/api/admin/question-sets/upload', 'POST'), second, () => assert.fail('second mutation should be blocked'));
   assert.equal(second.statusCode, 409);
   assert.equal(second.body.error, 'question_set_mutation_in_progress');
 
   first.emit('finish');
   const third = makeRes();
   let passed = false;
-  runtime.hardeningMiddleware(makeReq('/api/admin/question-sets/upload', 'POST'), third, () => { passed = true; });
+  runtime.questionSetMutationGuard(makeReq('/api/admin/question-sets/upload', 'POST'), third, () => { passed = true; });
   assert.equal(passed, true);
 });
 
