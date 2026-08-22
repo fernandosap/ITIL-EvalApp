@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const runtime = require('../lib/runtime-hardening.js');
+const legacyLogin = require('../lib/core/legacy-login.js');
 const { mapScopesToRole, roleFromClaims } = require('../shared/xsuaa.js');
 const { readConnConfig } = require('../shared/db-pool.js');
 const { config } = require('../lib/core/db.js');
@@ -32,6 +33,11 @@ function req(body = {}, ip = '127.0.0.1') {
   return { path: '/api/session/start', method: 'POST', body, headers: {}, ip, socket: { remoteAddress: ip } };
 }
 
+function restoreEnv(name, value) {
+  if (value == null) delete process.env[name];
+  else process.env[name] = value;
+}
+
 test.beforeEach(() => runtime.resetForTests());
 
 test('session start throttle is global per IP, not bypassable by rotating codes', () => {
@@ -45,6 +51,34 @@ test('session start throttle is global per IP, not bypassable by rotating codes'
   assert.equal(passed, 10);
   assert.equal(blocked.statusCode, 429);
   assert.equal(blocked.body.error, 'too_many_attempts');
+});
+
+test('reviewer-only legacy password configuration still authenticates', () => {
+  const names = ['ADMIN_HASH', 'MANAGER_HASH', 'REVIEWER_HASH', 'CONTENT_EDITOR_HASH'];
+  const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+  try {
+    delete process.env.ADMIN_HASH;
+    delete process.env.MANAGER_HASH;
+    process.env.REVIEWER_HASH = 'a'.repeat(64);
+    delete process.env.CONTENT_EDITOR_HASH;
+    legacyLogin.resetForTests();
+    const res = makeRes();
+    let fellThrough = false;
+    legacyLogin.fallbackLoginGuard(
+      { body: { hash: 'a'.repeat(64) }, headers: {}, ip: '127.0.0.1', socket: { remoteAddress: '127.0.0.1' } },
+      res,
+      () => { fellThrough = true; }
+    );
+    assert.equal(fellThrough, false);
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.ok, true);
+    assert.equal(res.body.role, 'reviewer');
+    const decoded = Buffer.from(res.body.token, 'base64url').toString('utf8').split(':');
+    assert.equal(decoded[2], 'reviewer');
+    assert.equal(decoded.length, 5);
+  } finally {
+    for (const name of names) restoreEnv(name, previous[name]);
+  }
 });
 
 test('access code generator uses the approved alphabet and produces six characters', () => {
@@ -110,4 +144,15 @@ test('question-set mutations use CURRENT_IDENTITY_VALUE and transactions', () =>
   assert.doesNotMatch(source, /SELECT MAX\(QUESTION_SET_ID\)/);
   assert.doesNotMatch(source, /SELECT MAX\(SECTION_ID\)/);
   assert.match(source, /transaction:\s*true/g);
+});
+
+test('shared SSO, readiness, live sessions and timeline routes are wired', () => {
+  const authSource = fs.readFileSync(path.join(__dirname, '..', 'lib', 'core', 'auth.js'), 'utf8');
+  const proctorSource = fs.readFileSync(path.join(__dirname, '..', 'lib', 'core', 'proctor.js'), 'utf8');
+  const runtimeSource = fs.readFileSync(path.join(__dirname, '..', 'lib', 'runtime-hardening.js'), 'utf8');
+  assert.match(authSource, /ADMIN_SSO_SESSIONS/);
+  assert.match(proctorSource, /INSERT INTO EXAM_PROCTOR_INCIDENTS/);
+  assert.match(runtimeSource, /\/api\/admin\/live-sessions/);
+  assert.match(runtimeSource, /\/api\/admin\/proctor\/incidents\/:code/);
+  assert.match(runtimeSource, /\/api\/admin\/question-sets\/:id\/readiness/);
 });
