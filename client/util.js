@@ -1,13 +1,5 @@
 /* eslint-disable no-console */
-// client/util.js — pure DOM and API helpers. No state, no globals other
-// than window.IE and the standard browser APIs. Loaded as a UMD module
-// (matches the pattern in shared/constants.js).
-//
-// Public surface (attached to window.IE.util):
-//   $, render, sleep, _esc, fmt, durationLabel, brandLockup,
-//   normalizeExamTitle, roleCan, apiFetch, apiJson, modal,
-//   _sha256, errorMessage, setSavePill, markSaveStart,
-//   markRetry, markSaveDone, markOfflineSave
+// client/util.js — pure DOM and API helpers.
 
 (function (root) {
   function $(id) { return document.getElementById(id); }
@@ -49,17 +41,14 @@
     </div>`;
   }
 
-  // Shared with the server; see shared/constants.js. Local delegates
-  // so existing call sites keep working without an extra dot.
-  function normalizeExamTitle(value) {
-    return window.SharedConstants.normalizeExamTitle(value);
-  }
-  function roleCan(permission) {
-    return window.SharedConstants.hasPermission(String(window._adminRole || 'admin'), permission);
+  function connectivityBanner() {
+    if (typeof navigator === 'undefined' || navigator.onLine !== false) return '';
+    return `<div role="status" aria-live="polite" style="background:#fff3cd;color:#664d03;border-bottom:1px solid #ffecb5;padding:8px 16px;text-align:center;font-size:12px;font-weight:700">You are offline. Your answers stay in this browser and will retry when the connection returns.</div>`;
   }
 
-  // SHA-256 of a UTF-8 string, hex-encoded. Used for the password
-  // login hash. The server compares against the env-var hash.
+  function normalizeExamTitle(value) { return window.SharedConstants.normalizeExamTitle(value); }
+  function roleCan(permission) { return window.SharedConstants.hasPermission(String(window._adminRole || 'admin'), permission); }
+
   async function _sha256(str) {
     const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
     return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, '0')).join('');
@@ -72,26 +61,44 @@
     return fallback;
   }
 
-  // Save-pill state. Persists in window.SAVE_UI so the latest state is
-  // available to any module that wants to read it.
   function setSavePill(cls, text) {
     root.SAVE_UI = root.SAVE_UI || { cls: 'save-pill', text: 'Saved' };
     root.SAVE_UI.cls = cls;
     root.SAVE_UI.text = text;
     const el = $('save-pill');
-    if (el) {
-      el.className = cls;
-      el.textContent = text;
-    }
+    if (el) { el.className = cls; el.textContent = text; }
   }
   function markSaveStart() { setSavePill('save-pill saving', 'Saving...'); }
   function markRetry(attempt) { setSavePill('save-pill retry', `Retry ${attempt}`); }
   function markSaveDone(ok) { setSavePill(ok ? 'save-pill' : 'save-pill error', ok ? 'Saved' : 'Save failed'); }
   function markOfflineSave() { setSavePill('save-pill error', 'Offline'); }
 
-  // Generic fetch wrapper with timeout + retry. Returns the Response
-  // object (or throws). All admin/exam token wiring happens here so
-  // individual call sites don't repeat the header logic.
+  root._questionSetVersions = root._questionSetVersions || {};
+
+  function questionSetId(url) {
+    const match = String(url || '').match(/^\/api\/admin\/question-sets\/(\d+)(?:\/|$)/);
+    return match ? match[1] : null;
+  }
+
+  function rememberVersion(url, resp) {
+    const id = questionSetId(url);
+    if (!id || !resp || !resp.headers) return;
+    const raw = resp.headers.get('x-resource-version') || resp.headers.get('etag') || '';
+    const version = String(raw).trim().replace(/^W\//, '').replace(/^"|"$/g, '');
+    if (version) root._questionSetVersions[id] = version;
+  }
+
+  async function hydrateQuestionSetVersion(id, headers, signal) {
+    if (!id || root._questionSetVersions[id]) return root._questionSetVersions[id] || null;
+    try {
+      const probeHeaders = Object.assign({}, headers || {});
+      delete probeHeaders['If-Match'];
+      const resp = await fetch(`/api/admin/question-sets/${id}/readiness`, { method: 'GET', headers: probeHeaders, signal: signal });
+      if (resp.ok) rememberVersion(`/api/admin/question-sets/${id}/readiness`, resp);
+    } catch (_e) { /* the mutation will return a useful 428 if probing failed */ }
+    return root._questionSetVersions[id] || null;
+  }
+
   async function apiFetch(url, opts, cfg) {
     opts = opts || {};
     cfg = cfg || {};
@@ -109,12 +116,17 @@
       try {
         const headers = Object.assign({}, opts.headers || {});
         if (root._adminToken) headers['X-Admin-Token'] = root._adminToken;
-        // XSUAA cookie path: the browser sends the xsuaa_jwt cookie
-        // automatically. We do NOT need to set Authorization: Bearer
-        // here — the cookie is sufficient for requireAdmin to auth.
         if (root.S && root.S.examToken) headers['X-Exam-Token'] = root.S.examToken;
+
+        const setId = questionSetId(url);
+        if (setId && ['POST', 'PUT', 'PATCH', 'DELETE'].includes(method) && !String(url).endsWith('/clone')) {
+          const version = await hydrateQuestionSetVersion(setId, headers, controller.signal);
+          if (version) headers['If-Match'] = `"${version}"`;
+        }
+
         const resp = await fetch(url, Object.assign({}, opts, { headers, signal: controller.signal }));
         clearTimeout(timer);
+        rememberVersion(url, resp);
         if (!resp.ok) {
           let detail = `HTTP ${resp.status}`;
           try {
@@ -129,9 +141,8 @@
               const text = await resp.text();
               if (text) detail = text;
             }
-          } catch (_e) {
-            // ignore parse failure
-          }
+          } catch (_e) { /* ignore parse failure */ }
+          if (setId && (resp.status === 412 || resp.status === 428)) delete root._questionSetVersions[setId];
           const e = new Error(detail);
           e.status = resp.status;
           throw e;
@@ -166,7 +177,6 @@
     return resp.json();
   }
 
-  // Modal dialog. Renders into the static #modal element in index.html.
   function modal(icon, title, body, btns) {
     $('m-icon').textContent = icon;
     $('m-title').textContent = title;
@@ -185,13 +195,6 @@
     $('modal').classList.add('show');
   }
 
-  // ---------------------------------------------------------------------------
-  // Client error telemetry — thin delegate to IE.reporter
-  // (defined in client/reporter.js, loaded after this module).
-  // The real implementation is in reporter.js so it can be
-  // unit-tested in isolation. We re-export it here so existing
-  // call sites using IE.util.reportClientError keep working.
-  // ---------------------------------------------------------------------------
   function reportClientError(type, info) {
     if (root.IE && root.IE.reporter && typeof root.IE.reporter.report === 'function') {
       return root.IE.reporter.report(type, info);
@@ -201,25 +204,28 @@
 
   root.IE = root.IE || {};
   root.IE.util = {
-    $: $,
-    render: render,
-    sleep: sleep,
-    _esc: _esc,
-    fmt: fmt,
-    durationLabel: durationLabel,
-    brandLockup: brandLockup,
-    normalizeExamTitle: normalizeExamTitle,
-    roleCan: roleCan,
-    _sha256: _sha256,
-    errorMessage: errorMessage,
-    setSavePill: setSavePill,
-    markSaveStart: markSaveStart,
-    markRetry: markRetry,
-    markSaveDone: markSaveDone,
-    markOfflineSave: markOfflineSave,
-    apiFetch: apiFetch,
-    apiJson: apiJson,
-    modal: modal,
-    reportClientError: reportClientError
+    $,
+    render,
+    sleep,
+    _esc,
+    fmt,
+    durationLabel,
+    brandLockup,
+    connectivityBanner,
+    normalizeExamTitle,
+    roleCan,
+    _sha256,
+    errorMessage,
+    setSavePill,
+    markSaveStart,
+    markRetry,
+    markSaveDone,
+    markOfflineSave,
+    apiFetch,
+    apiJson,
+    modal,
+    reportClientError,
+    questionSetId,
+    rememberVersion
   };
 })(typeof window !== 'undefined' ? window : globalThis);

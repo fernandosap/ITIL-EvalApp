@@ -56,8 +56,8 @@ test('/client/util.js: 200, correct content-type, body matches the file', async 
   const r = await get('/client/util.js');
   assert.equal(r.status, 200);
   assert.match(r.headers['content-type'], /application\/javascript/);
-  // Body should be the actual util module — find a known export
-  assert.match(r.body, /window\.IE\.util/);
+  // Body should be the actual util module — find its UMD export
+  assert.match(r.body, /root\.IE\.util/);
   // Should not be the SPA fallback HTML
   assert.doesNotMatch(r.body, /<!DOCTYPE html>/i);
 });
