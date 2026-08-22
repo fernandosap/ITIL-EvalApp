@@ -33,9 +33,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for f in server.js lib/*.js client/*.js shared/*.js; do
+          node --check server.js
+          while IFS= read -r -d '' f; do
             node --check "$f"
-          done
+          done < <(find lib client shared -type f -name '*.js' -print0)
 
       - name: Repository secret scan
         shell: bash
