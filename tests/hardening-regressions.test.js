@@ -47,22 +47,23 @@ test('secureMathRandom always returns a value in [0,1)', () => {
   }
 });
 
-test('session/start is independently rate limited by IP and code', () => {
+test('session/start has an independent global per-IP rate limit', () => {
   let nextCalls = 0;
   for (let i = 0; i < 10; i++) {
     const res = makeRes();
-    runtime.sessionStartGuard(makeReq('/api/session/start', 'POST', {}, { code: 'ABC234' }), res, () => { nextCalls += 1; });
+    runtime.sessionStartGuard(makeReq('/api/session/start', 'POST', {}, { code: `ABC2${String(i).padStart(2, '0')}` }), res, () => { nextCalls += 1; });
     assert.equal(res.statusCode, 200);
   }
-  const blocked = makeRes();
-  runtime.sessionStartGuard(makeReq('/api/session/start', 'POST', {}, { code: 'ABC234' }), blocked, () => { nextCalls += 1; });
-  assert.equal(blocked.statusCode, 429);
-  assert.equal(blocked.body.error, 'too_many_attempts');
+
+  const sameIpDifferentCode = makeRes();
+  runtime.sessionStartGuard(makeReq('/api/session/start', 'POST', {}, { code: 'XYZ234' }), sameIpDifferentCode, () => { nextCalls += 1; });
+  assert.equal(sameIpDifferentCode.statusCode, 429);
+  assert.equal(sameIpDifferentCode.body.error, 'too_many_attempts');
   assert.equal(nextCalls, 10);
 
-  const differentCode = makeRes();
-  runtime.sessionStartGuard(makeReq('/api/session/start', 'POST', {}, { code: 'XYZ234' }), differentCode, () => { nextCalls += 1; });
-  assert.equal(differentCode.statusCode, 200);
+  const otherIp = makeRes();
+  runtime.sessionStartGuard(makeReq('/api/session/start', 'POST', { 'x-forwarded-for': '203.0.113.20' }, { code: 'XYZ234' }), otherIp, () => { nextCalls += 1; });
+  assert.equal(otherIp.statusCode, 200);
   assert.equal(nextCalls, 11);
 });
 
