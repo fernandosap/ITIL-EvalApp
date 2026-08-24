@@ -7,6 +7,7 @@ const { createAuthMiddleware } = require('../lib/middleware.js');
 function makeDeps(overrides = {}) {
   return {
     tryXsuaaAuth: () => null,
+    readXsuaaSession: async () => null,
     parseAdminToken: () => null,
     getAdminTokenNotBefore: async () => 0,
     withDb: async (fn) => fn({}),
@@ -40,24 +41,26 @@ test('createAuthMiddleware: throws when required deps are missing', () => {
   );
 });
 
-test('requireAdmin: returns 401 when no auth is present and no hint', () => {
+test('requireAdmin: returns 401 when no auth is present and no hint', async () => {
   const m = createAuthMiddleware(makeDeps());
   const res = makeRes();
   let nextCalled = false;
   m.requireAdmin(makeReq(), res, () => { nextCalled = true; });
+  await new Promise((r) => setImmediate(r));
   assert.equal(nextCalled, false);
   assert.equal(res._status, 401);
   assert.equal(res._body.error, 'unauthorized');
   assert.match(res._body.hint, /X-Admin-Token/);
 });
 
-test('requireAdmin: surfaces XSUAA hint when bound', () => {
+test('requireAdmin: surfaces XSUAA hint when bound', async () => {
   const m = createAuthMiddleware(makeDeps({
     getXsuaaConfig: () => ({ xsappname: 'x' })
   }));
   const res = makeRes();
   let nextCalled = false;
   m.requireAdmin(makeReq(), res, () => { nextCalled = true; });
+  await new Promise((r) => setImmediate(r));
   assert.equal(nextCalled, false);
   assert.equal(res._status, 401);
   assert.match(res._body.hint, /XSUAA/);
@@ -75,6 +78,27 @@ test('requireAdmin: passes through when XSUAA auth succeeds', () => {
   assert.equal(req.adminRole, 'admin');
   assert.equal(req.adminSubject, 'u1');
   assert.equal(req.authMethod, 'xsuaa');
+});
+
+test('requireAdmin: restores shared xsuaa session from cookie when sync auth misses', async () => {
+  let nextCalled = false;
+  const m = createAuthMiddleware(makeDeps({
+    tryXsuaaAuth: (req) => req.xsuaaSessionAuth
+      ? { role: req.xsuaaSessionAuth.role, sub: req.xsuaaSessionAuth.sub }
+      : null,
+    readXsuaaSession: async (id) => id === 'abc123'
+      ? { token: 'jwt', role: 'admin', sub: 'u2' }
+      : null
+  }));
+  const req = makeReq({ cookie: 'xsuaa_session=abc123' });
+  const res = makeRes();
+  m.requireAdmin(req, res, () => { nextCalled = true; });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(nextCalled, true);
+  assert.equal(req.adminRole, 'admin');
+  assert.equal(req.adminSubject, 'u2');
+  assert.equal(req.authMethod, 'xsuaa');
+  assert.equal(req.headers.authorization, 'Bearer jwt');
 });
 
 test('requireAdmin: legacy SHA-256 token path accepts a valid token', async () => {

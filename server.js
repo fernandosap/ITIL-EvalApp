@@ -69,6 +69,7 @@ const audit = require('./lib/audit.js');
 const clientErrors = require('./lib/client-errors.js');
 const rateLimit = require('./lib/rate-limit.js');
 const { createAuthMiddleware } = require('./lib/middleware.js');
+const sharedSsoAuth = require('./lib/core/auth.js');
 const sweeper = require('./lib/sweeper.js');
 const {
   toCsvCell,
@@ -781,6 +782,18 @@ function tryXsuaaAuth(req) {
     return { role, sub: inspection.claims.sub || null };
   }
 
+  // 0. Shared server-side browser session resolved by lib/core/auth.js.
+  // The new opaque xsuaa_session cookie flow stores the JWT in HANA and
+  // loads the resolved auth onto req.xsuaaSessionAuth before routes run.
+  // Legacy server.js routes must honor that object directly; otherwise
+  // /api/admin/me sees the cookie but still returns 401 after ?auth=ok.
+  if (req.xsuaaSessionAuth?.token && req.xsuaaSessionAuth?.role) {
+    return {
+      role: req.xsuaaSessionAuth.role,
+      sub: req.xsuaaSessionAuth.sub || null
+    };
+  }
+
   // 1. Authorization: Bearer <jwt> (API clients)
   const auth = String(req.headers.authorization || '').trim();
   if (auth.startsWith('Bearer ')) {
@@ -803,6 +816,7 @@ function tryXsuaaAuth(req) {
 // function references for the rest of server.js to use.
 const adminAuth = createAuthMiddleware({
   tryXsuaaAuth,
+  readXsuaaSession: sharedSsoAuth.readSession,
   parseAdminToken,
   getAdminTokenNotBefore,
   withDb,
@@ -816,6 +830,34 @@ const adminAuth = createAuthMiddleware({
 
 async function requireAdmin(req, res, next) {
   return adminAuth.requireAdmin(req, res, next);
+}
+
+async function restoreSharedXsuaaSession(req) {
+  if (req.xsuaaSessionAuth?.token && req.xsuaaSessionAuth?.role) return req.xsuaaSessionAuth;
+  const cookies = parseCookieHeader(req.headers.cookie);
+  const sessionId = String(cookies.xsuaa_session || '').trim();
+  if (!sessionId) return null;
+  try {
+    const session = await sharedSsoAuth.readSession(sessionId);
+    if (!session?.token || !session?.role) {
+      appLog('warn', 'xsuaa_session_restore_miss', {
+        requestId: req.requestId,
+        path: req.path,
+        hasCookie: true
+      });
+      return null;
+    }
+    req.xsuaaSessionAuth = session;
+    req.headers.authorization = `Bearer ${session.token}`;
+    return session;
+  } catch (err) {
+    appLog('error', 'xsuaa_session_restore_failed', {
+      requestId: req.requestId,
+      path: req.path,
+      message: err.message
+    });
+    return null;
+  }
 }
 
 function requireAdminRole(role) {
@@ -2157,8 +2199,12 @@ app.get('/api/admin/auth-methods', (_req, res) => {
 // Useful for the SPA to bootstrap after an OAuth callback that set a
 // cookie — the SPA calls /api/admin/me on page load, and if it returns
 // 200, the admin is signed in.
-app.get('/api/admin/me', (req, res) => {
-  const xsuaaAuth = tryXsuaaAuth(req);
+app.get('/api/admin/me', async (req, res) => {
+  let xsuaaAuth = tryXsuaaAuth(req);
+  if (!xsuaaAuth) {
+    await restoreSharedXsuaaSession(req);
+    xsuaaAuth = tryXsuaaAuth(req);
+  }
   if (xsuaaAuth) {
     return res.json({
       ok: true,

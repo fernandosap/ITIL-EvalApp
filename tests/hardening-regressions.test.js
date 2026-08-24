@@ -224,3 +224,15 @@ test('V3 shared runtime schema includes rotatable SSO storage', () => {
   assert.match(dbSource, /APP_RATE_LIMITS/);
   assert.match(dbSource, /APP_MUTEX/);
 });
+
+test('legacy server auth honors shared xsuaaSessionAuth resolved by middleware', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+  assert.match(source, /req\.xsuaaSessionAuth\?\.token/);
+  assert.match(source, /req\.xsuaaSessionAuth\?\.role/);
+});
+
+test('admin me route restores shared xsuaa session when middleware misses', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+  assert.match(source, /app\.get\('\/api\/admin\/me', async \(req, res\) =>/);
+  assert.match(source, /await restoreSharedXsuaaSession\(req\)/);
+});
