@@ -63,6 +63,21 @@ export AUTO_CLEAR_STALE_SESSIONS=true
 export STALE_SESSION_SWEEP_MINUTES=10
 export SLOW_QUERY_MS=350
 export SLOW_REQUEST_MS=1500
+export HANA_POOL_SIZE=5
+```
+
+Recommended when XSUAA browser SSO is bound:
+
+```bash
+export SSO_SESSION_KEY_ID=v1
+export SSO_SESSION_ENCRYPTION_KEY=<32-byte-or-longer-secret>
+```
+
+Optional XSUAA browser-session key rotation:
+
+```bash
+export SSO_SESSION_PREVIOUS_KEY_ID=v0
+export SSO_SESSION_PREVIOUS_KEY=<previous-32-byte-or-longer-secret>
 ```
 
 Optional (server-side AI proctoring via Anthropic):

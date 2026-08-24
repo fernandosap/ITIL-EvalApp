@@ -40,6 +40,12 @@ Notes:
     ADMIN_HASH
   - Optional role auth vars:
     MANAGER_HASH, REVIEWER_HASH, CONTENT_EDITOR_HASH
+  - Recommended XSUAA browser-session vars when XSUAA is bound:
+    SSO_SESSION_KEY_ID, SSO_SESSION_ENCRYPTION_KEY
+  - Optional XSUAA key-rotation vars:
+    SSO_SESSION_PREVIOUS_KEY_ID, SSO_SESSION_PREVIOUS_KEY
+  - Optional HANA/runtime vars:
+    HANA_POOL_SIZE
   - Optional runtime hardening / observability vars:
     STARTUP_STRICT, AUTO_CLEAR_STALE_SESSIONS, STALE_SESSION_SWEEP_MINUTES,
     SLOW_QUERY_MS, SLOW_REQUEST_MS
@@ -159,6 +165,20 @@ done
 echo "==> Running local env preflight"
 node scripts/check-env.mjs
 
+if [[ -n "${SSO_SESSION_KEY_ID:-}" || -n "${SSO_SESSION_ENCRYPTION_KEY:-}" ]]; then
+  if [[ -z "${SSO_SESSION_KEY_ID:-}" || -z "${SSO_SESSION_ENCRYPTION_KEY:-}" ]]; then
+    echo "SSO_SESSION_KEY_ID and SSO_SESSION_ENCRYPTION_KEY must be configured together." >&2
+    exit 1
+  fi
+fi
+
+if [[ -n "${SSO_SESSION_PREVIOUS_KEY_ID:-}" || -n "${SSO_SESSION_PREVIOUS_KEY:-}" ]]; then
+  if [[ -z "${SSO_SESSION_PREVIOUS_KEY_ID:-}" || -z "${SSO_SESSION_PREVIOUS_KEY:-}" ]]; then
+    echo "SSO_SESSION_PREVIOUS_KEY_ID and SSO_SESSION_PREVIOUS_KEY must be configured together." >&2
+    exit 1
+  fi
+fi
+
 if [[ "$USE_SSO" == "true" ]]; then
   echo "==> Logging in with SSO to Cloud Foundry API: $CF_API"
   cf login -a "$CF_API" --sso
@@ -171,6 +191,16 @@ fi
 
 echo "==> Targeting org/space: $CF_ORG / $CF_SPACE"
 cf target -o "$CF_ORG" -s "$CF_SPACE"
+
+if [[ -n "${SSO_SESSION_KEY_ID:-}" ]]; then
+  echo "==> Pre-configuring SSO session env before push"
+  cf set-env "$APP_NAME" SSO_SESSION_KEY_ID "$SSO_SESSION_KEY_ID"
+  cf set-env "$APP_NAME" SSO_SESSION_ENCRYPTION_KEY "$SSO_SESSION_ENCRYPTION_KEY"
+  if [[ -n "${SSO_SESSION_PREVIOUS_KEY_ID:-}" ]]; then
+    cf set-env "$APP_NAME" SSO_SESSION_PREVIOUS_KEY_ID "$SSO_SESSION_PREVIOUS_KEY_ID"
+    cf set-env "$APP_NAME" SSO_SESSION_PREVIOUS_KEY "$SSO_SESSION_PREVIOUS_KEY"
+  fi
+fi
 
 echo "==> Deploying app with fixed route + HANA vars"
 cf push \
@@ -218,6 +248,28 @@ if [[ -n "${CONTENT_EDITOR_HASH:-}" ]]; then
   NEED_RESTAGE="true"
 else
   echo "==> CONTENT_EDITOR_HASH not set; content editor login will stay disabled"
+fi
+
+if [[ -n "${SSO_SESSION_KEY_ID:-}" || -n "${SSO_SESSION_ENCRYPTION_KEY:-}" ]]; then
+  echo "==> Configuring SSO_SESSION_KEY_ID=${SSO_SESSION_KEY_ID}"
+  cf set-env "$APP_NAME" SSO_SESSION_KEY_ID "$SSO_SESSION_KEY_ID"
+  cf set-env "$APP_NAME" SSO_SESSION_ENCRYPTION_KEY "$SSO_SESSION_ENCRYPTION_KEY"
+  NEED_RESTAGE="true"
+else
+  echo "==> SSO session encryption vars not provided; existing app values will be kept"
+fi
+
+if [[ -n "${SSO_SESSION_PREVIOUS_KEY_ID:-}" || -n "${SSO_SESSION_PREVIOUS_KEY:-}" ]]; then
+  echo "==> Configuring SSO session previous key id=${SSO_SESSION_PREVIOUS_KEY_ID}"
+  cf set-env "$APP_NAME" SSO_SESSION_PREVIOUS_KEY_ID "$SSO_SESSION_PREVIOUS_KEY_ID"
+  cf set-env "$APP_NAME" SSO_SESSION_PREVIOUS_KEY "$SSO_SESSION_PREVIOUS_KEY"
+  NEED_RESTAGE="true"
+fi
+
+if [[ -n "${HANA_POOL_SIZE:-}" ]]; then
+  echo "==> Configuring HANA_POOL_SIZE=$HANA_POOL_SIZE"
+  cf set-env "$APP_NAME" HANA_POOL_SIZE "$HANA_POOL_SIZE"
+  NEED_RESTAGE="true"
 fi
 
 if [[ -n "${STARTUP_STRICT:-}" ]]; then
