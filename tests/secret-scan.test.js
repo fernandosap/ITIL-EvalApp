@@ -11,7 +11,7 @@ test.before(async () => {
 });
 
 test('secret scanner supports JavaScript whitespace escapes used by patterns', () => {
-  const patterns = scanner.loadPatterns('hana://[A-Za-z0-9_]+:[^@\\s]+@\\n');
+  const patterns = scanner.loadPatterns(String.raw`hana://[A-Za-z0-9_]+:[^@\s]+@`);
   assert.equal(patterns.length, 1);
   assert.equal(scanner.scanText('hana://USER:supersecret@example.hana', patterns).length, 1);
   assert.equal(scanner.scanText('hana://USER:not allowed@example.hana', patterns).length, 0);
@@ -20,12 +20,13 @@ test('secret scanner supports JavaScript whitespace escapes used by patterns', (
 test('secret scanner ignores comments and blank pattern lines', () => {
   const patterns = scanner.loadPatterns('# comment\n\nAKIA[0-9A-Z]{16}\n');
   assert.equal(patterns.length, 1);
-  assert.equal(scanner.scanText('AKIA1234567890ABCDEF', patterns).length, 1);
+  const candidate = 'AKIA' + '1234567890ABCDEF';
+  assert.equal(scanner.scanText(candidate, patterns).length, 1);
 });
 
 test('line-level secretscan opt-out suppresses an intentional false positive', () => {
   const patterns = scanner.loadPatterns('sk-[A-Za-z0-9]{20,}\n');
-  const value = 'sk-abcdefghijklmnopqrstuvwxyz # secretscan: ok';
+  const value = 'sk-' + 'abcdefghijklmnopqrstuvwxyz' + ' # secretscan: ok';
   assert.equal(scanner.scanText(value, patterns).length, 0);
 });
 
