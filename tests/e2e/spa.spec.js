@@ -85,6 +85,52 @@ test('exam question and option text meet practical AA contrast threshold', async
   expect(ratios.option).toBeGreaterThanOrEqual(4.5);
 });
 
+test('exam reading surface is opaque and cannot be washed out by decorative background overlays', async ({ page }) => {
+  await startExam(page);
+  await expect(page.locator('[data-question-surface="opaque"]')).toBeVisible();
+
+  const visual = await page.evaluate(() => {
+    const stem = document.querySelector('.q-stem');
+    const surface = document.querySelector('[data-question-surface="opaque"]');
+    const examRoot = document.querySelector('[data-exam-surface-root="opaque"]') || stem?.closest('.no-select');
+    const option = document.querySelector('.option');
+    const optText = document.querySelector('.opt-text');
+    const pseudo = examRoot ? getComputedStyle(examRoot, '::before') : null;
+    let minAncestorOpacity = 1;
+    let node = stem;
+    while (node && node !== document.documentElement) {
+      const value = Number(getComputedStyle(node).opacity || 1);
+      minAncestorOpacity = Math.min(minAncestorOpacity, Number.isFinite(value) ? value : 1);
+      node = node.parentElement;
+    }
+    return {
+      hasLegacyOverlayClass: !!examRoot?.classList.contains('exam-shell'),
+      pseudoContent: pseudo?.content || 'none',
+      pseudoBackground: pseudo?.backgroundImage || 'none',
+      surfaceBackground: surface ? getComputedStyle(surface).backgroundColor : '',
+      surfaceOpacity: surface ? getComputedStyle(surface).opacity : '',
+      surfaceFilter: surface ? getComputedStyle(surface).filter : '',
+      stemColor: stem ? getComputedStyle(stem).color : '',
+      optionBackground: option ? getComputedStyle(option).backgroundColor : '',
+      optionColor: option ? getComputedStyle(option).color : '',
+      optTextColor: optText ? getComputedStyle(optText).color : '',
+      minAncestorOpacity
+    };
+  });
+
+  expect(visual.hasLegacyOverlayClass).toBe(false);
+  expect(visual.pseudoContent).toBe('none');
+  expect(visual.pseudoBackground).toBe('none');
+  expect(visual.surfaceBackground).toBe('rgb(255, 255, 255)');
+  expect(visual.surfaceOpacity).toBe('1');
+  expect(visual.surfaceFilter).toBe('none');
+  expect(visual.stemColor).toBe('rgb(23, 32, 51)');
+  expect(visual.optionBackground).toBe('rgb(255, 255, 255)');
+  expect(visual.optionColor).toBe('rgb(36, 52, 77)');
+  expect(visual.optTextColor).toBe('rgb(36, 52, 77)');
+  expect(visual.minAncestorOpacity).toBe(1);
+});
+
 test('candidate can navigate, answer all questions and submit', async ({ page }) => {
   await startExam(page);
 
