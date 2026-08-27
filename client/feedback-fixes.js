@@ -29,26 +29,81 @@
     return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
   }
 
+  // Keep decorative page art strictly behind the reading surfaces. The legacy
+  // `.exam-shell::before` gradient paints over non-positioned exam content and
+  // can make otherwise AA-compliant colors look washed out. The background can
+  // stay decorative, but question/status content must always sit on an opaque,
+  // high-contrast surface independent of that background.
+  function stabilizeReadingSurfaces(doc = root.document) {
+    if (!doc?.querySelectorAll) return;
+
+    doc.querySelectorAll('.exam-shell').forEach((el) => {
+      el.classList.remove('exam-shell');
+      el.dataset.examSurfaceRoot = 'opaque';
+      el.style.color = '#172033';
+    });
+
+    const stem = doc.querySelector?.('.q-stem');
+    const surface = stem?.parentElement;
+    if (surface) {
+      surface.dataset.questionSurface = 'opaque';
+      surface.style.backgroundColor = '#ffffff';
+      surface.style.border = '1px solid #c7d3e4';
+      surface.style.borderRadius = '14px';
+      surface.style.padding = 'clamp(18px, 3vw, 28px)';
+      surface.style.boxShadow = '0 10px 28px rgba(31,56,100,.12)';
+      surface.style.position = 'relative';
+      surface.style.zIndex = '1';
+      surface.style.opacity = '1';
+      surface.style.filter = 'none';
+    }
+
+    doc.querySelectorAll('.q-num').forEach((el) => {
+      el.style.color = '#46566f';
+      el.style.opacity = '1';
+    });
+    doc.querySelectorAll('.opt-text').forEach((el) => {
+      el.style.color = '#24344d';
+      el.style.fontWeight = '500';
+      el.style.opacity = '1';
+    });
+    doc.querySelectorAll('.nav-help').forEach((el) => {
+      el.style.color = '#56627a';
+      el.style.opacity = '1';
+    });
+  }
+
   function applyAccessibleContrast(doc = root.document) {
     if (!doc?.querySelectorAll) return;
-    doc.querySelectorAll('.q-stem').forEach((el) => { el.style.color = '#172033'; });
+    stabilizeReadingSurfaces(doc);
+    doc.querySelectorAll('.q-stem').forEach((el) => {
+      el.style.color = '#172033';
+      el.style.opacity = '1';
+    });
     doc.querySelectorAll('.option').forEach((el) => {
       el.style.color = '#24344d';
       el.style.backgroundColor = '#ffffff';
       el.style.borderColor = '#7889a8';
       el.style.opacity = '1';
+      el.style.filter = 'none';
       if (el.classList.contains('selected')) {
         el.style.backgroundColor = '#e8f1ff';
         el.style.borderColor = '#1f4f8a';
         el.style.boxShadow = '0 0 0 2px rgba(31,79,138,.14)';
+      } else {
+        el.style.boxShadow = 'none';
       }
     });
     doc.querySelectorAll('.multi-note').forEach((el) => {
       el.style.color = '#704300';
       el.style.backgroundColor = '#fff8e6';
       el.style.borderColor = '#d59a2d';
+      el.style.opacity = '1';
     });
-    doc.querySelectorAll('.nav-help,.sel-count').forEach((el) => { el.style.color = '#56627a'; });
+    doc.querySelectorAll('.nav-help,.sel-count').forEach((el) => {
+      el.style.color = '#56627a';
+      el.style.opacity = '1';
+    });
   }
 
   function hardenAccessCodeInput(doc = root.document) {
@@ -91,6 +146,7 @@
       if (el.textContent !== label) el.textContent = label;
       el.style.fontWeight = '700';
       el.style.color = selectedCount === required ? '#1f5f2c' : '#8a5b00';
+      el.style.opacity = '1';
     });
     const meta = doc.querySelector('.q-meta');
     if (meta && q.multi && !meta.querySelector('[data-selection-requirement]')) {
@@ -177,11 +233,13 @@
     installed = true;
     patchExamActions();
     hardenAccessCodeInput();
+    stabilizeReadingSurfaces();
     if (root.document?.documentElement && typeof MutationObserver !== 'undefined') {
       observer = new MutationObserver(() => {
         patchExamActions();
         hardenAccessCodeInput();
         updateSelectionUi();
+        stabilizeReadingSurfaces();
       });
       observer.observe(root.document.documentElement, { childList: true, subtree: true });
     }
@@ -194,5 +252,15 @@
     installed = false;
   }
 
-  return { fallbackStatusChip, luminance, contrastRatio, applyAccessibleContrast, hardenAccessCodeInput, ensureAdminStatusChip, install, stop };
+  return {
+    fallbackStatusChip,
+    luminance,
+    contrastRatio,
+    stabilizeReadingSurfaces,
+    applyAccessibleContrast,
+    hardenAccessCodeInput,
+    ensureAdminStatusChip,
+    install,
+    stop
+  };
 });

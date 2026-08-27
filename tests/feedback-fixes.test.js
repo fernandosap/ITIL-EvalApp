@@ -96,6 +96,43 @@ test('candidate palette meets WCAG AA contrast targets for normal text', () => {
   assert.ok(feedback.contrastRatio('#56627a', '#ffffff') >= 4.5, 'navigation help contrast below AA');
 });
 
+test('reading-surface hardening removes legacy shell overlay and creates an opaque question panel', () => {
+  const classes = new Set(['no-select', 'exam-shell']);
+  const examRoot = {
+    classList: {
+      remove(name) { classes.delete(name); },
+      contains(name) { return classes.has(name); }
+    },
+    dataset: {},
+    style: {}
+  };
+  const questionSurface = { dataset: {}, style: {} };
+  const stem = { parentElement: questionSurface };
+  const qNum = { style: {} };
+  const optText = { style: {} };
+  const navHelp = { style: {} };
+  const doc = {
+    querySelector(selector) { return selector === '.q-stem' ? stem : null; },
+    querySelectorAll(selector) {
+      if (selector === '.exam-shell') return [examRoot];
+      if (selector === '.q-num') return [qNum];
+      if (selector === '.opt-text') return [optText];
+      if (selector === '.nav-help') return [navHelp];
+      return [];
+    }
+  };
+
+  feedback.stabilizeReadingSurfaces(doc);
+  assert.equal(classes.has('exam-shell'), false, 'legacy overlay class remained on exam root');
+  assert.equal(examRoot.dataset.examSurfaceRoot, 'opaque');
+  assert.equal(questionSurface.dataset.questionSurface, 'opaque');
+  assert.equal(questionSurface.style.backgroundColor, '#ffffff');
+  assert.equal(questionSurface.style.opacity, '1');
+  assert.equal(questionSurface.style.filter, 'none');
+  assert.equal(optText.style.color, '#24344d');
+  assert.equal(navHelp.style.color, '#56627a');
+});
+
 test('status chip fallback is total and does not throw for partial admin module loads', () => {
   assert.match(feedback.fallbackStatusChip({ status: 'completed', pass: true }), /PASS/);
   assert.match(feedback.fallbackStatusChip({ status: 'completed', pass: false }), /FAIL/);
