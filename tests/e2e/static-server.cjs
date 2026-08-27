@@ -10,9 +10,9 @@ const port = Number(process.env.E2E_PORT || 4173);
 const csp = buildPolicy(root);
 const types = { '.js': 'application/javascript', '.html': 'text/html; charset=utf-8', '.svg': 'image/svg+xml' };
 const questions = [
-  { stem: 'Which framework is being assessed?', opts: ['ITIL 4', 'COBIT', 'TOGAF'], multi: false, note: '' },
-  { stem: 'Select the two practices used in this fixture.', opts: ['Incident Management', 'Change Enablement', 'Payroll'], multi: true, note: 'Select two answers.' },
-  { stem: 'What is the purpose of the E2E flow?', opts: ['Validate the browser journey', 'Generate production data'], multi: false, note: '' }
+  { stem: 'Which framework is being assessed?', opts: ['ITIL 4', 'COBIT', 'TOGAF'], multi: false, note: '', requiredSelections: 1 },
+  { stem: 'Select the two practices used in this fixture.', opts: ['Incident Management', 'Change Enablement', 'Payroll'], multi: true, note: 'Select exactly TWO answers.', requiredSelections: 2 },
+  { stem: 'What is the purpose of the E2E flow?', opts: ['Validate the browser journey', 'Generate production data'], multi: false, note: '', requiredSelections: 1 }
 ];
 
 function send(res, status, body, type = 'application/json', extraHeaders = {}) {
@@ -31,6 +31,18 @@ function readBody(req) {
       catch (_e) { resolve({}); }
     });
   });
+}
+
+function invalidSelection(body, requireComplete) {
+  const answers = Array.isArray(body?.answers) ? body.answers : [];
+  for (let i = 0; i < questions.length; i += 1) {
+    const selected = Array.isArray(answers[i]) ? [...new Set(answers[i])] : [];
+    const required = questions[i].requiredSelections;
+    if (selected.length > required || (requireComplete && selected.length !== required)) {
+      return { question: i + 1, selectedCount: selected.length, requiredSelections: required };
+    }
+  }
+  return null;
 }
 
 async function api(req, res, url) {
@@ -66,12 +78,16 @@ async function api(req, res, url) {
   }
 
   if (url.pathname === '/api/progress' && req.method === 'POST') {
-    await readBody(req);
+    const body = await readBody(req);
+    const invalid = invalidSelection(body, false);
+    if (invalid) return send(res, 400, JSON.stringify({ error: 'too_many_selections', ...invalid }));
     return send(res, 200, JSON.stringify({ ok: true }));
   }
 
   if (url.pathname === '/api/submit' && req.method === 'POST') {
-    await readBody(req);
+    const body = await readBody(req);
+    const invalid = invalidSelection(body, body.autoSubmit !== true);
+    if (invalid) return send(res, 400, JSON.stringify({ error: 'selection_count_incomplete', ...invalid }));
     return send(res, 200, JSON.stringify({
       ok: true,
       result: {
