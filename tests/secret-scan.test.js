@@ -13,8 +13,10 @@ test.before(async () => {
 test('secret scanner supports JavaScript whitespace escapes used by patterns', () => {
   const patterns = scanner.loadPatterns(String.raw`hana://[A-Za-z0-9_]+:[^@\s]+@`);
   assert.equal(patterns.length, 1);
-  assert.equal(scanner.scanText('hana://USER:supersecret@example.hana', patterns).length, 1);
-  assert.equal(scanner.scanText('hana://USER:not allowed@example.hana', patterns).length, 0);
+  const validCandidate = 'hana://' + 'USER' + ':' + 'supersecret' + '@example.hana';
+  const whitespaceCandidate = 'hana://' + 'USER' + ':' + 'not allowed' + '@example.hana';
+  assert.equal(scanner.scanText(validCandidate, patterns).length, 1);
+  assert.equal(scanner.scanText(whitespaceCandidate, patterns).length, 0);
 });
 
 test('secret scanner ignores comments and blank pattern lines', () => {
