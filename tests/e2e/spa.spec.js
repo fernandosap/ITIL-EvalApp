@@ -8,10 +8,19 @@ async function enterValidCode(page) {
 }
 
 async function startExam(page) {
+  const browserErrors = [];
+  page.on('pageerror', (err) => browserErrors.push(`pageerror: ${err.message}\n${err.stack || ''}`));
+  page.on('console', (msg) => { if (msg.type() === 'error') browserErrors.push(`console: ${msg.text()}`); });
   await enterValidCode(page);
   await page.locator('#cb-consent').check();
   await page.getByRole('button', { name: /Continue/ }).click();
-  await expect(page.locator('.q-stem')).toContainText('Which framework is being assessed?');
+  try {
+    await expect(page.locator('.q-stem')).toContainText('Which framework is being assessed?');
+  } catch (err) {
+    const body = await page.locator('body').innerText().catch(() => '<body unavailable>');
+    console.log(`CANDIDATE_START_DIAGNOSTIC\n${browserErrors.join('\n')}\nBODY:\n${body}`);
+    throw err;
+  }
 }
 
 test('candidate landing renders access-code entry instead of a blank screen', async ({ page }) => {
