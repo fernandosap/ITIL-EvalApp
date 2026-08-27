@@ -24,6 +24,8 @@ npm run test:e2e
 
 Browser tests exercise candidate entry, consent, exam rendering, exact multi-select behavior, navigation/submission, accessibility contrast, refresh recovery, admin entry, and module-load recovery.
 
+**What the e2e test server is and is not**: the e2e tests run against `tests/e2e/static-server.cjs` — a hand-written Node HTTP fixture that serves `index.html` and a 3-question mock API on `127.0.0.1:4173` (overridable via `E2E_PORT`). It is **not** the real backend; in particular the fixture's `/api/submit` always returns `{ ok: true, result: { passed: true, score: 100, total: 3, ... } }` without writing anywhere. So the e2e "candidate can submit" test is non-destructive and safe to run against any environment. The real submit flow is exercised by the unit tests (`tests/server-routes.test.js` exercises the production code path with a stubbed HANA) and by manual UAT.
+
 ### Application smoke
 
 ```bash
@@ -48,6 +50,13 @@ npm run scan:secrets:staged
 ```
 
 Both CI and the local pre-commit hook use the same JavaScript RegExp engine and the patterns in `.githooks/secret-patterns.txt`. This avoids differences between grep/awk regex dialects. The scanner fails closed when a configured pattern is invalid.
+
+**Mode differences** (important for the `scan:secrets` workflow):
+
+- `scan:secrets` (default — `scripts/secret-scan.mjs --repo`): walks `git ls-files` and only scans **committed** files. Use this for "is the current tree clean?" after a merge.
+- `scan:secrets:staged` (`--staged` mode): scans only the diff for staged additions, via `git diff --cached`. This is what the pre-commit hook invokes via `.githooks/pre-commit`. Use this for "would my next commit introduce a secret?".
+
+If a developer writes `AKIA...` into a brand-new file and runs `scan:secrets`, the result is `secretscan: clean` (the file isn't tracked yet). Running `git add` and then `scan:secrets` correctly detects the leak. The pre-commit hook (`scan:secrets:staged`) catches it on commit regardless. The security gate is therefore the pre-commit hook + CI; `scan:secrets` standalone is a convenience check that intentionally trades a few false-negatives for speed.
 
 ### Post-deploy smoke
 

@@ -218,16 +218,60 @@ fallback when XSUAA is not bound.
 - **Logout**: `POST /api/admin/logout` clears `xsuaa_session` (and the legacy `xsuaa_jwt` cookie when present). It does NOT invalidate the IdP session (XSUAA session is separate and would need `/oauth/logout` against XSUAA — not implemented; not needed for this app).
 - **No `@sap/xssec` dependency** — manual JWT verification keeps the dep tree small (~140 LOC in `shared/xsuaa.js`).
 
-### Opaque browser-session lifecycle
+### Opaque browser-session lifecycle (multi-instance safe)
 
-The OAuth browser flow stores the XSUAA JWT in the process-local
-`_xsuaaBrowserSessions` map and sends the browser only an opaque
-`xsuaa_session` cookie. This avoids browser cookie-size limits and keeps the
-JWT off the client, but sessions are valid only on the process that created
-them. A CF restart/deploy invalidates active SSO browser sessions. The app is
-currently pinned to one instance; before scaling beyond one instance, move
-this session map to shared storage (or use sticky routing plus an explicit
-availability plan).
+The OAuth browser flow (`/oauth/callback` → `lib/core/auth.js#oauthCallbackHandler`)
+authenticates the XSUAA JWT, then stores the **verified principal** (subject +
+role + email) in the HANA-backed `ADMIN_SSO_SESSIONS_V3` table and returns
+only an opaque `xsuaa_session` cookie to the browser. The browser cookie
+holds a random session ID, not the JWT — so cookie-size limits are not a
+concern, and the JWT never reaches the client.
+
+**Storage** (`ADMIN_SSO_SESSIONS_V3`):
+- row key = the opaque `xsuaa_session` value
+- columns: `SUBJECT`, `ROLE`, `EMAIL`, `AUTH_METHOD`, `CREATED_AT`,
+  `LAST_SEEN_AT`, `EXPIRES_AT`, plus an `ENCRYPTED_PRINCIPAL` blob holding
+  the full JWT for downstream API calls
+- encryption: AES-256-GCM with a 12-byte random IV per row
+- the encryption key is read from `SSO_SESSION_ENCRYPTION_KEY` (must be
+  ≥32 chars; rotate via `SSO_SESSION_KEY_ID`)
+
+**Read path** (`tryXsuaaAuth`):
+1. global `sharedSessionMiddleware` (installed by `lib/bootstrap.js#installGlobalMiddleware`)
+   reads the cookie, fetches + decrypts the row from HANA, and sets
+   `req.xsuaaSessionAuth = { sub, role, email, jwt }`.
+2. `tryXsuaaAuth` then sees `req.xsuaaSessionAuth` set and returns the
+   verified principal — **no JWT revalidation against XSUAA keys on every
+   request** (which would otherwise be a network call per admin action).
+3. **Fallback**: if step 1 fails (HANA unreachable, session purged, cookie
+   expired), the legacy in-memory `_xsuaaBrowserSessions` map in
+   `server.js` is consulted as a defensive last-resort. This is only meant
+   to keep a single instance partially functional during a HANA outage;
+   it does NOT survive a CF restart, and it does NOT share sessions across
+   instances. See comments in `server.js#createXsuaaBrowserSession` for
+   the rationale.
+
+**Key rotation** (covered by `lib/core/auth.js#rotateSsoSessionKey`):
+- `SSO_SESSION_KEY_ID` is the active key id; rows are tagged with the
+  key id that encrypted them.
+- on rotation, the active key id changes; the previous key must remain
+  configured as `SSO_SESSION_ENCRYPTION_KEY_PREVIOUS` for the grace
+  window so legacy `xsuaa_session` cookies can still be decrypted.
+- the grace window is bounded by the cookie `Max-Age` (8h, same as the
+  admin token TTL).
+
+**Multi-instance**: the app is **functionally** multi-instance safe even
+at `instances: 1` in `manifest.yml`. Sessions are in shared storage, not
+in process memory. The `instances: 1` pin is a conservative capacity
+choice, not a hard requirement.
+
+**Related gotchas**:
+- `_xsuaaBrowserSessions` in `server.js` is **legacy fallback**, not the
+  primary store. See P2.2 in the latest QA review.
+- The `xsuaa_jwt` cookie is set by `lib/core/auth.js` for the **legacy**
+  XSUAA-bearer path (when BTP rewrites the `Authorization` header). It
+  is NOT the multi-instance-safe path. The opaque `xsuaa_session` cookie
+  is the canonical SSO session handle.
 
 ### Exam token
 

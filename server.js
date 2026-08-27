@@ -167,6 +167,16 @@ const PROCTOR_WINDOW = 60 * 1000;
 const CLIENT_ERROR_MAX = 30;
 const CLIENT_ERROR_WINDOW = 60 * 1000;
 const _questionSetCache = new Map();
+// LEGACY FALLBACK ONLY. The primary SSO session store is the
+// HANA-backed `ADMIN_SSO_SESSIONS_V3` table (see
+// `lib/core/auth.js#oauthCallbackHandler` + `sharedSessionMiddleware`).
+// This Map is consulted only when (a) the HANA shared-store path
+// didn't resolve the cookie (HANA outage, expired session, etc.)
+// or (b) the request landed on a path that didn't go through the
+// global middleware. It is per-process, per-instance, and does
+// NOT survive a CF restart. It is intentionally NOT the primary
+// store — see AGENTS.md "Opaque browser-session lifecycle" and
+// QA review P2.2 (2026-08-27).
 const _xsuaaBrowserSessions = new Map();
 const _runtimeState = {
   adminTokenNotBefore: 0,
@@ -615,6 +625,7 @@ function getClientIp(req) {
   return req.socket?.remoteAddress || 'unknown';
 }
 
+// LEGACY FALLBACK — see the comment on `_xsuaaBrowserSessions` above.
 function createXsuaaBrowserSession(token, expiresInSeconds) {
   const now = Date.now();
   for (const [id, session] of _xsuaaBrowserSessions) {
@@ -626,6 +637,10 @@ function createXsuaaBrowserSession(token, expiresInSeconds) {
   return { id, expiresAt };
 }
 
+// LEGACY FALLBACK — see the comment on `_xsuaaBrowserSessions` above.
+// In normal operation the global `sharedSessionMiddleware` sets
+// `req.xsuaaSessionAuth` from the HANA shared store; this Map is
+// only consulted as a last-resort when that path didn't resolve.
 function getXsuaaBrowserSession(id) {
   const session = _xsuaaBrowserSessions.get(String(id || ''));
   if (!session) return null;
