@@ -27,13 +27,13 @@ jobs:
         run: npm ci
 
       - name: Production dependency audit
-        run: npm audit --omit=dev --audit-level=high
+        run: npm run audit:prod
 
       - name: Unit and regression tests
         shell: bash
         run: |
           set -o pipefail
-          npm test 2>&1 | tee unit-test.log
+          npm run test:unit 2>&1 | tee unit-test.log
 
       - name: Upload unit diagnostics
         if: always()
@@ -50,26 +50,12 @@ jobs:
           set -euo pipefail
           node --check server.js
           node --check playwright.config.js
-          node --check scripts/migrate-runtime.mjs
-          node --check scripts/check-env.mjs
           while IFS= read -r -d '' f; do
             node --check "$f"
-          done < <(find lib client shared tests/e2e -type f \( -name '*.js' -o -name '*.cjs' \) -print0)
+          done < <(find lib client shared scripts tests/e2e -type f \( -name '*.js' -o -name '*.cjs' -o -name '*.mjs' \) -print0)
 
       - name: Repository secret scan
-        shell: bash
-        run: |
-          set -euo pipefail
-          PATTERNS_FILE=.githooks/secret-patterns.txt
-          COMBINED=$(grep -v -E '^\s*(#|$)' "$PATTERNS_FILE" | paste -sd '|' -)
-          [ -n "$COMBINED" ] || exit 0
-          HITS=$(git grep -n -E "$COMBINED" -- . ':!.githooks/*' ':!package-lock.json' || true)
-          HITS=$(printf '%s\n' "$HITS" | grep -v 'secretscan: ok' || true)
-          if [ -n "$HITS" ]; then
-            echo "Possible secret pattern(s) detected:"
-            printf '%s\n' "$HITS" | head -20
-            exit 1
-          fi
+        run: npm run scan:secrets
 
   browser-smoke:
     runs-on: ubuntu-latest
@@ -87,8 +73,10 @@ jobs:
       - name: Install app dependencies
         run: npm ci
 
-      - name: Install Playwright test runner without changing lockfile
-        run: npm install --no-save --package-lock=false @playwright/test@1.55.0
+      - name: Install pinned Playwright runner without changing lockfile
+        run: |
+          npm run test:e2e:setup
+          git diff --exit-code -- package.json package-lock.json
 
       - name: Install Chromium
         run: npx playwright install --with-deps chromium
@@ -97,7 +85,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          npx playwright test --config=playwright.config.js 2>&1 | tee playwright-test.log
+          npm run test:e2e 2>&1 | tee playwright-test.log
 
       - name: Upload browser diagnostics
         if: always()

@@ -5,12 +5,10 @@
 #   git config core.hooksPath .githooks
 #
 # What it does:
-#   1. Runs the full test suite (npm test). Blocks commit on any failure.
-#   2. Scans staged changes for accidental secret leaks. Blocks commit
-#      on hits. The patterns live in .githooks/secret-patterns.txt
-#      (one regex per line) and that file is excluded from the scan
-#      along with the rest of .githooks/ (so the patterns don't match
-#      themselves).
+#   1. Runs unit/regression tests.
+#   2. Syntax-checks application JavaScript.
+#   3. Scans staged added lines for accidental secret leaks using the same
+#      JavaScript-regex engine as CI, avoiding grep/awk regex dialect drift.
 #
 # To skip in an emergency: git commit --no-verify
 # To silence a false positive: add '# secretscan: ok' on the line.
@@ -30,78 +28,32 @@ say()  { printf '%b==>%b %s\n' "$YELLOW" "$NC" "$*"; }
 ok()   { printf '%b✓%b  %s\n' "$GREEN" "$NC" "$*"; }
 fail() { printf '%b✗%b  %s\n' "$RED" "$NC" "$*" >&2; }
 
-# ---------------------------------------------------------------------------
-# 1. Tests
-# ---------------------------------------------------------------------------
-
-say "Running test suite (npm test)..."
-if ! npm test --silent; then
+say "Running unit/regression suite..."
+if ! npm run test:unit --silent; then
   fail "Tests failed. Fix the failures above, or 'git commit --no-verify' to skip."
   exit 1
 fi
-ok "All tests pass."
+ok "Unit/regression tests pass."
 
-# Client modules: syntax-only check (no execution, browser-only APIs).
-say "Syntax-checking client modules..."
+say "Syntax-checking application modules..."
 SYNTAX_FAILED=0
-for f in server.js client/*.js shared/*.js; do
-  if ! node --check "$f" 2>/dev/null; then
+while IFS= read -r -d '' f; do
+  if ! node --check "$f" >/dev/null 2>&1; then
     fail "Syntax error in $f"
     node --check "$f" 2>&1 | sed 's/^/    /'
     SYNTAX_FAILED=1
   fi
-done
+done < <(find server.js lib client shared scripts tests/e2e -type f \( -name '*.js' -o -name '*.cjs' -o -name '*.mjs' \) -print0 2>/dev/null)
 if [ "$SYNTAX_FAILED" -ne 0 ]; then
   fail "Fix the syntax errors above before committing."
   exit 1
 fi
-ok "All JS files parse cleanly."
+ok "All JavaScript parses cleanly."
 
-# ---------------------------------------------------------------------------
-# 2. Secret scan over staged diff (added lines only).
-# ---------------------------------------------------------------------------
-
-PATTERNS_FILE="$REPO_ROOT/.githooks/secret-patterns.txt"
-if [ ! -f "$PATTERNS_FILE" ]; then
-  fail "Secret patterns file missing: $PATTERNS_FILE"
-  exit 1
-fi
-
-# Build a single combined regex (alternation) from non-comment lines.
-COMBINED=$(grep -v -E '^\s*(#|$)' "$PATTERNS_FILE" | paste -sd '|' -)
-if [ -z "$COMBINED" ]; then
-  ok "No patterns defined; skipping secret scan."
-  exit 0
-fi
-
-# Staged diff with no context. We use awk to track which file each
-# '+' line belongs to (from the '+++ b/<path>' header), and emit
-# only added lines that are NOT from a file under .githooks/.
-HITS=$(git diff --cached --no-color -U0 \
-  | awk -v combined="$COMBINED" '
-      /^\+\+\+ b\// {
-        current = substr($0, 7)
-        sub(/\r$/, "", current)
-        next
-      }
-      /^\+\+\+ /     { current = ""; next }   # /dev/null header
-      /^\+[^+]/      {
-        if (current ~ /^\.githooks\//) next   # skip the patterns file + this script
-        # Allow a line-level opt-out marker.
-        if ($0 ~ /secretscan: ok/) next
-        line = substr($0, 2)
-        if (match(line, combined)) {
-          printf("  %s:%s\n", current, line)
-        }
-      }
-  ' | head -20)
-
-if [ -n "$HITS" ]; then
-  fail "Possible secret(s) in staged changes:"
-  printf '%s\n' "$HITS" >&2
-  echo "" >&2
-  fail "If this is a false positive, add '# secretscan: ok' on the line and re-stage."
-  fail "Otherwise, scrub the secret, rotate it (it is now in git history), and try again."
+say "Scanning staged changes for secrets..."
+if ! npm run scan:secrets:staged --silent; then
+  fail "Possible secret(s) detected in staged changes."
+  fail "If a match is intentionally harmless, add '# secretscan: ok' on that line and re-stage."
   exit 1
 fi
 ok "No secret patterns detected."
