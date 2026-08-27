@@ -51,6 +51,22 @@
     doc.querySelectorAll('.nav-help,.sel-count').forEach((el) => { el.style.color = '#56627a'; });
   }
 
+  function hardenAccessCodeInput(doc = root.document) {
+    const el = doc?.getElementById?.('code-inp');
+    if (!el) return;
+    // This handler used to be emitted as an inline oninput attribute. The
+    // strict CSP correctly blocked that runtime-generated handler, producing a
+    // noisy console error and making normalization browser-dependent. Replace
+    // it with a normal event listener instead of weakening script-src-attr.
+    if (el.hasAttribute('oninput')) el.removeAttribute('oninput');
+    if (el.dataset.accessNormalizerBound === '1') return;
+    el.dataset.accessNormalizerBound = '1';
+    el.addEventListener('input', () => {
+      const normalized = String(el.value || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
+      if (el.value !== normalized) el.value = normalized;
+    });
+  }
+
   function rememberRequirement() {
     const S = root.S;
     const policy = root.IE?.selectionPolicy;
@@ -72,9 +88,6 @@
     const selectedCount = policy.uniqueSelection(answer).length;
     const required = policy.requiredSelections(q);
     doc.querySelectorAll('.sel-count').forEach((el) => {
-      // MutationObserver watches child-list changes. Rewriting the same text on
-      // every callback creates a self-sustaining mutation loop and can freeze
-      // the browser main thread. Only mutate DOM when the value truly changed.
       if (el.textContent !== label) el.textContent = label;
       el.style.fontWeight = '700';
       el.style.color = selectedCount === required ? '#1f5f2c' : '#8a5b00';
@@ -163,9 +176,11 @@
     if (installed) return;
     installed = true;
     patchExamActions();
+    hardenAccessCodeInput();
     if (root.document?.documentElement && typeof MutationObserver !== 'undefined') {
       observer = new MutationObserver(() => {
         patchExamActions();
+        hardenAccessCodeInput();
         updateSelectionUi();
       });
       observer.observe(root.document.documentElement, { childList: true, subtree: true });
@@ -179,5 +194,5 @@
     installed = false;
   }
 
-  return { fallbackStatusChip, luminance, contrastRatio, applyAccessibleContrast, ensureAdminStatusChip, install, stop };
+  return { fallbackStatusChip, luminance, contrastRatio, applyAccessibleContrast, hardenAccessCodeInput, ensureAdminStatusChip, install, stop };
 });
