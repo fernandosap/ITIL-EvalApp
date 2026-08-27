@@ -21,6 +21,10 @@
     const explicit = Number(question.requiredSelections);
     if (Number.isInteger(explicit) && explicit > 0) return explicit;
     if (!question.multi) return 1;
+    // Persisted server questions expose their answer key internally as
+    // `answer`; upload/validation helpers use `correctIndices`. Either one is
+    // authoritative for cardinality, but neither is ever sent to the browser.
+    if (Array.isArray(question.answer) && question.answer.length > 0) return question.answer.length;
     if (Array.isArray(question.correctIndices) && question.correctIndices.length > 0) return question.correctIndices.length;
     return noteCount(question.note) || 2;
   }
