@@ -122,7 +122,8 @@
       const incomplete = [];
       for (let i = 0; i < Number(S?.total || 0); i += 1) {
         const answer = Array.isArray(S.answers?.[i]) ? S.answers[i] : [];
-        const required = Number(requirements[i] || (i === S.currentQ && S.currentQCache ? policy.requiredSelections(S.currentQCache) : 1));
+        const knownRequired = requirements[i] || (i === S.currentQ && S.currentQCache ? policy.requiredSelections(S.currentQCache) : null);
+        const required = Number(knownRequired || (answer.length > 0 ? policy.uniqueSelection(answer).length : 1));
         if (policy.uniqueSelection(answer).length !== required) incomplete.push(i + 1);
       }
       if (incomplete.length) {
@@ -151,9 +152,6 @@
     root.IE.exam = root.IE.exam || {};
     if (typeof root.IE.exam.statusChip === 'function') return true;
     root.IE.exam.statusChip = fallbackStatusChip;
-    // admin-codes captures statusChip at module load. Reload it once after
-    // installing the fallback so a partial/stale exam module can never blank
-    // the dashboard with "statusChip is not a function".
     await loadScript(`/client/admin-codes.js?dependency-repair=${Date.now()}`);
     return typeof root.IE?.admin?.showAdmin === 'function';
   }
