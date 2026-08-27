@@ -50,6 +50,41 @@ test('candidate can start a non-proctored exam and render the first question', a
   await expect(page.locator('.option')).toHaveCount(3);
 });
 
+test('multi-select enforces the exact selection cap and shows required count', async ({ page }) => {
+  await startExam(page);
+  await page.locator('.option').nth(0).click();
+  await page.getByRole('button', { name: /Next/ }).click();
+  await expect(page.locator('.q-stem')).toContainText('Select the two practices');
+  await expect(page.locator('[data-selection-requirement]')).toContainText('Select exactly 2');
+
+  await page.locator('.option').nth(0).click();
+  await page.locator('.option').nth(1).click();
+  await expect(page.locator('.sel-count')).toContainText('2/2 selected');
+  await page.locator('.option').nth(2).click();
+  await expect(page.locator('#m-title')).toHaveText('Selection limit reached');
+  await expect(page.locator('.option.selected')).toHaveCount(2);
+});
+
+test('exam question and option text meet practical AA contrast threshold', async ({ page }) => {
+  await startExam(page);
+  const ratios = await page.evaluate(() => {
+    function rgbToLum(rgb) {
+      const m = rgb.match(/\d+/g).slice(0, 3).map(Number).map((v) => v / 255)
+        .map((v) => v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4));
+      return 0.2126 * m[0] + 0.7152 * m[1] + 0.0722 * m[2];
+    }
+    function ratio(el) {
+      const cs = getComputedStyle(el);
+      const fg = rgbToLum(cs.color);
+      const bg = rgbToLum(cs.backgroundColor === 'rgba(0, 0, 0, 0)' ? 'rgb(255,255,255)' : cs.backgroundColor);
+      return (Math.max(fg, bg) + 0.05) / (Math.min(fg, bg) + 0.05);
+    }
+    return { stem: ratio(document.querySelector('.q-stem')), option: ratio(document.querySelector('.option')) };
+  });
+  expect(ratios.stem).toBeGreaterThanOrEqual(4.5);
+  expect(ratios.option).toBeGreaterThanOrEqual(4.5);
+});
+
 test('candidate can navigate, answer all questions and submit', async ({ page }) => {
   await startExam(page);
 
