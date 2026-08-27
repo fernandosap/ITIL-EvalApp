@@ -177,7 +177,7 @@ Unique index: `UX_QITEMS_SET_QINDEX` on `QUESTION_SET_QUESTIONS(QUESTION_SET_ID,
 - `GET /api/admin/auth-methods` — public; returns `{ password, xsuaa: { enabled, authorizeUrl, xsappname } }`
 - `GET /api/admin/me` — auth; returns `{ ok, role, sub, authMethod }` (used by SPA to bootstrap from cookie)
 - `GET /oauth/login` — public; 302 to XSUAA authorize URL, sets `xsuaa_state` cookie
-- `GET /oauth/callback` — public; exchanges code, sets `xsuaa_jwt` cookie, 302s to `/?auth=ok`
+- `GET /oauth/callback` — public; exchanges code, persists the encrypted JWT server-side in HANA, sets opaque `xsuaa_session`, 302s to `/?admin=1&auth=ok`
 - `GET /api/admin/system-status`, `/metrics`, `/notifications`, `/audit`, `/audit/export.json`
 - `GET /api/admin/codes` (paginated codes + joins)
 - `POST /api/admin/generate` (create codes), `POST /api/admin/reset`, `POST /api/admin/note`
@@ -211,67 +211,60 @@ fallback when XSUAA is not bound.
 ### XSUAA / OAuth 2.0 path (BTP)
 
 - **Service instance**: `itil-evalapp-xsuaa` (plan `application`), bound to the app. Config in `xs-security.json` declares 4 scopes (`$XSAPPNAME.{admin,manager,reviewer,content_editor}`).
-- **Browser flow**: SPA calls `GET /api/admin/auth-methods` → if XSUAA is bound, shows a "Sign in with SAP" button. Clicking it navigates to `GET /oauth/login` → 302 to `https://<xsuaa>/oauth/authorize?response_type=code&client_id=...&redirect_uri=...&state=<rand>`. The user authenticates at SAP, which redirects to `GET /oauth/callback?code=...&state=...`. The server validates state (cookie `xsuaa_state`, httpOnly, 10 min), exchanges the code for an access token at `https://<xsuaa>/oauth/token` (HTTP Basic auth with clientid:clientsecret), sets the JWT in cookie `xsuaa_jwt` (httpOnly, SameSite=Lax, Secure, Max-Age = `expires_in`), and 302s to `/?auth=ok`.
+- **Browser flow**: SPA calls `GET /api/admin/auth-methods` → if XSUAA is bound, shows a "Sign in with SAP" button. Clicking it navigates to `GET /oauth/login` → 302 to XSUAA authorize. SAP redirects to `GET /oauth/callback?code=...&state=...`; the server validates the `xsuaa_state` cookie, exchanges the code for an access token, verifies that the token maps to an authorized app role, encrypts the JWT with AES-256-GCM into HANA, sets an opaque `xsuaa_session` cookie (`HttpOnly`, `SameSite=Lax`, `Secure` on HTTPS, `Max-Age` from XSUAA `expires_in` with a 1h default), and redirects to `/?admin=1&auth=ok`.
 - **API clients**: send `Authorization: Bearer <jwt>` directly (RS256, signed by XSUAA's verification key).
-- **JWT validation** (`shared/xsuaa.js` `verifyXsuaaJwt`): manual RS256 verification using the verification key from `VCAP_SERVICES.xsuaa[0].credentials.verificationkey`. Validates `alg=RS256`, signature, `exp`, `nbf`, `aud == xsappname` (or `*`).
-- **Role mapping**: highest-priority scope wins. `admin` > `manager` > `reviewer` > `content_editor`.
-- **Logout**: `POST /api/admin/logout` clears `xsuaa_session` (and the legacy `xsuaa_jwt` cookie when present). It does NOT invalidate the IdP session (XSUAA session is separate and would need `/oauth/logout` against XSUAA — not implemented; not needed for this app).
-- **No `@sap/xssec` dependency** — manual JWT verification keeps the dep tree small (~140 LOC in `shared/xsuaa.js`).
+- **JWT validation** (`shared/xsuaa.js`): manual RS256 verification using the verification key from the XSUAA binding. Validates `alg=RS256`, signature, `exp`, `nbf`, audience, and issuer when the binding URL is available.
+- **Role mapping**: highest-priority recognized app scope wins. `admin` > `manager` > `reviewer` > `content_editor`.
+- **Logout**: `POST /api/admin/logout` clears `xsuaa_session` (and the legacy `xsuaa_jwt` cookie when present). It does NOT invalidate the IdP session.
+- **No `@sap/xssec` dependency** — manual JWT verification is retained intentionally; see the investigation later in this document.
 
-### Opaque browser-session lifecycle (multi-instance safe)
+### Opaque browser-session lifecycle
 
-The OAuth browser flow (`/oauth/callback` → `lib/core/auth.js#oauthCallbackHandler`)
-authenticates the XSUAA JWT, then stores the **verified principal** (subject +
-role + email) in the HANA-backed `ADMIN_SSO_SESSIONS_V3` table and returns
-only an opaque `xsuaa_session` cookie to the browser. The browser cookie
-holds a random session ID, not the JWT — so cookie-size limits are not a
-concern, and the JWT never reaches the client.
+The canonical browser SSO path is implemented by `lib/core/auth.js` and installed by
+`lib/bootstrap.js`. `/oauth/callback` is migrated to `auth.oauthCallbackHandler` before
+the production app starts listening.
 
-**Storage** (`ADMIN_SSO_SESSIONS_V3`):
-- row key = the opaque `xsuaa_session` value
-- columns: `SUBJECT`, `ROLE`, `EMAIL`, `AUTH_METHOD`, `CREATED_AT`,
-  `LAST_SEEN_AT`, `EXPIRES_AT`, plus an `ENCRYPTED_PRINCIPAL` blob holding
-  the full JWT for downstream API calls
-- encryption: AES-256-GCM with a 12-byte random IV per row
-- the encryption key is read from `SSO_SESSION_ENCRYPTION_KEY` (must be
-  ≥32 chars; rotate via `SSO_SESSION_KEY_ID`)
+**Storage (`ADMIN_SSO_SESSIONS_V3`)**:
+- primary key: `SESSION_ID`, the opaque `xsuaa_session` value
+- columns: `SESSION_ID`, `KEY_ID`, `TOKEN_CIPHERTEXT`, `TOKEN_IV`, `TOKEN_TAG`,
+  `SUBJECT`, `ROLE_NAME`, `ISSUED_AT_MS`, `EXPIRES_AT_MS`, `CREATED_AT`, `LAST_SEEN_AT`
+- the complete XSUAA access token is encrypted at rest with AES-256-GCM using a
+  random 12-byte IV and authentication tag; there are no `EMAIL`, `AUTH_METHOD`,
+  or `ENCRYPTED_PRINCIPAL` columns in V3
 
-**Read path** (`tryXsuaaAuth`):
-1. global `sharedSessionMiddleware` (installed by `lib/bootstrap.js#installGlobalMiddleware`)
-   reads the cookie, fetches + decrypts the row from HANA, and sets
-   `req.xsuaaSessionAuth = { sub, role, email, jwt }`.
-2. `tryXsuaaAuth` then sees `req.xsuaaSessionAuth` set and returns the
-   verified principal — **no JWT revalidation against XSUAA keys on every
-   request** (which would otherwise be a network call per admin action).
-3. **Fallback**: if step 1 fails (HANA unreachable, session purged, cookie
-   expired), the legacy in-memory `_xsuaaBrowserSessions` map in
-   `server.js` is consulted as a defensive last-resort. This is only meant
-   to keep a single instance partially functional during a HANA outage;
-   it does NOT survive a CF restart, and it does NOT share sessions across
-   instances. See comments in `server.js#createXsuaaBrowserSession` for
-   the rationale.
+**Read path**:
+1. `auth.sharedSessionMiddleware` reads `xsuaa_session`, loads/decrypts the HANA row,
+   and sets `req.xsuaaSessionAuth = { token, role, sub, issuedAt, expiresAt }`.
+2. The middleware also hydrates `req.headers.authorization = Bearer <token>` when it
+   restored a session, so existing admin auth middleware can use the verified token.
+3. `tryXsuaaAuth` honors `req.xsuaaSessionAuth` directly before the legacy paths.
 
-**Key rotation** (covered by `lib/core/auth.js#rotateSsoSessionKey`):
-- `SSO_SESSION_KEY_ID` is the active key id; rows are tagged with the
-  key id that encrypted them.
-- on rotation, the active key id changes; the previous key must remain
-  configured as `SSO_SESSION_ENCRYPTION_KEY_PREVIOUS` for the grace
-  window so legacy `xsuaa_session` cookies can still be decrypted.
-- the grace window is bounded by the cookie `Max-Age` (8h, same as the
-  admin token TTL).
+**Key configuration and rotation**:
+- active pair: `SSO_SESSION_KEY_ID` + `SSO_SESSION_ENCRYPTION_KEY`
+- optional previous pair during a rotation: `SSO_SESSION_PREVIOUS_KEY_ID` +
+  `SSO_SESSION_PREVIOUS_KEY`
+- IDs must be distinct and keys must be at least 32 bytes/chars of secret material;
+  `sessionKeyRing()` validates the pairs at startup when XSUAA is bound
+- rows carry the `KEY_ID` used to encrypt them, so `readSession()` can decrypt with
+  either the current or configured previous key
+- there is **no** `rotateSsoSessionKey()` function and no
+  `SSO_SESSION_ENCRYPTION_KEY_PREVIOUS` environment variable
+- the compatibility window is bounded by the remaining XSUAA token/session lifetime;
+  the cookie `Max-Age` follows XSUAA `expires_in` (default 3600 seconds), not the 8h
+  TTL of the separate legacy `X-Admin-Token` path
 
-**Multi-instance**: the app is **functionally** multi-instance safe even
-at `instances: 1` in `manifest.yml`. Sessions are in shared storage, not
-in process memory. The `instances: 1` pin is a conservative capacity
-choice, not a hard requirement.
+**Legacy in-memory map**:
+`server.js` still contains `_xsuaaBrowserSessions` plus its legacy helper functions,
+but the production bootstrap replaces the legacy `/oauth/callback` with the HANA-backed
+handler before listen. Normal new SSO logins therefore do **not** populate that Map.
+Treat it as transitional compatibility code, not an availability or HANA-outage
+failover mechanism, not authoritative session storage, and not a multi-instance store.
 
-**Related gotchas**:
-- `_xsuaaBrowserSessions` in `server.js` is **legacy fallback**, not the
-  primary store. See P2.2 in the latest QA review.
-- The `xsuaa_jwt` cookie is set by `lib/core/auth.js` for the **legacy**
-  XSUAA-bearer path (when BTP rewrites the `Authorization` header). It
-  is NOT the multi-instance-safe path. The opaque `xsuaa_session` cookie
-  is the canonical SSO session handle.
+**Multi-instance scope**:
+The HANA-backed SSO session path itself is compatible with multiple app instances because
+session state is shared. Do not infer that the entire application is automatically
+multi-instance-safe: other process-local state such as `_questionSetCache` has separate
+consistency considerations. `instances: 1` remains a conservative deployment choice.
 
 ### Exam token
 
@@ -289,12 +282,14 @@ choice, not a hard requirement.
 | `HANA_HOST`, `HANA_PORT`, `HANA_USER`, `HANA_PASSWORD`, `HANA_SCHEMA` | ✅ | Prod schema is `ITIL_EXAM`. |
 | `HANA_ENCRYPT` | optional | `true` by default |
 | `HANA_SSL_VALIDATE_CERTIFICATE` | optional | **`true` is the default** (and what we run in BTP). The HANA Cloud cert is signed by DigiCert G5 which is in the Node.js default trust store, so no custom `sslTrustStore` is needed. Set to `false` only as a last-resort workaround for a misconfigured CA. |
-| `ADMIN_HASH`, `MANAGER_HASH`, `REVIEWER_HASH`, `CONTENT_EDITOR_HASH` | optional | 64-char SHA-256 hex of role password. If absent, that role's login is disabled. |
+| `ADMIN_HASH`, `MANAGER_HASH`, `REVIEWER_HASH`, `CONTENT_EDITOR_HASH` | optional | 64-char SHA-256 hex of role password. If absent, that role's legacy password login is disabled; SAP SSO/RBAC is unaffected. |
 | `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `ANTHROPIC_VERSION` | optional | If absent, proctor endpoint returns `{ enabled: false }` |
 | `EXAM_NAME`, `EXAM_DURATION_SECS`, `EXAM_PASS_PCT`, `EXAM_ACTIVE`, `PROCTOR_ENABLED` | optional | Defaults: 45min, 80%, true, true |
 | `STALE_SESSION_MINUTES` | optional | Default 30. Used by sweeper and admin status. |
 | `AUTO_CLEAR_STALE_SESSIONS`, `STALE_SESSION_SWEEP_MINUTES` | optional | Default true / 10 |
 | `HANA_POOL_SIZE`, `HANA_POOL_PING_CHECK`, `HANA_POOL_TTL_SECONDS` | optional | Defaults 0 / true / 300. When `HANA_POOL_SIZE > 0`, `withDb` uses a pool. See gotcha #3. |
+| `SSO_SESSION_KEY_ID`, `SSO_SESSION_ENCRYPTION_KEY` | required when XSUAA browser SSO is enabled | Active AES-256-GCM key id + secret for HANA-backed opaque browser sessions. Secret must be at least 32 chars. |
+| `SSO_SESSION_PREVIOUS_KEY_ID`, `SSO_SESSION_PREVIOUS_KEY` | optional | Previous SSO session key pair retained temporarily during key rotation so rows encrypted under the previous `KEY_ID` can still be read. |
 | `RESULT_SIGNING_KEY_ID` | recommended (with `RESULT_SIGNING_KEY`) | Stable identifier for the active signing key (e.g. `"v2"`, `"prod-2026-08"`). 1-64 chars. The value of this env var is what shows up in the `kid` field of every new signed envelope. **Do not change it during a rotation** — pick a new value for the new key instead. |
 | `RESULT_SIGNING_KEY` | recommended | 32+ char secret for the active signing key. When set with `RESULT_SIGNING_KEY_ID`, new envelopes use that kid. When unset, falls back to the legacy derived secret (logs a warning). |
 | `RESULT_SIGNING_KEY_PREVIOUS_ID` | optional | Stable identifier for the previous signing key during rotation. Must keep the SAME value the previous deployment used for that key. |
@@ -378,7 +373,7 @@ Reads HANA vars from `.env` or `--env-file`. Sets `APP_REVISION` from `git rev-p
 
     **(C) `Retry-After` header on `/api/client-errors` 204**. When the client-error telemetry endpoint rate-limits a request, the 204 response now includes `Retry-After: <window-in-seconds>`. This lets a well-behaved browser / service worker retry on schedule instead of hammering the endpoint. The endpoint still returns 204 (not 429) so the failure mode stays invisible to the candidate.
 
-    **CSRF analysis re-verified 2026-08-20** (see "CSRF analysis" section above): the new CSP `connect-src 'self'` + `frame-ancestors 'none'` actually shrinks the residual CSRF surface further. No CSRF tokens were added because the existing SameSite=Lax + header-based tokens + no-CORS-policy was already correct; adding a token would be security theater, not defense.
+    **CSRF analysis re-verified 2026-08-20** (see "CSRF analysis" section below): the CSP `connect-src 'self'` + `frame-ancestors 'none'` shrinks the residual attack surface. The XSUAA browser path is cookie-based, but the opaque cookie is `SameSite=Lax`; legacy admin and exam tokens remain header-based. Do not describe the application as having no cookie-based auth.
 
     Tests: `tests/security-headers.test.js` (10 tests for header values), `tests/admin-write-rate.test.js` (6 tests for rate limit behavior + Retry-After + shared bucket + per-IP isolation), and an updated assertion in `tests/client-errors.test.js` for the Retry-After header on the 204 path.
 
@@ -537,7 +532,7 @@ question set versioning, audit log, and the proctoring endpoint.
 **BTP env vars confirmed after deploy:**
 - HANA: `ITIL_EXAM_ADMIN` (password in BTP credential store, **not committed**)
 - `ADMIN_HASH`, `MANAGER_HASH` set
-- `REVIEWER_HASH`, `CONTENT_EDITOR_HASH` not set (login disabled for those roles)
+- `REVIEWER_HASH`, `CONTENT_EDITOR_HASH` not set (legacy password login disabled for those roles; SAP SSO/RBAC is unaffected)
 - `STARTUP_STRICT=true`, `AUTO_CLEAR_STALE_SESSIONS=true`, `STALE_SESSION_SWEEP_MINUTES=10` (new in this deploy)
 
 > **Note**: an earlier version of this section (commit `b06518d`) included the
@@ -608,16 +603,15 @@ when the corresponding env var is empty. This is what runs in local dev
 
 The BTP XSUAA service `itil-evalapp-xsuaa` is bound to the app. The
 config in `xs-security.json` declares 4 scopes
-(`$XSAPPNAME.admin`, `.manager`, `.reviewer`, `.content_editor`) and a
-role template that puts those scopes into the access token. Admin
-endpoints accept a Bearer token (Authorization: Bearer <jwt>); the
-server validates against the XSUAA `verificationkey` from
-`VCAP_SERVICES` and maps the granted scopes to the internal role.
+(`$XSAPPNAME.admin`, `.manager`, `.reviewer`, `.content_editor`) and
+separate role templates that grant the matching scope. API callers may
+send a Bearer token directly; browser OAuth stores the verified token
+encrypted in HANA and authenticates subsequent requests through the
+opaque `xsuaa_session` cookie restored by shared middleware.
 
-The two mechanisms coexist: if `process.env.VCAP_SERVICES` contains an
-xsuaa binding, the server uses Bearer auth; otherwise it falls back to
-the SHA-256 hash. This means local dev (no XSUAA bound) keeps working
-without any extra config.
+The two mechanisms coexist: XSUAA is preferred when bound, while the
+SHA-256 hash path remains available for local dev/break-glass roles that
+have the corresponding hash configured.
 
 ## CSRF analysis
 
@@ -626,28 +620,19 @@ browser holds a session cookie or storage state for our app. The
 attacker tricks the victim's browser into issuing a state-changing
 request (POST/DELETE/PUT) to our origin, with the victim's auth attached.
 
-**Why this app is mostly not vulnerable**:
+**Relevant auth behavior**:
 
-1. **No cookie-based auth on the candidate or admin side.** Both auth
-   mechanisms (SHA-256 token, XSUAA JWT) are sent in **headers** that
-   the attacker cannot set from a cross-origin page:
-   - `X-Admin-Token: <base64url>` — set as a custom header, not
-     auto-attached by the browser.
-   - `Authorization: Bearer <jwt>` — same.
-   - `X-Exam-Token: <base64url>` — same.
-   Browsers DO NOT send custom headers cross-origin without an explicit
-   CORS preflight, and a `evil.com` script cannot trigger that preflight
-   (no `Content-Type: application/json` would force it; even if it did,
-   the server's CORS policy would reject it).
+1. **Candidate and legacy admin tokens are header-based.** `X-Exam-Token` and
+   `X-Admin-Token` are custom headers and are not automatically attached by a
+   browser to a cross-origin request. Direct API XSUAA clients likewise use
+   `Authorization: Bearer <jwt>`.
 
-2. **`xsuaa_jwt` cookie** is the one token that IS auto-attached. It
-   is set with `SameSite=Lax; HttpOnly; Secure`. Lax means it is
-   **not** sent on cross-site sub-requests (XHR / fetch / form POSTs
-   from another origin), only on top-level navigations (the user
-   typing the URL, following a link, or hitting back). A `evil.com`
-   `<form action="https://academycd-evalapp.../api/admin/codes" method="POST">`
-   would NOT include the `xsuaa_jwt` cookie because Lax blocks cookies
-   on cross-site POSTs. So even the cookie-based path is safe.
+2. **Browser XSUAA auth is cookie-based.** The canonical browser cookie is the
+   opaque `xsuaa_session` handle, not the JWT itself. It is set with
+   `HttpOnly; SameSite=Lax` and `Secure` on HTTPS. SameSite=Lax prevents the
+   cookie from being sent on ordinary cross-site XHR/fetch and cross-site form
+   POSTs. A legacy `xsuaa_jwt` cookie may still be cleared/read for backwards
+   compatibility, but it is not the canonical shared-session path.
 
 3. **No GET-as-state-change endpoints.** Every state-changing endpoint
    requires POST / DELETE / PUT. Express routes are explicit per
@@ -655,43 +640,30 @@ request (POST/DELETE/PUT) to our origin, with the victim's auth attached.
 
 4. **CORS is not configured for cross-origin admin access.** A
    `evil.com` script doing `fetch('https://academycd-evalapp.../api/admin/...')`
-   would have to handle CORS preflight (`OPTIONS`), and the server
-   doesn't reply with permissive `Access-Control-Allow-Origin` for any
-   non-self origin. So even with the cookie, the attacker cannot read
-   the response.
+   cannot obtain permissive cross-origin access from this server.
 
-5. **Rate limits + audit** mean a successful CSRF would be visible in
-   `ADMIN_AUDIT_LOG` within seconds. The IP-keyed login rate limit
-   stops brute-force auth attempts; the new hash-keyed limit stops
-   password-spray across IPs.
+5. **Rate limits + audit** improve detection and blast-radius control for
+   admin mutations; they are defense in depth rather than the primary CSRF
+   boundary.
 
 **What an attacker CAN do**:
 
-- Force a top-level navigation (the Lax exception). E.g.
-  `<a href="https://academycd-evalapp.../api/admin/codes/ABC123/reset">`
-  via a phishing link. The server will not reset anything because
-  `POST /api/admin/codes/:code/reset` requires a POST — a GET
-  navigation just hits the SPA shell.
-- Read the SPA shell HTML (no auth) and link the user to the public
-  landing. Already public, no information disclosure.
-- Phish the admin's password via a fake login page that submits to
-  `evil.com`. This is the standard phishing threat, not a CSRF
-  bypass. Mitigations: bind XSUAA so admins never see a password
-  prompt; ensure the password page is served over HTTPS with HSTS
-  (CF router sets HSTS by default).
+- Force a top-level navigation (the Lax exception). A GET navigation to a
+  state-changing-looking URL does not mutate because the actual mutation
+  endpoints require POST/PUT/DELETE.
+- Read the public SPA shell HTML and link a user to the public landing.
+- Phish credentials. This is a phishing threat, not a CSRF bypass; XSUAA
+  reduces reliance on shared role passwords for normal admin access.
 
-**Conclusion**: the CSRF attack surface is minimal. No mitigation
-needed beyond the existing SameSite=Lax + header-based tokens + CORS
-defaults. **Do not** add CSRF tokens unless the auth model changes
-(e.g. switching to cookie-based sessions with `SameSite=None` for
-cross-origin SSO, or adding a webhook-style endpoint callable from
-another origin).
+**Conclusion**: under the current same-origin design, CSRF risk is constrained by
+SameSite=Lax on the browser SSO cookie, header-based candidate/legacy tokens,
+method-safe routes, and the absence of permissive cross-origin access. Re-evaluate
+and add an explicit CSRF token if the cookie policy changes (for example
+`SameSite=None`) or if cross-origin authenticated integrations are introduced.
 
-**Re-verified 2026-08-20**: confirmed after the security-headers
-hardening pass (commit `2c7a961`/later). The new CSP `connect-src 'self'`
-plus `frame-ancestors 'none'` actually shrinks the residual attack
-surface further: an XSS payload could not exfiltrate to a third party
-or iframe the app for clickjacking. The analysis above still holds.
+**Re-verified 2026-08-27** against the HANA-backed `xsuaa_session` flow. The CSP
+`connect-src 'self'` plus `frame-ancestors 'none'` further limits exfiltration and
+clickjacking but is not a substitute for the SameSite/method controls above.
 
 ## Open items / TODO
 
@@ -711,7 +683,7 @@ or iframe the app for clickjacking. The analysis above still holds.
 - [x] `/api/admin/me` as canonical for client role lookup → cookie-based XSUAA flow + reviewers (no `codes:read`) both work.
 - [x] "Sign in with SAP" loading state (spinner during 302 to IdP) → prevents double-click that races the OAuth flow.
 - [x] Inactivity banner on candidate landing → shows exam duration + pass mark + "Session secure" indicator.
-- [x] CSRF analysis writeup → minimal attack surface (header-based tokens, SameSite=Lax, no CORS, no GET-as-state-change).
+- [x] CSRF analysis writeup → current browser SSO cookie + header-based token model documented above.
 - [x] `__el__` sentinel in event delegation → allows the XSUAA login button to pass its own element to `startXsuaaLogin(el)` for in-place spinner swap.
 - [ ] Sweeper end-to-end test (real HANA stale session cleared by sweeper) — deferred to next session, requires CI infra.
 - [ ] JSDOM-light tests for client renderers (`renderQ`, `showAdmin`, `showResultsFromRecord`) — deferred, no test deps added.
