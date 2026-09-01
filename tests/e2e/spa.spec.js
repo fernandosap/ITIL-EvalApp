@@ -23,7 +23,9 @@ async function loginAdmin(page) {
 }
 
 function adminRoster(page) {
-  return page.getByRole('columnheader', { name: 'Code', exact: true }).locator('xpath=ancestor::table');
+  return page.locator('select[data-args="archive,__value__"]')
+    .locator('xpath=ancestor::div[contains(concat(" ", normalize-space(@class), " "), " card ")][1]')
+    .locator('table.admin-table');
 }
 
 test('candidate landing renders access-code entry instead of a blank screen', async ({ page }) => {
