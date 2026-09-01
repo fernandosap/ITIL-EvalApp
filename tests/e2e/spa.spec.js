@@ -22,6 +22,10 @@ async function loginAdmin(page) {
   await expect(page.locator('.admin-page-title')).toHaveText('Admin Console');
 }
 
+function adminRoster(page) {
+  return page.getByRole('columnheader', { name: 'Code', exact: true }).locator('xpath=ancestor::table');
+}
+
 test('candidate landing renders access-code entry instead of a blank screen', async ({ page }) => {
   await page.goto('/');
   await expect(page.locator('#code-inp')).toBeVisible();
@@ -178,11 +182,13 @@ test('admin route falls back to configured login when no SSO cookie exists', asy
 test('admin dashboard compacts status, limits notifications and moves audit activity below roster', async ({ page }) => {
   await loginAdmin(page);
   await expect(page.getByText('Technical details', { exact: true })).toBeVisible();
-  const notificationsCard = page.locator('.card').filter({ hasText: /^Notifications/ }).first();
-  await expect(notificationsCard.getByRole('button', { name: 'Show 2 more' })).toBeVisible();
+  const notificationToggle = page.locator('[data-admin-notification-toggle]');
+  await expect(notificationToggle).toHaveText('Show 2 more');
+  await expect(notificationToggle).toBeVisible();
+  const notificationsCard = notificationToggle.locator('xpath=../..');
   const visibleBefore = await notificationsCard.locator(':scope > div:nth-child(2) > div:not([hidden])').count();
   expect(visibleBefore).toBe(3);
-  await notificationsCard.getByRole('button', { name: 'Show 2 more' }).click();
+  await notificationToggle.click();
   const visibleAfter = await notificationsCard.locator(':scope > div:nth-child(2) > div:not([hidden])').count();
   expect(visibleAfter).toBe(5);
 
@@ -196,7 +202,9 @@ test('admin dashboard compacts status, limits notifications and moves audit acti
 
 test('admin roster filters by seat and preserves the historical exam set after default changes', async ({ page }) => {
   await loginAdmin(page);
-  const historicRow = page.locator('tbody tr').filter({ hasText: 'ADM202' });
+  const roster = adminRoster(page);
+  const historicRow = roster.locator('tbody tr').filter({ hasText: 'ADM202' });
+  await expect(historicRow).toHaveCount(1);
   await expect(historicRow).toContainText('Historic Exam');
   await expect(historicRow).toContainText('Version 2');
   const examCellText = await historicRow.locator('td').nth(3).innerText();
@@ -206,27 +214,30 @@ test('admin roster filters by seat and preserves the historical exam set after d
   await page.getByPlaceholder('Seat from').press('Tab');
   await page.getByPlaceholder('Seat to').fill('25');
   await page.getByPlaceholder('Seat to').press('Tab');
-  await expect(page.locator('tbody tr').filter({ hasText: 'ADM203' })).toBeVisible();
-  await expect(page.locator('tbody tr').filter({ hasText: 'ADM202' })).toBeHidden();
-  await expect(page.locator('tbody tr').filter({ hasText: 'ADM201' })).toBeHidden();
+  await expect(roster.locator('tbody tr').filter({ hasText: 'ADM203' })).toBeVisible();
+  await expect(roster.locator('tbody tr').filter({ hasText: 'ADM202' })).toBeHidden();
+  await expect(roster.locator('tbody tr').filter({ hasText: 'ADM201' })).toBeHidden();
   await expect(page.locator('#admin-filter-summary')).toContainText('Showing 1 of 4 records');
 });
 
 test('completed results can be archived and restored without deletion', async ({ page }) => {
   await loginAdmin(page);
-  const row = page.locator('tbody tr').filter({ hasText: 'ADM203' });
+  let roster = adminRoster(page);
+  let row = roster.locator('tbody tr').filter({ hasText: 'ADM203' });
   await expect(row).toBeVisible();
   await row.getByRole('button', { name: 'Archive' }).click();
-  await expect(page.locator('tbody tr').filter({ hasText: 'ADM203' })).toBeHidden();
+  roster = adminRoster(page);
+  await expect(roster.locator('tbody tr').filter({ hasText: 'ADM203' })).toBeHidden();
 
   const archiveFilter = page.locator('select[data-args="archive,__value__"]');
   await archiveFilter.selectOption('archived');
-  await expect(page.locator('tbody tr').filter({ hasText: 'ADM203' })).toBeVisible();
-  await expect(page.locator('tbody tr').filter({ hasText: 'ADM204' })).toBeVisible();
-  await page.locator('tbody tr').filter({ hasText: 'ADM203' }).getByRole('button', { name: 'Restore' }).click();
-  await expect(page.locator('tbody tr').filter({ hasText: 'ADM203' })).toBeHidden();
+  await expect(roster.locator('tbody tr').filter({ hasText: 'ADM203' })).toBeVisible();
+  await expect(roster.locator('tbody tr').filter({ hasText: 'ADM204' })).toBeVisible();
+  await roster.locator('tbody tr').filter({ hasText: 'ADM203' }).getByRole('button', { name: 'Restore' }).click();
+  roster = adminRoster(page);
+  await expect(roster.locator('tbody tr').filter({ hasText: 'ADM203' })).toBeHidden();
   await page.locator('select[data-args="archive,__value__"]').selectOption('current');
-  await expect(page.locator('tbody tr').filter({ hasText: 'ADM203' })).toBeVisible();
+  await expect(roster.locator('tbody tr').filter({ hasText: 'ADM203' })).toBeVisible();
 });
 
 test('missing required client module leaves a visible recovery path', async ({ page }) => {
