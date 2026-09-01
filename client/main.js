@@ -27,6 +27,13 @@
     root.IE?.feedbackFixes?.install?.();
   }
 
+  async function loadAdminFeedbackModule() {
+    if (!root.IE?.adminFeedback?.installed) {
+      await loadScriptOnce('/client/admin-feedback.js', 'data-admin-feedback-module');
+      root.IE?.adminFeedback?.install?.();
+    }
+  }
+
   function loadAdminOperationsModule() {
     if (document.querySelector('script[data-admin-live-module]') || root.IE?.adminLive) return;
     const script = document.createElement('script');
@@ -115,6 +122,7 @@
       const params = new URLSearchParams(window.location.search);
       if (params.get('admin') === '1') {
         loadAdminOperationsModule();
+        await loadAdminFeedbackModule();
         await root.IE?.feedbackFixes?.ensureAdminStatusChip?.();
         if (await root.IE.adminAuth.tryBootstrapFromCookie()) {
           root.IE.admin.showAdmin();
