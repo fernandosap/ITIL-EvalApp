@@ -50,6 +50,7 @@ const {
   pickQuestionsForSession,
   gradeExamFromSession
 } = require('./shared/scoring.js');
+const selectionPolicy = require('./client/selection-policy.js');
 const {
   getXsuaaConfig,
   inspectXsuaaJwt,
@@ -899,7 +900,7 @@ function createPersistedExamSessionFromSet(code, questionSet) {
   return {
     code,
     questionSetId: questionSet.id,
-    questionSetName: normalizeExamTitle(questionSet.name),
+    questionSetName: String(questionSet.name || 'Academy Exam App'),
     examMode: questionSet.examMode,
     showCorrectAnswers: questionSet.showCorrectAnswers === true,
     countsTowardResults: questionSet.countsTowardResults !== false,
@@ -933,7 +934,22 @@ function requireExamSession(req, res, next) {
     if (Number(stored.session.tokenExpiry || 0) <= Date.now()) return null;
     return stored;
   }).then((stored) => {
-    if (!stored) return res.status(401).json({ error: 'invalid_exam_session' });
+    if (!stored) {
+      // A successful submit deletes its exam session. If the response is lost
+      // in transit, the browser retries with its still-valid exam token but
+      // finds no session. Return the durable result so submit retries remain
+      // idempotent instead of appearing to fail forever.
+      const submittedCode = String(req.body?.code || '').trim().toUpperCase();
+      if (req.path === '/api/submit' && submittedCode === parsedToken.code) {
+        return withDb((conn) => getResultRecord(conn, submittedCode)).then((existing) => {
+          if (existing) {
+            return res.json({ ok: true, idempotentReplay: true, result: sanitizeCandidateResult(existing) });
+          }
+          return res.status(401).json({ error: 'invalid_exam_session' });
+        });
+      }
+      return res.status(401).json({ error: 'invalid_exam_session' });
+    }
     req.examSession = stored.session;
     req.examProgress = stored.progress;
     next();
@@ -995,7 +1011,9 @@ function normalizeQuestionSetRow(row) {
   const examMode = String(row.EXAM_MODE || EXAM_MODE.GRADED).toUpperCase() === EXAM_MODE.PRACTICE ? EXAM_MODE.PRACTICE : EXAM_MODE.GRADED;
   return {
     id: Number(row.QUESTION_SET_ID),
-    name: normalizeExamTitle(row.NAME || 'Exam'),
+    // Question-set names are user-authored content. Keep them verbatim;
+    // normalizeExamTitle is for legacy product branding, not exam titles.
+    name: String(row.NAME || 'Exam'),
     description: row.DESCRIPTION || '',
     isActive: Boolean(row.IS_ACTIVE),
     durationMinutes: Number(row.DURATION_MINUTES || 45),
@@ -1314,7 +1332,7 @@ function buildExamConfigForSet(questionSet, totalOverride = null, examEnabled = 
   const durationSecs = (Number(questionSet.durationMinutes || 45) || 45) * 60;
   const passPct = Number(questionSet.passPct || 80) || 80;
   return {
-    examName: normalizeExamTitle(questionSet.name || EXAM_NAME),
+    examName: String(questionSet.name || EXAM_NAME),
     examDescription: questionSet.description || '',
     examActive: examEnabled,
     durationSecs,
@@ -1962,7 +1980,7 @@ app.post('/api/session/start', async (req, res) => {
         && Number(storedSession.session.questionSetId) === Number(questionSet.id)
         ? {
             ...storedSession.session,
-            questionSetName: normalizeExamTitle(questionSet.name),
+            questionSetName: String(questionSet.name || 'Academy Exam App'),
             tokenNonce,
             tokenExpiry
           }
@@ -1980,6 +1998,8 @@ app.post('/api/session/start', async (req, res) => {
           ok: true,
           examToken: createExamToken(code, tokenNonce, tokenExpiry),
           progress,
+          requiredSelections: (Array.isArray(sessionState.qOrder) ? sessionState.qOrder : []).map((questionIdx) =>
+            selectionPolicy.requiredSelections(sessionState.questions[questionIdx])),
           questionSet: { id: questionSet.id, name: questionSet.name },
           ...sessionConfig
         }
@@ -2118,7 +2138,7 @@ app.get('/api/admin/results/:code/signed-summary', requireAdmin, requirePermissi
         generatedAt: new Date().toISOString(),
         code,
         questionSetId: result.questionSetId ?? null,
-        questionSetName: normalizeExamTitle(result.questionSetName || ''),
+        questionSetName: String(result.questionSetName || ''),
         examMode: result.examMode || EXAM_MODE.GRADED,
         score: result.score ?? null,
         total: result.total ?? null,
@@ -2450,7 +2470,7 @@ app.get('/api/admin/codes', requireAdmin, requirePermission('codes:read'), async
         incidents: parsedResult?.incidents || [],
         questionResults: Array.isArray(parsedResult?.questionResults) ? parsedResult.questionResults : [],
         questionSetId: r.QUESTION_SET_ID == null ? null : Number(r.QUESTION_SET_ID),
-        questionSetName: normalizeExamTitle(r.QUESTION_SET_NAME || ''),
+        questionSetName: String(r.QUESTION_SET_NAME || ''),
         questionSetActive: r.QUESTION_SET_ACTIVE == null ? false : Boolean(r.QUESTION_SET_ACTIVE),
         examMode: parsedResult?.examMode || '',
         isPractice: parsedResult?.examMode === EXAM_MODE.PRACTICE || parsedResult?.isPractice === true,
@@ -3016,7 +3036,7 @@ app.get('/api/admin/analytics/overview', requireAdmin, requirePermission('analyt
         return {
           code: row.ACCESS_CODE,
           questionSetId: Number(row.QUESTION_SET_ID ?? result.questionSetId ?? 0),
-          questionSetName: normalizeExamTitle(row.QUESTION_SET_NAME || result.questionSetName || 'Exam'),
+          questionSetName: String(row.QUESTION_SET_NAME || result.questionSetName || 'Exam'),
           pct: Number(row.PCT ?? result.pct ?? 0),
           score: Number(row.SCORE ?? result.score ?? 0),
           total: Number(row.TOTAL ?? result.total ?? 0),
@@ -3577,6 +3597,12 @@ app.post('/api/admin/question-sets/:id/config', requireAdmin, requirePermission(
 
   try {
     await withDb(async (conn) => {
+      const existing = await execQuery(conn, 'SELECT QUESTION_SET_ID FROM QUESTION_SETS WHERE QUESTION_SET_ID = ?', [id]);
+      if (!existing.length) {
+        const err = new Error('question_set_not_found');
+        err.statusCode = 404;
+        throw err;
+      }
       if (await hasQuestionSetModeColumns(conn)) {
         await execQuery(
           conn,
@@ -3619,7 +3645,7 @@ app.post('/api/admin/question-sets/:id/config', requireAdmin, requirePermission(
     });
     res.json({ ok: true });
   } catch (err) {
-    res.status(500).json({ error: 'admin_question_set_config_failed', message: err.message });
+    res.status(err.statusCode || 500).json({ error: err.statusCode === 404 ? 'question_set_not_found' : 'admin_question_set_config_failed' });
   }
 });
 
@@ -3716,7 +3742,8 @@ app.get('/api/admin/question-sets/:id/questions', requireAdmin, requirePermissio
           proctorEnabled: questionSet.proctorEnabled,
           durationMinutes: questionSet.durationMinutes,
           passPct: questionSet.passPct,
-          numQuestions: questionSet.numQuestions
+          numQuestions: questionSet.numQuestions,
+          sections: questionSet.sections
         },
         questions: questionSet.questions.map((question) => ({
           id: question.questionId,
@@ -3744,12 +3771,16 @@ app.post('/api/admin/question-sets/:setId/questions', requireAdmin, requirePermi
   const qNum = Number(req.body?.qNum);
   const stem = String(req.body?.stem || '').trim();
   const note = String(req.body?.note || '').trim();
-  const opts = Array.isArray(req.body?.opts) ? req.body.opts.map((item) => String(item || '').trim()).filter(Boolean) : [];
+  const opts = Array.isArray(req.body?.opts)
+    ? req.body.opts.map((item) => String(item ?? '')).filter((item) => item.trim().length > 0)
+    : [];
   const correctIndices = Array.isArray(req.body?.correctIndices) ? req.body.correctIndices.map((item) => Number(item)).filter((n) => Number.isInteger(n) && n >= 0) : [];
   const multi = Boolean(req.body?.multi);
   const sectionId = req.body?.sectionId == null || req.body?.sectionId === '' ? null : Number(req.body.sectionId);
 
   if (!Number.isInteger(qNum) || qNum < 1) return res.status(400).json({ error: 'invalid_question_number' });
+  if (questionId != null && (!Number.isInteger(questionId) || questionId < 1)) return res.status(400).json({ error: 'invalid_question_id' });
+  if (sectionId != null && (!Number.isInteger(sectionId) || sectionId < 1)) return res.status(400).json({ error: 'invalid_section_id' });
   if (!stem) return res.status(400).json({ error: 'stem_required' });
   if (opts.length < 2) return res.status(400).json({ error: 'at_least_two_options_required' });
   if (!correctIndices.length) return res.status(400).json({ error: 'correct_indices_required' });
@@ -3760,7 +3791,31 @@ app.post('/api/admin/question-sets/:setId/questions', requireAdmin, requirePermi
     await withDb(async (conn) => {
       if (sectionId != null) {
         const sections = await execQuery(conn, 'SELECT SECTION_ID FROM QUESTION_SECTIONS WHERE SECTION_ID = ? AND QUESTION_SET_ID = ?', [sectionId, setId]);
-        if (!sections.length) throw new Error('section_not_found');
+        if (!sections.length) {
+          const err = new Error('section_not_found');
+          err.statusCode = 404;
+          throw err;
+        }
+      }
+      if (questionId != null) {
+        const existingQuestion = await execQuery(conn,
+          'SELECT QUESTION_ID FROM QUESTION_SET_QUESTIONS WHERE QUESTION_ID = ? AND QUESTION_SET_ID = ?',
+          [questionId, setId]);
+        if (!existingQuestion.length) {
+          const err = new Error('question_not_found');
+          err.statusCode = 404;
+          throw err;
+        }
+      }
+      const existingNumber = await execQuery(conn,
+        questionId == null
+          ? 'SELECT QUESTION_ID FROM QUESTION_SET_QUESTIONS WHERE QUESTION_SET_ID = ? AND QUESTION_INDEX = ?'
+          : 'SELECT QUESTION_ID FROM QUESTION_SET_QUESTIONS WHERE QUESTION_SET_ID = ? AND QUESTION_INDEX = ? AND QUESTION_ID <> ?',
+        questionId == null ? [setId, qNum] : [setId, qNum, questionId]);
+      if (existingNumber.length) {
+        const err = new Error('question_number_conflict');
+        err.statusCode = 409;
+        throw err;
       }
       if (questionId != null) {
         await execQuery(
@@ -3797,7 +3852,7 @@ app.post('/api/admin/question-sets/:setId/questions', requireAdmin, requirePermi
     });
     res.json({ ok: true });
   } catch (err) {
-    res.status(500).json({ error: 'admin_question_save_failed', message: err.message });
+    res.status(err.statusCode || 500).json({ error: err.statusCode === 404 ? 'question_not_found' : err.statusCode === 409 ? 'question_number_conflict' : 'admin_question_save_failed' });
   }
 });
 
@@ -3863,14 +3918,24 @@ app.post('/api/admin/question-sets/:setId/sections', requireAdmin, requirePermis
   const sectionId = req.body?.id == null || req.body?.id === '' ? null : Number(req.body.id);
   const name = String(req.body?.name || '').trim();
   const description = String(req.body?.description || '').trim();
-  const displayOrder = Number(req.body?.displayOrder) || 0;
+  const displayOrder = req.body?.displayOrder == null || req.body?.displayOrder === '' ? 0 : Number(req.body.displayOrder);
   const drawCountRaw = req.body?.drawCount;
-  const drawCount = drawCountRaw == null || drawCountRaw === '' ? null : Math.max(1, Number(drawCountRaw));
+  const drawCount = drawCountRaw == null || drawCountRaw === '' ? null : Number(drawCountRaw);
   if (!name) return res.status(400).json({ error: 'name_required' });
+  if (name.length > 120 || description.length > 500) return res.status(400).json({ error: 'section_text_too_long' });
+  if (sectionId != null && (!Number.isInteger(sectionId) || sectionId < 1)) return res.status(400).json({ error: 'invalid_section_id' });
+  if (!Number.isInteger(displayOrder) || displayOrder < 0) return res.status(400).json({ error: 'invalid_section_order' });
+  if (drawCount != null && (!Number.isInteger(drawCount) || drawCount < 1)) return res.status(400).json({ error: 'invalid_section_draw_count' });
 
   try {
     await withDb(async (conn) => {
       if (sectionId != null) {
+        const existing = await execQuery(conn, 'SELECT SECTION_ID FROM QUESTION_SECTIONS WHERE SECTION_ID = ? AND QUESTION_SET_ID = ?', [sectionId, setId]);
+        if (!existing.length) {
+          const err = new Error('section_not_found');
+          err.statusCode = 404;
+          throw err;
+        }
         await execQuery(
           conn,
           `UPDATE QUESTION_SECTIONS
@@ -3897,7 +3962,7 @@ app.post('/api/admin/question-sets/:setId/sections', requireAdmin, requirePermis
     });
     res.json({ ok: true });
   } catch (err) {
-    res.status(500).json({ error: 'admin_section_save_failed', message: err.message });
+    res.status(err.statusCode || 500).json({ error: err.statusCode === 404 ? 'section_not_found' : 'admin_section_save_failed' });
   }
 });
 

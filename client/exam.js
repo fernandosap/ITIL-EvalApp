@@ -5,7 +5,7 @@
 // Public surface (attached to window.IE.exam):
 //   renderQ, goToQ, prevQ, nextQ, pick, trySubmit, startTimer,
 //   getRemainingMs, updateTimer, submitExam, showResultsFromRecord,
-//   downloadResultSummary, showPendingSubmission, retryPendingSubmission,
+//   showPendingSubmission, retryPendingSubmission,
 //   statusChip
 //
 // Security event listeners (keydown/contextmenu/selectstart) are wired
@@ -36,6 +36,10 @@
       return;
     }
     S.currentQCache = q;
+    S.requiredSelections = S.requiredSelections || [];
+    if (Number.isInteger(Number(q.requiredSelections)) && Number(q.requiredSelections) > 0) {
+      S.requiredSelections[S.currentQ] = Number(q.requiredSelections);
+    }
 
     // ---- Render error boundary ----
     // The big template string below is built from server
@@ -80,7 +84,11 @@
   // can be caught without losing the API call result.
   async function _renderQBody(q) {
     const sel = S.answers[S.currentQ] || [];
-    const answered = S.answers.filter((a) => a && a.length > 0).length;
+    const requiredSelections = Math.max(1, Number(q.requiredSelections) || 1);
+    const answered = S.answers.reduce((count, answer, index) => {
+      const required = Number(S.requiredSelections?.[index] || S.questionRequirements?.[index] || 0);
+      return count + (Array.isArray(answer) && answer.length > 0 && (!required || answer.length === required) ? 1 : 0);
+    }, 0);
     const pct = (answered / S.total) * 100;
     const isLast = S.currentQ === S.total - 1;
     const unanswered = S.answers.filter((a) => !a || a.length === 0).length;
@@ -97,18 +105,22 @@
       const a = S.answers[i] || [];
       const vis = S.visited.has(i);
       const isCurrent = i === S.currentQ;
-      const isAnswered = a.length > 0;
-      const isSkipped = vis && !isAnswered;
+      const required = Number(S.requiredSelections?.[i] || S.questionRequirements?.[i] || 0);
+      const isAnswered = a.length > 0 && (!required || a.length === required);
+      const isIncomplete = a.length > 0 && !isAnswered;
+      const isSkipped = vis && !isAnswered && !isIncomplete;
       let cls = 'nav-dot';
       if (isCurrent) cls += ' current';
-      else if (isAnswered) cls += ' answered';
+      if (isAnswered) cls += ' answered';
+      else if (isIncomplete) cls += ' incomplete';
       else if (isSkipped) cls += ' skipped';
       // Status glyph shown in the top-right corner of each dot.
-      // ✓ = answered, · = skipped/visited, empty = unanswered.
+      // ✓ = complete, ! = partial multi-select, · = skipped/visited.
       // The current question hides the glyph and relies on its
       // background fill to convey "you are here".
-      const statusGlyph = isCurrent ? '' : (isAnswered ? '✓' : (isSkipped ? '·' : ''));
-      const statusLabel = isCurrent ? 'Current' : (isAnswered ? 'Answered' : (isSkipped ? 'Skipped' : 'Unanswered'));
+      const statusGlyph = isAnswered ? '✓' : (isIncomplete ? '!' : (isSkipped ? '·' : ''));
+      const completionLabel = isAnswered ? 'Complete' : (isIncomplete ? `Incomplete: ${a.length} of ${required} selected` : (isSkipped ? 'Skipped' : 'Unanswered'));
+      const statusLabel = isCurrent ? `Current; ${completionLabel.toLowerCase()}` : completionLabel;
       return `<button type="button" class="${cls}" data-action="goToQ" data-args="${i}" title="Q${i + 1}: ${statusLabel}" aria-label="Go to question ${i + 1}: ${statusLabel}" ${isCurrent ? 'aria-current="step"' : ''}><span class="nav-dot-num">${i + 1}</span><span class="nav-dot-status" aria-hidden="true">${statusGlyph}</span></button>`;
     }).join('');
 
@@ -135,8 +147,8 @@
       ${connectivityBanner()}
       <div style="background:white;padding:8px 20px;border-bottom:1px solid #e0e6f0">
         <div style="display:flex;justify-content:space-between;font-size:12px;color:#777;margin-bottom:5px">
-          <span><strong>Q${S.currentQ + 1}</strong> of ${S.total} · <span style="color:${answered === S.total ? '#1a5c1a' : '#c55a11'}">${answered}/${S.total} answered</span></span>
-          <span>${sel.length ? (q.multi ? `${sel.length} selected` : '✓ Answered') : '<span style="color:#c55a11">⚠ Unanswered</span>'}</span>
+          <span><strong>Q${S.currentQ + 1}</strong> of ${S.total} · <span style="color:${answered === S.total ? '#1a5c1a' : '#c55a11'}">${answered}/${S.total} complete</span></span>
+          <span style="color:${q.multi && sel.length > 0 && sel.length !== requiredSelections ? '#8a5b00' : '#777'}">${sel.length ? (q.multi ? `${sel.length}/${requiredSelections} selected` : '✓ Answered') : '<span style="color:#c55a11">⚠ Unanswered</span>'}</span>
         </div>
         <div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>
         <div class="nav-dots">${dots}</div>
@@ -153,11 +165,14 @@
           <div class="options">${opts}</div>
           <div class="exam-nav">
             <button class="btn btn-secondary" data-action="prevQ" ${S.currentQ === 0 ? 'disabled' : ''}>← Back</button>
-            <span class="sel-count">${sel.length ? (q.multi ? `${sel.length} selected` : '✓ Answered') : 'No answer'}</span>
+            <span class="sel-count">${sel.length ? (q.multi ? `${sel.length}/${requiredSelections} selected` : '✓ Answered') : 'No answer'}</span>
             ${isLast
               ? `<button class="btn btn-primary" data-action="trySubmit" ${unanswered > 0 ? 'disabled' : ''}>Submit Exam</button>`
               : `<button class="btn btn-primary" data-action="nextQ">Next →</button>`}
           </div>
+          ${q.multi && sel.length > 0 && sel.length !== requiredSelections
+            ? `<p class="multi-selection-warning" role="status" aria-live="polite">Select exactly ${requiredSelections} answers to complete this question.</p>`
+            : ''}
           ${S.isPractice ? '<p style="text-align:center;font-size:12px;color:#1a5c1a;margin-top:8px;font-weight:700">Practice mode: you will see right/wrong feedback after submission.</p>' : ''}
           ${isLast && unanswered > 0 ? `<p style="text-align:center;font-size:12px;color:#c55a11;margin-top:8px">⚠ ${unanswered} unanswered — use the dots above to go back.</p>` : ''}
         </div>
@@ -255,6 +270,18 @@
       modal('⚠️', 'Unanswered Questions', `${unanswered} question${unanswered !== 1 ? 's are' : ' is'} still unanswered. Please answer all questions before submitting.`, [{ label: 'Go Back', cls: 'btn-primary' }]);
       return;
     }
+    const incompleteIndex = S.answers.findIndex((answer, index) => {
+      const required = Number(S.requiredSelections?.[index] || 0);
+      return required > 0 && Array.isArray(answer) && answer.length > 0 && answer.length !== required;
+    });
+    if (incompleteIndex >= 0) {
+      const selected = Array.isArray(S.answers[incompleteIndex]) ? S.answers[incompleteIndex].length : 0;
+      const required = Number(S.requiredSelections[incompleteIndex]);
+      modal('⚠️', 'Incomplete Multi-Select Answer',
+        `Question ${incompleteIndex + 1} requires ${required} selection${required === 1 ? '' : 's'}; ${selected} selected. Please review it before submitting.`,
+        [{ label: 'Review Question', cls: 'btn-primary', action: () => goToQ(incompleteIndex) }]);
+      return;
+    }
     modal('📝', 'Submit Exam', 'Are you sure you want to submit? You will not be able to make changes after submission.', [
       { label: 'Submit Now', cls: 'btn-primary', action: () => submitExam(false) },
       { label: 'Cancel', cls: 'btn-secondary' }
@@ -288,17 +315,16 @@
     if (S.submitted || (!autoSubmit && isProctorRecoveryRequired())) return;
     S.submitted = true;
     clearInterval(S.timerInterval);
-    if (root.IE.proctor && typeof root.IE.proctor.teardownSecurity === 'function') {
-      // teardownSecurity() now also clears the webcam
-      // interval and stops MediaStream tracks via
-      // IE.state.stopMediaStreams(). Single source of
-      // truth for the cleanup path.
-      root.IE.proctor.teardownSecurity();
-    }
+    const stopProctor = () => {
+      if (root.IE.proctor && typeof root.IE.proctor.teardownSecurity === 'function') {
+        root.IE.proctor.teardownSecurity();
+      }
+    };
 
     const payload = buildSubmitPayload(autoSubmit);
     let data;
     if (!isOnline()) {
+      stopProctor();
       queuePendingAction(S.code, 'submit', payload);
       showPendingSubmission();
       return;
@@ -308,15 +334,36 @@
         method: 'POST',
         body: JSON.stringify(payload)
       }, { timeoutMs: 15000, retries: 0 });
-    } catch (_e) {
+    } catch (err) {
+      const validation = err?.responseData || {};
+      if (!autoSubmit && err?.status === 400
+        && ['selection_count_incomplete', 'too_many_selections', 'invalid_selection'].includes(validation.error)) {
+        S.submitted = false;
+        const questionIndex = Number(validation.question) - 1;
+        if (Number.isInteger(questionIndex) && questionIndex >= 0 && questionIndex < S.total) {
+          S.currentQ = questionIndex;
+          await renderQ();
+          const selected = Number(validation.selectedCount || 0);
+          const required = Number(validation.requiredSelections || S.requiredSelections?.[questionIndex] || 0);
+          modal('⚠️', 'Review Your Answer',
+            required > 0
+              ? `Question ${questionIndex + 1} requires ${required} selection${required === 1 ? '' : 's'}; ${selected} selected. Please correct it and submit again.`
+              : `Please review question ${questionIndex + 1} and submit again.`,
+            [{ label: 'OK', cls: 'btn-primary' }]);
+          startTimer();
+          return;
+        }
+      }
       data = null;
     }
 
     if (!data || !data.ok || !data.result) {
+      stopProctor();
       queuePendingAction(S.code, 'submit', payload);
       showPendingSubmission();
       return;
     }
+    stopProctor();
     clearPendingState(S.code);
     showResultsFromRecord(data.result);
   }
@@ -328,7 +375,7 @@
       <div class="card" style="margin-top:56px;text-align:center">
         <div style="font-size:42px;margin-bottom:10px">⏳</div>
         <h2 style="margin-bottom:10px">Submission Queued</h2>
-        <p style="color:#555;font-size:14px;line-height:1.7">Your browser could not reach the server, so the final submission was saved locally on this device. Keep this tab or reopen with the same code once your connection returns.</p>
+        <p style="color:#555;font-size:14px;line-height:1.7">The server could not confirm the final submission, so it was saved locally on this device. Keep this tab or reopen with the same code when you can reconnect.</p>
         <p style="color:#8a5b00;font-size:13px;margin:12px 0 18px">Access code: <strong style="font-family:monospace">${_esc(S.code)}</strong></p>
         <button class="btn btn-primary btn-full" data-action="retryPendingSubmission">Retry Submission</button>
         <button class="btn btn-secondary btn-full" data-action="showCodeEntry">Return to Start</button>
@@ -349,8 +396,37 @@
     }
     const done = await replayPendingActions();
     if (!done) {
-      modal('❌', 'Retry Failed', 'Submission is still pending. Keep this tab and try again shortly.', [{ label: 'OK', cls: 'btn-primary' }]);
+      const failure = S.pendingSubmitFailure;
+      S.pendingSubmitFailure = null;
+      if (failure) {
+        showPendingSubmitFailure(failure);
+      } else {
+        modal('❌', 'Retry Failed', 'Submission is still pending. Keep this tab and try again shortly.', [{ label: 'OK', cls: 'btn-primary' }]);
+      }
     }
+  }
+
+  function showPendingSubmitFailure(failure, examScreenReady = false) {
+    const detail = failure?.responseData || {};
+    const selectionErrors = ['selection_count_incomplete', 'too_many_selections', 'invalid_selection'];
+    if (failure?.status === 400 && selectionErrors.includes(detail.error)) {
+      const question = Number(detail.question || 0);
+      const selected = Number(detail.selectedCount || 0);
+      const required = Number(detail.requiredSelections || 0);
+      const nextStep = examScreenReady
+        ? 'Review and correct that question below; your saved answers remain on this device.'
+        : 'Return to the exam with the same code to review the answer; your saved answers remain on this device.';
+      const explanation = question > 0 && required > 0
+        ? `The server rejected the saved answer for question ${question}: ${selected} of ${required} required selections were selected. ${nextStep}`
+        : `The server rejected a saved answer. ${nextStep}`;
+      modal('⚠️', 'Answer Needs Review', explanation, [{ label: 'OK', cls: 'btn-primary' }]);
+      return;
+    }
+    if (failure?.status === 401) {
+      modal('⚠️', 'Exam Session Expired', 'Your answers are still saved on this device, but this exam session is no longer active. Keep this browser data and return to the start with the same code to resume.', [{ label: 'OK', cls: 'btn-primary' }]);
+      return;
+    }
+    modal('❌', 'Retry Failed', 'The server did not accept the saved submission. Keep this tab and try again shortly; your answers remain saved on this device.', [{ label: 'OK', cls: 'btn-primary' }]);
   }
 
   // ---- Results ----
@@ -448,37 +524,10 @@
           <div style="font-size:16px;font-weight:800;color:#1F3864;margin-bottom:8px">Study Focus</div>
           <div style="font-size:13px;color:#555;line-height:1.9">${studyFocus.map((item) => `• ${_esc(item)}`).join('<br>')}</div>
         </div>` : ''}
-        <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-bottom:12px">
-          <button class="btn btn-secondary btn-sm" data-action="downloadResultSummary" data-args="json">Download JSON Summary</button>
-          <button class="btn btn-secondary btn-sm" data-action="downloadResultSummary" data-args="html">Download Study Report</button>
-        </div>
         <p style="font-size:13px;color:#999">${rec.isPractice ? 'Your practice attempt has been saved for learning analytics.' : 'Your result has been recorded. You may close this window.'}</p>
       </div>
     </div>`);
     root.__lastResult = rec;
-  }
-
-  function downloadResultSummary(kind) {
-    const rec = root.__lastResult;
-    if (!rec) return;
-    const fileSafeCode = String(rec.code || 'result').replace(/[^A-Z0-9_-]/gi, '_');
-    let blob;
-    let fileName;
-    if (kind === 'html') {
-      const sections = Array.isArray(rec.sectionResults) ? rec.sectionResults : [];
-      const html = `<!doctype html><html><head><meta charset="utf-8"><title>Academy Exam Summary ${_esc(rec.code || '')}</title></head><body><h1>Academy Exam Summary</h1><p><strong>Code:</strong> ${_esc(rec.code || '')}</p><p><strong>Score:</strong> ${_esc(rec.score)} / ${_esc(rec.total)} (${_esc(rec.pct)}%)</p><p><strong>Submitted:</strong> ${_esc(rec.submittedAt || '')}</p><h2>Section Results</h2><ul>${sections.map((section) => `<li>${_esc(section.name || 'Segment')}: ${_esc(section.correct)} / ${_esc(section.total)} (${_esc(section.pct)}%)</li>`).join('')}</ul></body></html>`;
-      blob = new Blob([html], { type: 'text/html;charset=utf-8' });
-      fileName = `academy_exam_summary_${fileSafeCode}.html`;
-    } else {
-      blob = new Blob([JSON.stringify(rec, null, 2)], { type: 'application/json;charset=utf-8' });
-      fileName = `academy_exam_summary_${fileSafeCode}.json`;
-    }
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = fileName;
-    a.click();
-    URL.revokeObjectURL(url);
   }
 
   // Shared with admin dashboard — used by the status chip column.
@@ -560,9 +609,9 @@
     updateTimer: updateTimer,
     submitExam: submitExam,
     showResultsFromRecord: showResultsFromRecord,
-    downloadResultSummary: downloadResultSummary,
     showPendingSubmission: showPendingSubmission,
     retryPendingSubmission: retryPendingSubmission,
+    showPendingSubmitFailure: showPendingSubmitFailure,
     statusChip: statusChip
   };
 })(typeof window !== 'undefined' ? window : globalThis);

@@ -11,9 +11,9 @@
     root.SharedConstants = factory();
   }
 })(typeof window !== 'undefined' ? window : globalThis, function () {
-  // Normalize legacy product names. The app is branded "Academy Exam App"
-  // regardless of what an admin typed as a question set name. Specific
-  // legacy tokens are mapped to a friendlier display label.
+  // Normalize legacy product-title strings in contexts that intentionally
+  // use app branding. Do not apply this to persisted or user-authored exam
+  // question-set names.
   function normalizeExamTitle(value) {
     var text = String(value == null ? '' : value).trim();
     if (!text) return 'Academy Exam App';

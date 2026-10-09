@@ -72,8 +72,17 @@ test('multi-select enforces the exact selection cap and shows required count', a
   await expect(page.locator('[data-selection-requirement]')).toContainText('Select exactly 2');
 
   await page.locator('.option').nth(0).click();
+  await expect(page.locator('.multi-selection-warning')).toContainText('Select exactly 2 answers');
+  await expect(page.locator('.nav-dot.current')).toHaveClass(/incomplete/);
+  await expect(page.locator('.nav-dot.current .nav-dot-status')).toHaveText('!');
+  await page.getByRole('button', { name: /Next/ }).click();
+  await expect(page.locator('.nav-dot').nth(1)).toHaveClass(/incomplete/);
+  await expect(page.locator('.nav-dot').nth(1).locator('.nav-dot-status')).toHaveText('!');
+  await page.locator('.nav-dot').nth(1).click();
+
   await page.locator('.option').nth(1).click();
   await expect(page.locator('.sel-count')).toContainText('2/2 selected');
+  await expect(page.locator('.multi-selection-warning')).toHaveCount(0);
   await page.locator('.option').nth(2).click();
   await expect(page.locator('#m-title')).toHaveText('Selection limit reached');
   await expect(page.locator('.option.selected')).toHaveCount(2);

@@ -15,8 +15,27 @@
 //   archiveQuestionSet, rollbackImportedSet
 
 (function (root) {
-  const { $, _esc, render, modal, apiJson, apiFetch, durationLabel, normalizeExamTitle, roleCan } = root.IE.util;
+  const { $, _esc, render, modal, apiJson, apiFetch, durationLabel, roleCan } = root.IE.util;
   const S = root.S;
+
+  function saveFailureMessage(err, itemName) {
+    const status = Number(err?.status || 0);
+    const code = String(err?.responseData?.error || '');
+    if (status === 404) return `This ${itemName} no longer exists. Reload the exam set and try again.`;
+    if (status === 409 && code === 'question_number_conflict') return 'That question number is already used in this exam set. Choose a different number.';
+    if (status === 409) return 'This exam set changed while you were editing it. Reload the set, then reapply your changes.';
+    if (status === 400) {
+      const details = err?.responseData?.errors;
+      if (Array.isArray(details) && details.length) return details.slice(0, 3).join(' ');
+      if (code === 'invalid_question_upload') return 'The uploaded questions or section details are invalid. Review the preview and CSV values.';
+      if (code === 'invalid_section_draw_count') return 'Section draw count must be a positive whole number.';
+      if (code === 'invalid_section_order') return 'Section display order must be a whole number of 0 or greater.';
+      if (code === 'section_text_too_long') return 'Section name or description is too long.';
+      return 'Some values were rejected. Check the required fields and try again.';
+    }
+    if (status === 0 || err?.name === 'AbortError') return `The connection did not confirm the ${itemName} save. Reopen the set and check the saved value before retrying.`;
+    return `The server could not save this ${itemName}. Your changes have not been confirmed; reload the set before retrying.`;
+  }
 
   // ---- Assign / analytics ----
   async function assignQuestionSet(code, setIdValue) {
@@ -29,7 +48,7 @@
       if (row) {
         row.questionSetId = setIdValue === '' ? null : Number(setIdValue);
         const set = root._adminQuestionSets.find((item) => item.id === row.questionSetId);
-        row.questionSetName = set ? normalizeExamTitle(set.name) : '';
+        row.questionSetName = set ? set.name : '';
       }
     } catch (_e) {
       modal('❌', 'Assignment Failed', 'Could not assign that exam set to the access code.', [{ label: 'OK', cls: 'btn-primary', action: () => root.IE.admin.showAdmin() }]);
@@ -295,12 +314,12 @@
         cls: 'btn-primary',
         action: () => {
           const current = root.__currentQuestionSet || null;
-          if (current && current.id === id) openQuestionSet(id, name);
+          if (current && current.id === id) openQuestionSet(id, name, true);
           else root.IE.admin.showAdmin();
         }
       }]);
-    } catch (_e) {
-      modal('❌', 'Update Failed', 'Could not update that exam set configuration.', [{ label: 'OK', cls: 'btn-primary' }]);
+    } catch (err) {
+      modal('❌', 'Update Failed', saveFailureMessage(err, 'exam set'), [{ label: 'OK', cls: 'btn-primary' }]);
     }
   }
 
@@ -322,8 +341,12 @@
     try {
       await apiJson(`/api/admin/question-sets/${id}/activate`, { method: 'POST', body: JSON.stringify({}) }, { timeoutMs: 10000, retries: 0 });
       root.IE.admin.showAdmin();
-    } catch (_e) {
-      modal('❌', 'Activation Failed', 'Could not set that exam as the default.', [{ label: 'OK', cls: 'btn-primary' }]);
+    } catch (err) {
+      const blockers = err?.responseData?.readiness?.blockers;
+      const detail = err?.responseData?.error === 'question_set_not_ready' && Array.isArray(blockers) && blockers.length
+        ? `This exam set needs attention before activation:\n${blockers.slice(0, 5).join('\n')}`
+        : 'Could not set that exam as the default. Reload the set and try again.';
+      modal('❌', 'Activation Failed', detail, [{ label: 'OK', cls: 'btn-primary' }]);
     }
   }
 
@@ -343,10 +366,10 @@
 
   function downloadQuestionTemplate() {
     const lines = [
-      'q_num,stem,note,multi,option_1,option_2,option_3,option_4,option_5,option_6,correct_indices',
-      '"1","What is the purpose of incident management?","Leave blank if you do not need a hint","false","Restore service quickly","Approve all changes","Create new services","Manage suppliers","","","0"',
-      '"2","Which TWO items are service management dimensions?","Use pipe characters for multi-select answers","true","Organizations and people","Value streams and processes","Incident logging","Server patching","","","0|1"',
-      '"3","What should a candidate do before starting the exam?","Optional hint shown to the candidate if you want","false","Read the instructions","Skip the tech check","Close the browser","Wait for a CAB meeting","","","0"'
+      'q_num,stem,note,multi,section_name,section_description,section_order,section_draw_count,option_1,option_2,option_3,option_4,option_5,option_6,correct_indices',
+      '"1","What is the purpose of incident management?","Leave blank if you do not need a hint","false","Service Management","Questions about service management","1","","Restore service quickly","Approve all changes","Create new services","Manage suppliers","","","0"',
+      '"2","Which TWO items are service management dimensions?","Use pipe characters for multi-select answers","true","Service Management","Questions about service management","1","","Organizations and people","Value streams and processes","Incident logging","Server patching","","","0|1"',
+      '"3","What should a candidate do before starting the exam?","Optional hint shown to the candidate if you want","false","Operations","Operational practices","2","1","Read the instructions","Skip the tech check","Close the browser","Wait for a CAB meeting","","","0"'
     ];
     const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8' });
     const url = URL.createObjectURL(blob);
@@ -397,7 +420,7 @@
             <div style="font-size:14px;font-weight:800;color:#1F3864;margin-bottom:8px">Options</div>
             <div style="font-size:12px;color:#555;line-height:1.7">
               Add answer choices in <code>option_1</code>, <code>option_2</code>, and so on.<br>
-              Leave unused option columns blank.
+              Leave unused option columns blank. Repeat <code>section_name</code> for each question; description, order, and draw count may be entered once or repeated identically.
             </div>
           </div>
           <div style="padding:14px;border:1px solid #d8e1f0;border-radius:14px;background:#fff">
@@ -478,6 +501,10 @@
     const noteIdx = headers.indexOf('note');
     const multiIdx = headers.indexOf('multi');
     const correctIdx = headers.indexOf('correct_indices');
+    const sectionNameIdx = headers.indexOf('section_name');
+    const sectionDescriptionIdx = headers.indexOf('section_description');
+    const sectionOrderIdx = headers.indexOf('section_order');
+    const sectionDrawCountIdx = headers.indexOf('section_draw_count');
     if (qNumIdx === -1 || stemIdx === -1 || multiIdx === -1 || correctIdx === -1 || !optionIndexes.length) {
       throw new Error('CSV headers are missing required columns.');
     }
@@ -493,6 +520,10 @@
         stem: String(r[stemIdx] || '').trim(),
         note: noteIdx === -1 ? '' : String(r[noteIdx] || '').trim(),
         multi: /^(true|yes|1)$/i.test(String(r[multiIdx] || '').trim()),
+        sectionName: sectionNameIdx === -1 ? '' : String(r[sectionNameIdx] || '').trim(),
+        sectionDescription: sectionDescriptionIdx === -1 ? '' : String(r[sectionDescriptionIdx] || '').trim(),
+        sectionOrder: sectionOrderIdx === -1 || !String(r[sectionOrderIdx] || '').trim() ? null : Number(r[sectionOrderIdx]),
+        sectionDrawCount: sectionDrawCountIdx === -1 || !String(r[sectionDrawCountIdx] || '').trim() ? null : Number(r[sectionDrawCountIdx]),
         opts,
         correctIndices
       };
@@ -505,6 +536,7 @@
     const qNums = new Set();
     const stems = new Set();
     const duplicates = [];
+    const sections = new Map();
     const section = {
       count: questions.length,
       multiCount: 0,
@@ -531,12 +563,36 @@
       }
       if (q.multi) section.multiCount += 1;
       section.maxOptions = Math.max(section.maxOptions, q.opts.length);
+      const sectionName = String(q.sectionName || '').trim();
+      const hasSectionFields = Boolean(sectionName || q.sectionDescription || q.sectionOrder != null || q.sectionDrawCount != null);
+      if (!sectionName && hasSectionFields) errors.push(`${rowLabel}: section metadata requires section_name.`);
+      if (sectionName) {
+        if (sectionName.length > 120) errors.push(`${rowLabel}: section_name must be 120 characters or fewer.`);
+        if (String(q.sectionDescription || '').length > 500) errors.push(`${rowLabel}: section_description must be 500 characters or fewer.`);
+        if (q.sectionOrder != null && (!Number.isInteger(q.sectionOrder) || q.sectionOrder < 0)) errors.push(`${rowLabel}: section_order must be a whole number of 0 or greater.`);
+        if (q.sectionDrawCount != null && (!Number.isInteger(q.sectionDrawCount) || q.sectionDrawCount < 1)) errors.push(`${rowLabel}: section_draw_count must be a positive whole number.`);
+        const key = sectionName.toLocaleLowerCase();
+        const metadata = { name: sectionName, description: String(q.sectionDescription || ''), displayOrder: q.sectionOrder, drawCount: q.sectionDrawCount, questionCount: 1 };
+        const prior = sections.get(key);
+        if (!prior) sections.set(key, metadata);
+        else {
+          prior.questionCount += 1;
+          if ((prior.description && metadata.description && prior.description !== metadata.description) || (prior.displayOrder != null && metadata.displayOrder != null && prior.displayOrder !== metadata.displayOrder) || (prior.drawCount != null && metadata.drawCount != null && prior.drawCount !== metadata.drawCount)) {
+            errors.push(`${rowLabel}: section metadata conflicts with another row using "${sectionName}".`);
+          }
+          if (!prior.description) prior.description = metadata.description;
+          if (prior.displayOrder == null) prior.displayOrder = metadata.displayOrder;
+          if (prior.drawCount == null) prior.drawCount = metadata.drawCount;
+        }
+      }
     }
-    duplicates.forEach((item) => warnings.push(item));
+    for (const item of sections.values()) if (item.drawCount != null && item.drawCount > item.questionCount) errors.push(`Section "${item.name}": section_draw_count exceeds its question count (${item.questionCount}).`);
+    duplicates.forEach((item) => errors.push(`${item} is repeated. Question numbers must be unique.`));
     return {
       ok: errors.length === 0,
       errors,
       warnings,
+      sections: [...sections.values()].map((item, index) => ({ ...item, displayOrder: item.displayOrder == null ? index + 1 : item.displayOrder })),
       summary: section
     };
   }
@@ -555,27 +611,33 @@
       const questions = parseQuestionCsv(text);
       const analysis = analyzeQuestionUpload(questions);
       let serverPreview = null;
+      let serverErrors = [];
       if (roleCan('imports:write')) {
         try {
           serverPreview = await apiJson('/api/admin/question-sets/upload/preview', {
             method: 'POST',
             body: JSON.stringify({ questions })
           }, { timeoutMs: 15000, retries: 0 });
-        } catch (_e) {
+        } catch (err) {
           serverPreview = null;
+          if (Number(err?.status || 0) === 400) {
+            serverErrors = Array.isArray(err?.responseData?.errors) ? err.responseData.errors : [String(err?.responseData?.error || 'The server rejected this CSV.')];
+          }
         }
       }
-      root._uploadPreview = { questions, analysis, serverPreview };
+      root._uploadPreview = { questions, analysis, serverPreview, serverErrors };
+      const validationErrors = [...analysis.errors, ...serverErrors];
       host.innerHTML = `
         <div style="font-size:13px;color:#1F3864;font-weight:800;margin-bottom:8px">Preview</div>
         <div style="font-size:12px;color:#445;line-height:1.8">
           Rows: <strong>${analysis.summary.count}</strong><br>
           Multi-select: <strong>${analysis.summary.multiCount}</strong><br>
+          Sections: <strong>${analysis.sections.length}</strong><br>
           Max options: <strong>${analysis.summary.maxOptions}</strong><br>
-          Status: <strong style="color:${analysis.ok ? '#1a5c1a' : '#c0392b'}">${analysis.ok ? 'Ready to upload' : 'Fix issues first'}</strong>
+          Status: <strong style="color:${analysis.ok && !serverErrors.length ? '#1a5c1a' : '#c0392b'}">${analysis.ok && !serverErrors.length ? 'Ready to upload' : 'Fix issues first'}</strong>
         </div>
         ${serverPreview?.duplicatesAgainstDatabase?.length ? `<div style="margin-top:10px;font-size:12px;color:#8a5b00">Possible duplicates already in database:<br>${serverPreview.duplicatesAgainstDatabase.slice(0, 5).map((item) => `• ${_esc(String(item).slice(0, 120))}`).join('<br>')}</div>` : ''}
-        ${analysis.errors.length ? `<div style="margin-top:10px;font-size:12px;color:#9f2d22">${analysis.errors.slice(0, 8).map((item) => `• ${_esc(item)}`).join('<br>')}</div>` : ''}
+        ${validationErrors.length ? `<div style="margin-top:10px;font-size:12px;color:#9f2d22">${validationErrors.slice(0, 8).map((item) => `• ${_esc(item)}`).join('<br>')}</div>` : ''}
         ${(analysis.warnings.length || serverPreview?.warnings?.length) ? `<div style="margin-top:10px;font-size:12px;color:#8a5b00">${[...analysis.warnings, ...(serverPreview?.warnings || [])].slice(0, 8).map((item) => `• ${_esc(item)}`).join('<br>')}</div>` : ''}
       `;
     } catch (err) {
@@ -599,34 +661,39 @@
       if (!root._uploadPreview) await previewUploadedQuestionSet();
       const questions = root._uploadPreview?.questions || [];
       const analysis = root._uploadPreview?.analysis || analyzeQuestionUpload(questions);
+      const serverErrors = root._uploadPreview?.serverErrors || [];
       if (!questions.length) throw new Error('The CSV does not contain any questions.');
       if (!analysis.ok) throw new Error(analysis.errors[0] || 'CSV validation failed.');
+      if (serverErrors.length) throw new Error(serverErrors[0]);
       const resp = await apiJson('/api/admin/question-sets/upload', {
         method: 'POST',
         body: JSON.stringify({ name, description, questions })
       }, { timeoutMs: 20000, retries: 0 });
       if (!resp || !resp.ok) throw new Error('upload_failed');
       const note = analysis.warnings.length ? `\n\nWarnings noted: ${analysis.warnings.slice(0, 3).join(' · ')}` : '';
-      modal('✅', 'Upload Complete', `${resp.count} questions were imported into "${name}".${note}`, [{ label: 'Manage Exam Set', cls: 'btn-primary', action: () => openQuestionSet(resp.questionSetId, name) }]);
+      modal('✅', 'Upload Complete', `${resp.count} questions and ${resp.sectionCount || 0} sections were imported into "${name}".${note}`, [{ label: 'Manage Exam Set', cls: 'btn-primary', action: () => openQuestionSet(resp.questionSetId, name) }]);
     } catch (err) {
-      modal('❌', 'Upload Failed', err.message || 'Could not import that CSV file.', [{ label: 'OK', cls: 'btn-primary' }]);
+      modal('❌', 'Upload Failed', saveFailureMessage(err, 'question set'), [{ label: 'OK', cls: 'btn-primary' }]);
     }
   }
 
   // ---- Open / edit question set ----
-  async function openQuestionSet(setId, fallbackName) {
+  async function openQuestionSet(setId, fallbackName, mutationConfirmed = false) {
     S.screen = 'admin-question-set';
     render('<div class="admin-wrap"><div class="admin-loading">Loading exam set…</div></div>');
     try {
-      const [qData, sData, setList] = await Promise.all([
-        apiJson(`/api/admin/question-sets/${setId}/questions`, {}, { timeoutMs: 12000, retries: 1 }),
-        apiJson(`/api/admin/question-sets/${setId}/sections`, {}, { timeoutMs: 12000, retries: 1 }),
-        apiJson('/api/admin/question-sets', {}, { timeoutMs: 12000, retries: 1 })
-      ]);
+      const qData = await apiJson(`/api/admin/question-sets/${setId}/questions`, {}, { timeoutMs: 12000, retries: 1 });
       const questionSet = qData?.questionSet || {};
       const questions = Array.isArray(qData?.questions) ? qData.questions : [];
-      const sections = Array.isArray(sData?.sections) ? sData.sections : [];
-      const setMeta = (setList?.sets || []).find((item) => item.id === setId) || {};
+      const sectionCounts = new Map();
+      questions.forEach((question) => {
+        if (question.sectionId != null) sectionCounts.set(Number(question.sectionId), Number(sectionCounts.get(Number(question.sectionId)) || 0) + 1);
+      });
+      const sections = (Array.isArray(questionSet.sections) ? questionSet.sections : []).map((section) => ({
+        ...section,
+        questionCount: Number(sectionCounts.get(Number(section.id)) || 0)
+      }));
+      const setMeta = questionSet;
       const sectionMap = new Map(sections.map((s) => [s.id, s]));
       const questionRows = questions.map((q) => `
         <tr>
@@ -702,7 +769,9 @@
         </div>
       </div>`);
     } catch (_e) {
-      modal('❌', 'Load Failed', 'Could not load that exam set.', [{ label: 'Back to Admin', cls: 'btn-primary', action: () => root.IE.admin.showAdmin() }]);
+      modal(mutationConfirmed ? '✅' : '❌', mutationConfirmed ? 'Saved; Refresh Needed' : 'Load Failed',
+        mutationConfirmed ? 'The change was saved. The updated exam set could not be reloaded just now; reopen it from the admin list.' : 'Could not load that exam set.',
+        [{ label: 'Back to Admin', cls: 'btn-primary', action: () => root.IE.admin.showAdmin() }]);
     }
   }
 
@@ -749,7 +818,11 @@
   }
 
   async function saveQuestionEditor(setId, questionId) {
-    const opts = String($('qe-opts')?.value || '').split('\n').map((line) => line.trim()).filter(Boolean);
+    // Each physical line is one option. Keep its content verbatim so spacing
+    // edited by an administrator survives the save/reopen round trip.
+    const opts = String($('qe-opts')?.value || '')
+      .split(/\r\n?|\n/)
+      .filter((line) => line.trim().length > 0);
     const correctIndices = String($('qe-correct')?.value || '').split(',').map((item) => Number(item.trim())).filter((n) => Number.isInteger(n) && n >= 0);
     try {
       await apiJson(`/api/admin/question-sets/${setId}/questions`, {
@@ -765,10 +838,13 @@
           correctIndices
         })
       }, { timeoutMs: 12000, retries: 0 });
-      openQuestionSet(setId, root.__currentQuestionSet?.name || '');
-    } catch (_e) {
-      modal('❌', 'Save Failed', 'Could not save that question. Please check the question number, options, and correct indexes.', [{ label: 'OK', cls: 'btn-primary' }]);
+    } catch (err) {
+      modal('❌', 'Save Failed', saveFailureMessage(err, 'question'), [{ label: 'OK', cls: 'btn-primary' }]);
+      return;
     }
+    // Mutation success is confirmed by the API. A later read failure is shown
+    // by openQuestionSet as a refresh issue, never as a failed save.
+    openQuestionSet(setId, root.__currentQuestionSet?.name || '', true);
   }
 
   function deleteQuestion(setId, questionId) {
@@ -807,9 +883,9 @@
           drawCount: drawCount.trim() === '' ? null : Number(drawCount)
         })
       }, { timeoutMs: 10000, retries: 0 });
-      openQuestionSet(setId, current.name || '');
-    } catch (_e) {
-      modal('❌', 'Section Save Failed', 'Could not save that section.', [{ label: 'OK', cls: 'btn-primary' }]);
+      openQuestionSet(setId, current.name || '', true);
+    } catch (err) {
+      modal('❌', 'Section Save Failed', saveFailureMessage(err, 'section'), [{ label: 'OK', cls: 'btn-primary' }]);
     }
   }
 

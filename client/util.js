@@ -129,13 +129,14 @@
         rememberVersion(url, resp);
         if (!resp.ok) {
           let detail = `HTTP ${resp.status}`;
+          let responseData = null;
           try {
             const ct = (resp.headers.get('content-type') || '').toLowerCase();
             if (ct.includes('application/json')) {
-              const body = await resp.json();
-              detail = body?.message
-                || (Array.isArray(body?.errors) && body.errors.length ? body.errors[0] : null)
-                || body?.error
+              responseData = await resp.json();
+              detail = responseData?.message
+                || (Array.isArray(responseData?.errors) && responseData.errors.length ? responseData.errors[0] : null)
+                || responseData?.error
                 || detail;
             } else {
               const text = await resp.text();
@@ -145,6 +146,7 @@
           if (setId && (resp.status === 412 || resp.status === 428)) delete root._questionSetVersions[setId];
           const e = new Error(detail);
           e.status = resp.status;
+          e.responseData = responseData;
           throw e;
         }
         if (isSave) markSaveDone(true);
@@ -160,11 +162,17 @@
           continue;
         }
         if (isSave) markSaveDone(false);
-        throw new Error(errorMessage(err, 'API request failed'));
+        const finalError = new Error(errorMessage(err, 'API request failed'));
+        finalError.status = status;
+        finalError.responseData = err?.responseData || null;
+        throw finalError;
       }
     }
     if (isSave) markSaveDone(false);
-    throw new Error(errorMessage(lastErr, 'API request failed'));
+    const finalError = new Error(errorMessage(lastErr, 'API request failed'));
+    finalError.status = Number(lastErr?.status || 0);
+    finalError.responseData = lastErr?.responseData || null;
+    throw finalError;
   }
 
   async function apiJson(url, opts, cfg) {

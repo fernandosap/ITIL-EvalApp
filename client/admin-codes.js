@@ -18,7 +18,7 @@
 //   downloadSignedResultSummary, auditActionLabel
 
 (function (root) {
-  const { $, render, modal, _esc, apiJson, apiFetch, durationLabel, normalizeExamTitle, roleCan } = root.IE.util;
+  const { $, render, modal, _esc, apiJson, apiFetch, durationLabel, roleCan } = root.IE.util;
   const { statusChip } = root.IE.exam;
   const S = root.S;
 
@@ -227,7 +227,7 @@
                 <option value="" ${row.questionSetId == null ? 'selected' : ''}>${root._activeQuestionSet ? `${_esc(root._activeQuestionSet.name)} (default)` : 'Default active set'}</option>
                 ${root._adminQuestionSets.map((set) => `<option value="${set.id}" ${row.questionSetId === set.id ? 'selected' : ''}>${_esc(set.name)}${set.isActive ? ' ⭐' : ''}</option>`).join('')}
               </select>`
-            : `<span style="font-size:12px;color:#555">${_esc(normalizeExamTitle(row.questionSetName || root._activeQuestionSet?.name || 'Default active set'))}</span>`}
+            : `<span style="font-size:12px;color:#555">${_esc(row.questionSetName || root._activeQuestionSet?.name || 'Default active set')}</span>`}
         </td>
         <td><input type="text" value="${_esc(row.notes || '')}" style="margin:0;width:220px;font-size:12px;padding:6px 8px" data-blur-action="saveNote" data-args="${row.code},__value__"></td>
         <td>${statusChip(row)}</td>
@@ -563,7 +563,7 @@
           <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap">
             <div>
               <div style="font-size:22px;font-weight:800;color:#1F3864">Answer Review</div>
-              <div style="font-size:13px;color:#666;margin-top:4px">${_esc(resp.label || code)} · ${_esc(normalizeExamTitle(result.questionSetName || 'Exam'))}</div>
+              <div style="font-size:13px;color:#666;margin-top:4px">${_esc(resp.label || code)} · ${_esc(result.questionSetName || 'Exam')}</div>
               <div style="font-size:12px;color:#777;margin-top:6px">${result.score ?? '—'} / ${result.total ?? '—'} · ${result.pct == null ? '—' : `${result.pct}%`} · ${result.pass ? 'Passed' : 'Did not pass'}</div>
             </div>
             <div style="display:flex;gap:8px;flex-wrap:wrap">

@@ -57,6 +57,8 @@
     examToken: null,
     currentQCache: null,
     answers: [],
+    requiredSelections: [],
+    questionSetId: null,
     visited: new Set(),
     currentQ: 0,
     startTime: null,
@@ -211,6 +213,7 @@
   function buildSubmitPayload(autoSubmit) {
     return {
       code: root.S.code,
+      questionSetId: root.S.questionSetId,
       answers: root.S.answers,
       durationSecs: Math.round((root.S.elapsed + (root.S.startTime ? (Date.now() - root.S.startTime) : 0)) / 1000),
       tabSwitches: root.S.tabSwitches,
@@ -248,6 +251,7 @@
   async function replayPendingActions() {
     if (!root.S.code || !root.S.examToken || !isOnline()) return false;
     const state = readPendingState(root.S.code);
+    root.S.pendingSubmitFailure = null;
     if (!state.progress && !state.submit) return false;
     if (state.progress) {
       try {
@@ -257,7 +261,11 @@
         }, { isSave: true, timeoutMs: 9000, retries: 1 });
         state.progress = null;
         writePendingState(root.S.code, state);
-      } catch (_e) {
+      } catch (err) {
+        root.S.pendingProgressFailure = {
+          status: Number(err?.status || 0),
+          responseData: err?.responseData || null
+        };
         root.IE.util.markOfflineSave();
         return false;
       }
@@ -278,7 +286,18 @@
             return true;
           }
         }
-      } catch (_e) {
+      } catch (err) {
+        const rejected = err?.responseData || {};
+        if (err?.status === 400
+          && ['selection_count_incomplete', 'too_many_selections', 'invalid_selection'].includes(rejected.error)
+          && Array.isArray(state.submit.answers)
+          && state.submit.answers.length === Number(root.S.total)) {
+          root.S.answers = state.submit.answers.map((answer) => Array.isArray(answer) ? answer.slice() : []);
+        }
+        root.S.pendingSubmitFailure = {
+          status: Number(err?.status || 0),
+          responseData: err?.responseData || null
+        };
         root.IE.util.markOfflineSave();
         return false;
       }

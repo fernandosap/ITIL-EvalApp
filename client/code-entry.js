@@ -42,7 +42,7 @@
     document.body.classList.remove('exam-bg');
     const status = await root.IE.state.fetchStatus();
     const statusLoaded = Boolean(status && !status.error);
-    const examName = root.IE.util.normalizeExamTitle(status?.examName || 'Academy Exam App');
+    const examName = String(status?.examName || 'Academy Exam App').trim() || 'Academy Exam App';
     const examActive = statusLoaded && status?.examActive !== false;
     const sessionBanner = statusLoaded ? buildSessionBanner(status) : '';
 
@@ -485,6 +485,10 @@
 
     S.examToken = data.examToken;
     S.total = data.total || S.total;
+    S.questionSetId = Number(data.questionSet?.id) || null;
+    S.requiredSelections = Array.isArray(data.requiredSelections)
+      ? data.requiredSelections.map((count) => Math.max(1, Number(count) || 1))
+      : Array(S.total).fill(null);
     S.durationSecs = data.durationSecs || S.durationSecs;
     S.passPct = data.passPct || S.passPct;
     S.passScore = data.passScore || S.passScore;
@@ -523,8 +527,17 @@
       root.IE.proctor.startProctor();
     }
     if (await root.IE.state.replayPendingActions()) return;
+    const pendingSubmitFailure = root.S.pendingSubmitFailure;
+    if (pendingSubmitFailure?.status === 400) {
+      const question = Number(pendingSubmitFailure.responseData?.question || 0);
+      if (Number.isInteger(question) && question > 0 && question <= S.total) S.currentQ = question - 1;
+    }
     if (root.IE.exam && typeof root.IE.exam.renderQ === 'function') {
       await root.IE.exam.renderQ();
+    }
+    if (pendingSubmitFailure && root.IE.exam && typeof root.IE.exam.showPendingSubmitFailure === 'function') {
+      root.S.pendingSubmitFailure = null;
+      root.IE.exam.showPendingSubmitFailure(pendingSubmitFailure, true);
     }
   }
 
